@@ -1,0 +1,8 @@
+/target/
+/.claude/
+/scratch/
+/bench/node_modules/
+__pycache__/
+*.pyc
+.env
+.env.*

@@ -1,0 +1,82 @@
+[package]
+name = "bart"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.99.0"
+description = "Bart is an agent that likes notebooks!"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/MasterAwesome/bart-harness"
+publish = false
+
+[[bin]]
+name = "bart"
+path = "src/main.rs"
+test = false
+
+[[test]]
+name = "unit"
+path = "tests/unit.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.23.1"
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
+http = "1.5.0"
+httpdate = "1.0.3"
+hyper-util = { version = "0.1.21", default-features = false, features = ["client-proxy"] }
+oauth2 = { version = "5.0", default-features = false }
+percent-encoding = "2.3.2"
+pulldown-cmark = { version = "0.13.6", default-features = false }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+sse-stream = "0.2.6"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+ratatui-crossterm = "0.1.2"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "form", "json"] }
+rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "auth"] }
+rustix = { version = "1.1.6", features = ["event", "fs", "process", "net", "stdio"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.154", features = ["raw_value"] }
+sha2 = { version = "0.10.9", default-features = false }
+similar = "3.2"
+tokio-util = { version = "0.7.20", features = ["compat"] }
+tokio = { version = "1.54.1", features = ["process", "time", "net", "io-util", "macros", "rt", "signal", "sync"] }
+unicase = "2.10.0"
+unicode-width = "0.2.3"
+unicode-segmentation = "1.13.3"
+getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+fuzzy-matcher = "0.3.7"
+ignore = "0.4.34"
+soketto = { version = "0.8.1", features = ["deflate"] }
+tokio-rustls = { version = "0.26.6", default-features = false }
+rustls = { version = "0.23.46", default-features = false }
+rustls-platform-verifier = "0.7.1"
+httparse = "1.10.1"
+sha1 = { version = "0.10.7", default-features = false }
+bytes = "1.12.1"
+tempfile = "3.27.0"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "parsing", "regex-fancy"] }
+uuid = "1.29.0"
+filedescriptor = "0.8.3"
+signal-hook = { version = "0.3.18", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+strip = true
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+

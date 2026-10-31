@@ -1,0 +1,40 @@
+name: Bug report
+description: Bart does not do what the README says it does
+labels: [C-bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what Bart did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. bart --provider … --model …
+        2. …
+  - type: input
+    id: version
+    attributes:
+      label: Bart version
+      description: The output of `bart --version`.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System, terminal and provider
+      placeholder: Ubuntu 24.04, kitty, chatgpt
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        If you can, paste the session's `diagnostics.jsonl` from `~/.local/state/bart/sessions`. It holds request timings and outcomes, not your messages or keys.
+        Do not attach `session.jsonl`, `output/` or anything from `~/.config/bart`: they contain your conversations and credentials.
+      render: text
