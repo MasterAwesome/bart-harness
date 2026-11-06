@@ -17,6 +17,7 @@ pub(in crate::tui) struct Row {
     pub(in crate::tui) key: String,
     pub(in crate::tui) label: Clean,
     pub(in crate::tui) note: Clean,
+    pub(in crate::tui) detail: Clean,
     pub(in crate::tui) options: Vec<(Clean, bool)>,
     pub(in crate::tui) state: State,
 }
@@ -25,6 +26,7 @@ pub(in crate::tui) fn row(key: &str, note: &str, ready: bool) -> Row {
         key: key.into(),
         label: Clean::new(key),
         note: Clean::new(note),
+        detail: Clean::default(),
         options: Vec::new(),
         state: if ready {
             State::Ready
@@ -81,7 +83,7 @@ impl Menu {
             }
             for (r, row) in section.rows.iter().enumerate() {
                 if filter.is_empty()
-                    || format!("{} {} {}", row.key, row.label, row.note)
+                    || format!("{} {} {} {}", row.key, row.label, row.note, row.detail)
                         .to_lowercase()
                         .contains(&filter)
                 {
@@ -212,7 +214,23 @@ impl Menu {
             lines.push(Line::default());
         }
         let room = height.saturating_sub(lines.len() + 1);
-        let first = self.selected.saturating_sub(room.saturating_sub(1));
+        let mut first = self.selected;
+        let mut used = 0;
+        for (i, (s, r)) in self
+            .visible
+            .iter()
+            .enumerate()
+            .take(self.selected + 1)
+            .rev()
+        {
+            let rows =
+                1 + usize::from(r.is_some_and(|r| !self.sections[*s].rows[r].detail.is_empty()));
+            if used + rows > room {
+                break;
+            }
+            used += rows;
+            first = i;
+        }
         let label_width = self
             .label_width
             .min(width.saturating_sub(10).min(width / 2));
@@ -221,7 +239,10 @@ impl Menu {
         } else {
             ""
         };
-        for (i, (s, r)) in self.visible.iter().enumerate().skip(first).take(room) {
+        for (i, (s, r)) in self.visible.iter().enumerate().skip(first) {
+            if lines.len() >= height.saturating_sub(1) {
+                break;
+            }
             let section = &self.sections[*s];
             let Some(r) = r else {
                 lines.push(
@@ -282,6 +303,10 @@ impl Menu {
             } else {
                 line
             });
+            if !row.detail.is_empty() && lines.len() < height.saturating_sub(1) {
+                let detail = format!("{indent}    └─ {}", row.detail);
+                lines.push(Line::from(text::clip_end(&detail, width)).dim());
+            }
         }
         if self.visible.is_empty()
             && room > 0

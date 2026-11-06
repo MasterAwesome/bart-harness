@@ -6,7 +6,6 @@ use crate::tui::widgets::{
     field::{Field, Outcome as FieldOutcome},
     menu::{Hint, Menu, Row, Section, State as RowState, row},
 };
-use std::fmt::Write as _;
 
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -265,6 +264,12 @@ impl SettingsPicker {
                 _ => {}
             }
         }
+        if self.menu.selected_key() == Some("Approval")
+            && self.preferences.permissions.approval.mode() == Mode::Auto
+            && key.code == KeyCode::Enter
+        {
+            return Choice::Route(Route::Reviewer);
+        }
         if self.menu.selected_key() == Some(SEARCH) {
             match (key.code, self.preferences.search.is_some()) {
                 (KeyCode::Left, false) => return Choice::Stay,
@@ -332,10 +337,9 @@ impl SettingsPicker {
             return Choice::Stay;
         }
         let approval = &self.preferences.permissions.approval;
-        if value == "Reviewer"
-            || value == "Approval"
-                && approval.mode().next() == Mode::Auto
-                && approval.reviewer().is_none()
+        if value == "Approval"
+            && approval.mode().next() == Mode::Auto
+            && approval.reviewer().is_none()
         {
             return Choice::Route(Route::Reviewer);
         }
@@ -508,8 +512,14 @@ impl SettingsPicker {
                 Hint::Rows("digits custom"),
                 Hint::Rows("↑↓ move"),
             ],
+            Some("Approval") if self.preferences.permissions.approval.mode() == Mode::Auto => &[
+                Hint::Rows("Enter configure"),
+                Hint::Rows("←→ mode"),
+                Hint::Back("Esc back"),
+                Hint::Rows("↑↓ move"),
+            ],
             Some(SEARCH) => &[
-                Hint::Rows("Enter route"),
+                Hint::Rows("Enter configure"),
                 Hint::Back("Esc back"),
                 Hint::Rows("← off"),
                 Hint::Rows("Tab toggle"),
@@ -578,33 +588,28 @@ fn setting_change(preferences: &Preferences, key: &str) -> Option<Change> {
 fn settings_sections(preferences: &Preferences) -> Vec<Section> {
     let permissions = &preferences.permissions;
     let setting = |key, state: String| {
-        let mut row = row(
-            key,
-            "",
-            setting_change(preferences, key).is_some() || matches!(key, "Reviewer" | "Approval"),
-        );
+        let mut row = row(key, "", setting_change(preferences, key).is_some());
         row.options.push((Clean::new(&state), true));
         row
     };
-    let mut permissions_rows = vec![setting(
-        "Approval",
-        permissions.approval.mode().name().into(),
-    )];
+    let mut approval = row("Approval", "", true);
+    approval.options = [Mode::None, Mode::Manual, Mode::Auto]
+        .into_iter()
+        .map(|mode| {
+            (
+                Clean::literal(mode.name()),
+                mode == permissions.approval.mode(),
+            )
+        })
+        .collect();
     if let Some(reviewer) = permissions
         .approval
         .reviewer()
         .filter(|_| permissions.approval.mode() == Mode::Auto)
     {
-        permissions_rows.push(setting(
-            "Reviewer",
-            format!(
-                "{} · {} · {}",
-                reviewer.provider,
-                reviewer.model,
-                reviewer.effort.as_deref().unwrap_or(DEFAULT_EFFORT)
-            ),
-        ));
+        approval.detail = Clean::new(&model_label(reviewer));
     }
+    let mut permissions_rows = vec![approval];
     permissions_rows.extend([
         setting("Sandbox", on_off(permissions.sandbox.enabled)),
         setting(
@@ -634,20 +639,13 @@ fn settings_sections(preferences: &Preferences) -> Vec<Section> {
     ];
     other_rows.push(ui);
     let mut search = row(SEARCH, "", true);
-    let route = preferences.search.as_ref().map_or_else(
-        || "on".to_owned(),
-        |route| {
-            let mut label = format!("{}/{}", route.provider, route.model);
-            if let Some(effort) = &route.effort {
-                let _ = write!(label, " ({effort})");
-            }
-            label
-        },
-    );
     search.options = vec![
         (Clean::literal("off"), preferences.search.is_none()),
-        (Clean::new(&route), preferences.search.is_some()),
+        (Clean::literal("on"), preferences.search.is_some()),
     ];
+    if let Some(route) = &preferences.search {
+        search.detail = Clean::new(&model_label(route));
+    }
     other_rows.push(search);
     vec![
         Section {
@@ -661,23 +659,67 @@ fn settings_sections(preferences: &Preferences) -> Vec<Section> {
     ]
 }
 
+fn model_label(choice: &crate::choice::Choice) -> String {
+    format!(
+        "{} · {} · {}",
+        choice.provider,
+        choice.model,
+        choice.effort.as_deref().unwrap_or(DEFAULT_EFFORT)
+    )
+}
+
 fn review_text(change: &Change) -> Option<Clean> {
     let target = match change {
         Change::Sandbox(enabled) => format!("Sandbox: {}", on_off(*enabled)),
         Change::Network(network) => format!("Network: {}", on_off(*network == Network::On)),
         Change::Approval(mode) => format!("Approval: {}", mode.name()),
-        Change::Reviewer(choice) => format!(
-            "Reviewer: {}/{}{}",
-            choice.provider,
-            choice.model,
-            choice
-                .effort
-                .as_ref()
-                .map_or(String::new(), |effort| format!(" ({effort})"))
-        ),
+        Change::Reviewer(choice) => format!("Reviewer: {}", model_label(choice)),
         _ => return None,
     };
     Some(Clean::new(&format!(
         "{target}\nPython state lost.\nBackground jobs stop."
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn cancelling_route_setup_keeps_the_previous_mode_and_model() {
+        for configured in [false, true] {
+            let mut preferences = Preferences::default();
+            preferences
+                .permissions
+                .approval
+                .set_mode(Mode::Manual)
+                .unwrap();
+            if configured {
+                let choice = crate::choice::Choice {
+                    provider: "provider".into(),
+                    model: "model".into(),
+                    effort: None,
+                };
+                assert_eq!(model_label(&choice), "provider · model · provider default");
+                preferences.permissions.approval.auto(choice.clone());
+                preferences.search = Some(choice);
+            }
+            for (name, route) in [("Approval", Route::Reviewer), (SEARCH, Route::Search)] {
+                let mut picker = SettingsPicker::new(preferences.clone());
+                picker.menu.paste(name).unwrap();
+                picker.refresh();
+                assert_eq!(picker.key(key(KeyCode::Enter), None), Choice::Route(route));
+                assert_eq!(picker.preferences, preferences);
+                picker.route(route, Vec::new());
+                assert_eq!(picker.key(key(KeyCode::Esc), None), Choice::Back);
+                assert_eq!(picker.preferences, preferences);
+                assert_eq!(picker.menu.selected_key(), Some(name));
+            }
+        }
+    }
 }
