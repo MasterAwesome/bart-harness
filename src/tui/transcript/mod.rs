@@ -478,16 +478,15 @@ impl Transcript {
             UiEvent::Responded => self.responded = true,
             UiEvent::Image(path) => {
                 self.flush_text(&mut done, width);
-                let name = Clean::new(&path.file_name().unwrap_or_default().to_string_lossy());
                 let path = crate::terminal_text::safe_text(
                     &path.to_string_lossy(),
                     crate::terminal_text::TextMode::Diagnostic,
                 );
                 let cells = self.ui == crate::preferences::Ui::Cells;
                 let title = if cells {
-                    format!("view · {name}")
+                    format!("view · {path}")
                 } else {
-                    format!("display({name})")
+                    format!("display({path})")
                 };
                 self.note(&title, &path);
                 let quiet = muted(Style::new().italic());
@@ -505,9 +504,9 @@ impl Transcript {
                         ),
                         Span::styled(
                             if cells {
-                                format!(" · {name}")
+                                format!(" · {path}")
                             } else {
-                                format!("({name})")
+                                format!("({path})")
                             },
                             quiet,
                         ),
