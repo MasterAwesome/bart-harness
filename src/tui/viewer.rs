@@ -607,7 +607,9 @@ impl Viewer {
                 Focus::Output => self.output.area = inner,
             }
         } else {
-            let code_rows = (self.code.lines.len() as u16).clamp(1, (inner.height / 3).max(3));
+            let code_rows = u16::try_from(self.code.lines.len())
+                .unwrap_or(u16::MAX)
+                .clamp(1, (inner.height / 3).max(3));
             let pad = u16::from(inner.height >= 10);
             [
                 _,
