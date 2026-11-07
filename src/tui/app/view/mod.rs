@@ -79,7 +79,12 @@ impl App {
         if let Some(Surface::Picker(picker)) = &self.surface {
             let area = crate::tui::picker::content_area(frame.area());
             if let Some(confirm) = picker.confirm() {
-                return confirm.draw(frame, area, feedback);
+                return confirm.draw(
+                    frame,
+                    area,
+                    feedback,
+                    confirm.layout(area, feedback.is_some()),
+                );
             }
             if let Some(field) = picker.field() {
                 field.draw(frame, area, feedback);
@@ -93,8 +98,8 @@ impl App {
         {
             let area = frame.area();
             let feedback = feedback.map(|(text, color)| (text.to_owned(), color));
-            let panel = answer.confirm.panel(area, feedback.is_some());
-            if let Some(panel) = panel {
+            let layout = answer.confirm.layout(area, feedback.is_some());
+            if let Some(panel) = layout.panel {
                 self.draw_live(
                     frame,
                     Rect {
@@ -112,6 +117,7 @@ impl App {
                 feedback
                     .as_ref()
                     .map(|(text, color)| (text.as_str(), *color)),
+                layout,
             );
         }
         let lead = 2;
