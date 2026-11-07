@@ -96,7 +96,8 @@ impl App {
             .retain(|image| input.text.contains(&image.label));
         match delivery {
             Delivery::Queue if self.turn.is_some() => {
-                self.drafts.queued.push(PendingInput::new(input));
+                let pending = self.drafts.pending(input);
+                self.drafts.queued.push(pending);
             }
             Delivery::Send if self.turn.is_some() => self.effects.push(Effect::Steer(input)),
             Delivery::Send | Delivery::Queue => self.submit_input(input),
@@ -158,31 +159,17 @@ impl App {
                 "refused steers returned to the queue; together they exceed the 1 MiB draft limit",
             );
         }
-        self.drafts
-            .queued
-            .splice(0..0, unsent.into_iter().map(PendingInput::new));
+        let pending: Vec<_> = unsent
+            .into_iter()
+            .map(|input| self.drafts.pending(input))
+            .collect();
+        self.drafts.queued.splice(0..0, pending);
     }
 
     pub(super) fn restore_draft(&mut self, text: &str) -> bool {
-        let result = if let Some(artifacts) = &self.drafts.pastes {
-            Composer::restore(text, artifacts)
-        } else {
-            let mut composer = Composer::default();
-            if composer.set(text.to_owned()) {
-                Ok(composer)
-            } else {
-                Err(io::Error::other(
-                    "draft limit is 1 MiB; draft replacement refused",
-                ))
-            }
-        };
-        match result {
+        match self.drafts.restored_composer(text) {
             Ok(composer) => {
-                self.cancel_task(Kind::Prepare);
-                self.cancel_task(Kind::Image);
-                self.transcript
-                    .add_paste_previews(composer.paste_previews());
-                self.drafts.composer = composer;
+                self.set_restored_composer(composer);
                 true
             }
             Err(error) => {
@@ -190,6 +177,50 @@ impl App {
                 false
             }
         }
+    }
+
+    fn set_restored_composer(&mut self, composer: Composer) {
+        self.cancel_task(Kind::Prepare);
+        self.cancel_task(Kind::Image);
+        self.transcript
+            .add_paste_previews(composer.paste_previews());
+        self.drafts.composer = composer;
+    }
+
+    pub(super) fn recall_pending(&mut self) {
+        let (steering, pending) = match (self.drafts.queued.last(), self.drafts.steers.last()) {
+            (Some(queued), Some(steered)) if steered.order > queued.order => (true, steered),
+            (Some(queued), _) => (false, queued),
+            (None, Some(steered)) => (true, steered),
+            (None, None) => return,
+        };
+        let composer = match self.drafts.restored_composer(&pending.input.text) {
+            Ok(composer) => composer,
+            Err(error) => {
+                self.set_status(StatusKind::Error, format!("cannot restore draft: {error}"));
+                return;
+            }
+        };
+        if steering
+            && self
+                .session
+                .as_ref()
+                .and_then(|session| session.inbox().remove(&pending.input))
+                .is_none()
+        {
+            self.drafts.steers.pop();
+            self.set_status(StatusKind::Info, "steering already received by the agent");
+            return;
+        }
+        let pending = if steering {
+            self.drafts.steers.pop()
+        } else {
+            self.drafts.queued.pop()
+        }
+        .expect("pending input was just inspected");
+        self.set_restored_composer(composer);
+        self.drafts.images = pending.input.images;
+        self.drafts.browsing = None;
     }
 
     pub(super) fn recall(&mut self, older: bool) {

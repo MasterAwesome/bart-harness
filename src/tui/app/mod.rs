@@ -122,17 +122,23 @@ impl Default for Animation {
 struct PendingInput {
     input: Input,
     display: Clean,
+    order: u64,
 }
 impl PendingInput {
-    fn new(input: Input) -> Self {
+    fn new(input: Input, order: u64) -> Self {
         let display = Clean::new(&input.text);
-        Self { input, display }
+        Self {
+            input,
+            display,
+            order,
+        }
     }
 }
 struct Drafts {
     composer: Composer,
     queued: Vec<PendingInput>,
     steers: Vec<PendingInput>,
+    next_pending: u64,
     images: Vec<InlineImage>,
     next_image: usize,
     sent: Vec<String>,
@@ -143,12 +149,40 @@ struct Drafts {
     files: Option<super::mention::Index>,
     mention_closed: bool,
 }
+impl Drafts {
+    fn pending(&mut self, input: Input) -> PendingInput {
+        let order = self.next_pending;
+        self.next_pending += 1;
+        PendingInput::new(input, order)
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.queued.is_empty() || !self.steers.is_empty()
+    }
+
+    fn restored_composer(&self, text: &str) -> io::Result<Composer> {
+        if let Some(artifacts) = &self.pastes {
+            Composer::restore(text, artifacts)
+        } else {
+            let mut composer = Composer::default();
+            if composer.set(text.to_owned()) {
+                Ok(composer)
+            } else {
+                Err(io::Error::other(
+                    "draft limit is 1 MiB; draft replacement refused",
+                ))
+            }
+        }
+    }
+}
+
 impl Default for Drafts {
     fn default() -> Self {
         Self {
             composer: Composer::default(),
             queued: Vec::new(),
             steers: Vec::new(),
+            next_pending: 0,
             images: Vec::new(),
             next_image: 1,
             sent: Vec::new(),
@@ -378,13 +412,15 @@ impl App {
             }
             Msg::Steering(result) => match result {
                 Ok(input) => {
-                    self.drafts.steers.push(PendingInput::new(input));
+                    let pending = self.drafts.pending(input);
+                    self.drafts.steers.push(pending);
                 }
                 Err(input) => {
                     if self.restore_draft(&input.text) {
                         self.drafts.images = input.images;
                     } else {
-                        self.drafts.queued.insert(0, PendingInput::new(input));
+                        let pending = self.drafts.pending(input);
+                        self.drafts.queued.insert(0, pending);
                     }
                     self.set_status(StatusKind::Info, INPUT_FULL);
                 }
@@ -398,7 +434,8 @@ impl App {
             Msg::CommandRefused(command) => {
                 match command {
                     Command::Submit(input) => {
-                        self.drafts.queued.insert(0, PendingInput::new(input));
+                        let pending = self.drafts.pending(input);
+                        self.drafts.queued.insert(0, pending);
                         self.turn = None;
                     }
                     Command::Compact | Command::Rename(_) => self.turn = None,

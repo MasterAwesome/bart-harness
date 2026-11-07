@@ -349,6 +349,13 @@ impl App {
                 &[interrupt, "Enter command", "Tab queue", "Ctrl+O details"]
             }
             HintContext::Command => &["Enter command", "Ctrl+O details"],
+            HintContext::Normal if self.drafts.composer.is_empty() && self.drafts.has_pending() => {
+                if self.turn.is_some() {
+                    &[interrupt, "↑ edit pending", "Ctrl+O details"]
+                } else {
+                    &["↑ edit pending", "/ commands", "Ctrl+O details"]
+                }
+            }
             HintContext::Normal if self.turn.is_some() => {
                 &[interrupt, "Enter steer", "Tab queue", "Ctrl+O details"]
             }

@@ -181,6 +181,17 @@ impl Inbox {
         })
     }
 
+    pub(crate) fn remove(&self, input: &Input) -> Option<Input> {
+        let mut waiting = self.lock();
+        let index = waiting
+            .inputs
+            .iter()
+            .rposition(|pending| pending == input)?;
+        let input = waiting.inputs.remove(index)?;
+        waiting.usage.remove(InputSize::input(&input));
+        Some(input)
+    }
+
     pub(crate) fn take(&self) -> Vec<Input> {
         let mut waiting = self.lock();
         let inputs: Vec<_> = waiting.inputs.drain(..).collect();

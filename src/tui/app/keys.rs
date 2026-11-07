@@ -336,12 +336,12 @@ impl App {
         if key.code == KeyCode::Up
             && alt
             && !matches!(self.surface, Some(Surface::Picker(_)))
-            && !self.drafts.queued.is_empty()
+            && self.drafts.has_pending()
             && !self.drafts.composer.is_empty()
         {
             self.set_status(
                 StatusKind::Info,
-                "finish the current draft before recalling queued input",
+                "finish the current draft before recalling pending input",
             );
             return;
         }
@@ -374,15 +374,14 @@ impl App {
             KeyCode::Tab if self.turn.is_some() && !self.drafts.composer.is_empty() => {
                 self.prepare_or_commit(Delivery::Queue)
             }
-            KeyCode::Up if alt => {
-                if let Some(queued) = self.drafts.queued.pop() {
-                    if self.restore_draft(&queued.input.text) {
-                        self.drafts.images = queued.input.images;
-                    } else {
-                        self.drafts.queued.push(queued);
-                    }
-                }
+            KeyCode::Up
+                if (key.modifiers.is_empty() || key.modifiers == KeyModifiers::ALT)
+                    && self.drafts.composer.is_empty()
+                    && self.drafts.has_pending() =>
+            {
+                self.recall_pending()
             }
+            KeyCode::Up if alt => {}
             KeyCode::Up if self.drafts.composer.on_first_line() => self.recall(true),
             KeyCode::Down if self.drafts.composer.on_last_line() => self.recall(false),
             KeyCode::Up => self.drafts.composer.line_up(),
