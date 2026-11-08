@@ -428,6 +428,29 @@ impl App {
             }
             Event::Mouse(mouse) if self.surface.is_none() => {
                 use crossterm::event::{MouseButton, MouseEventKind};
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.drafts.composer.clear_selection();
+                        self.scrollback.clear_selection();
+                        if self.drafts.composer.contains(mouse.column, mouse.row) {
+                            self.drafts.composer.select(mouse.column, mouse.row, false);
+                            return;
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+                        if self.drafts.composer.selecting() =>
+                    {
+                        if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
+                            self.drafts.composer.select(mouse.column, mouse.row, true);
+                        } else if let Some(text) = self.drafts.composer.finish_selection() {
+                            self.effects
+                                .push(Effect::Copy(text, "the selection".into()));
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 let area = self.geometry.conversation;
                 let row = mouse.row.saturating_sub(area.y);
                 let column = usize::from(mouse.column.saturating_sub(area.x));
@@ -435,7 +458,6 @@ impl App {
                     MouseEventKind::ScrollUp => self.scrollback.scroll_line(false),
                     MouseEventKind::ScrollDown => self.scrollback.scroll_line(true),
                     MouseEventKind::Down(MouseButton::Left) => {
-                        self.scrollback.clear_selection();
                         if area.contains((mouse.column, mouse.row).into()) {
                             self.scrollback.select(usize::from(row), column, false);
                         }

@@ -121,7 +121,6 @@ impl App {
             );
         }
         let lead = 2;
-        let room = usize::from(frame.area().width.saturating_sub(lead + 1)).max(1);
         let shown = self.composer_rows(frame.area().width);
         let hint_rows = u16::from(
             self.turn.is_some()
@@ -170,12 +169,10 @@ impl App {
             Paragraph::new(self.pending_lines(pending.width, pending.height)),
             pending,
         );
-        let (rows, cursor) = self.drafts.composer.layout(room);
         draw_composer(
             frame,
             composer,
-            rows,
-            cursor,
+            &mut self.drafts.composer,
             lead,
             decorated,
             self.info.name.as_deref(),

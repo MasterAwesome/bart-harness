@@ -1,4 +1,4 @@
-use crate::tui::brand;
+use crate::tui::{brand, composer::Composer, selection};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -11,12 +11,14 @@ use ratatui::{
 pub(super) fn draw_composer(
     frame: &mut Frame,
     composer: Rect,
-    rows: &[(Line<'static>, usize)],
-    (row, column): (usize, usize),
+    draft: &mut Composer,
     lead: u16,
     decorated: bool,
     name: Option<&str>,
 ) {
+    let selected = draft.selected_range();
+    let room = usize::from(composer.width.saturating_sub(lead + 1)).max(1);
+    let (rows, (row, column)) = draft.layout(room);
     let visible = usize::from(composer.height.saturating_sub(u16::from(decorated) * 2));
     let first = (row + 1).saturating_sub(visible);
     let lines: Vec<Line> = rows
@@ -24,7 +26,7 @@ pub(super) fn draw_composer(
         .enumerate()
         .skip(first)
         .take(visible)
-        .map(|(index, (text, _))| {
+        .map(|(index, text)| {
             let mut spans = if index == 0 {
                 vec![Span::styled(
                     "❯ ",
@@ -33,7 +35,12 @@ pub(super) fn draw_composer(
             } else {
                 vec![Span::raw(" ".repeat(usize::from(lead)))]
             };
-            spans.extend(text.spans.clone());
+            let line = if let Some(range) = selected {
+                selection::highlight(text, range)
+            } else {
+                selection::borrowed(&text.line)
+            };
+            spans.extend(line.spans);
             Line::from(spans)
         })
         .collect();
@@ -61,6 +68,13 @@ pub(super) fn draw_composer(
         };
         frame.render_widget(Paragraph::new(title).right_aligned(), area);
     }
+    let content = Rect {
+        x: composer.x.saturating_add(lead.min(composer.width)),
+        y: composer.y + u16::from(decorated),
+        width: composer.width.saturating_sub(lead),
+        height: visible as u16,
+    };
+    draft.painted(content, first);
     if visible == 0 || composer.width == 0 {
         return;
     }

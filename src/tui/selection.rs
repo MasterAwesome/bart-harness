@@ -5,6 +5,7 @@ use ratatui::{
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
+#[derive(Clone)]
 pub(super) struct Row {
     pub(super) block: u64,
     pub(super) byte: usize,
@@ -26,7 +27,7 @@ fn pad_spans(line: &Line<'_>, indent: usize) -> usize {
         .count()
 }
 
-fn graphemes(row: &Row) -> impl Iterator<Item = (usize, usize, &str, Style)> {
+pub(super) fn graphemes(row: &Row) -> impl Iterator<Item = (usize, usize, &str, Style)> {
     let mut byte = row.byte;
     let mut column = row.indent;
     row.line
@@ -68,8 +69,11 @@ pub(super) fn borrowed<'a>(line: &'a Line<'_>) -> Line<'a> {
     }
 }
 
-pub(super) fn columns(row: &Row, selection: Option<(Point, Point)>) -> (Line<'_>, String) {
-    let end = row.byte + row.len;
+fn selected(row: &Row, byte: usize, (start, last): (Point, Point)) -> bool {
+    byte < row.byte + row.len && start <= (row.block, byte) && (row.block, byte) <= last
+}
+
+pub(super) fn highlight(row: &Row, range: (Point, Point)) -> Line<'_> {
     let mut line = Line {
         spans: row
             .line
@@ -81,12 +85,8 @@ pub(super) fn columns(row: &Row, selection: Option<(Point, Point)>) -> (Line<'_>
         style: row.line.style,
         alignment: row.line.alignment,
     };
-    let mut text = String::new();
     for (byte, _, grapheme, style) in graphemes(row) {
-        let inside = byte < end
-            && selection.is_some_and(|(start, last)| {
-                start <= (row.block, byte) && (row.block, byte) <= last
-            });
+        let inside = selected(row, byte, range);
         line.spans.push(Span::styled(
             grapheme,
             if inside {
@@ -95,18 +95,15 @@ pub(super) fn columns(row: &Row, selection: Option<(Point, Point)>) -> (Line<'_>
                 style
             },
         ));
-        if inside {
-            text.push_str(grapheme);
-        }
     }
-    (line, text)
+    line
 }
 
 pub(super) fn text<'a>(
     rows: impl IntoIterator<Item = &'a Row>,
     range: (Point, Point),
 ) -> Option<String> {
-    let mut lines: Vec<(u64, String)> = Vec::new();
+    let mut text = String::new();
     let mut previous_end = None;
     for row in rows {
         if row.block < range.0.0 || row.block > range.1.0 {
@@ -119,53 +116,57 @@ pub(super) fn text<'a>(
         {
             continue;
         }
-        let piece = columns(row, Some(range)).1;
-        match lines.last_mut() {
-            Some((id, text)) if *id == row.block => {
-                if previous_end.is_some_and(|end| row.byte > end) {
-                    text.push('\n');
-                }
-                text.push_str(&piece);
-            }
-            _ => lines.push((row.block, piece)),
+        if previous_end.is_some_and(|(block, end)| row.block != block || row.byte > end) {
+            text.push('\n');
         }
-        previous_end = Some(row.byte + row.len);
+        for (byte, _, grapheme, _) in graphemes(row) {
+            if selected(row, byte, range) {
+                text.push_str(grapheme);
+            }
+        }
+        previous_end = Some((row.block, row.byte + row.len));
     }
-    let text = lines
-        .iter()
-        .map(|(_, text)| text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     (!text.is_empty()).then_some(text)
 }
 
-pub(super) fn wrap_line(line: Line<'static>, block: u64, byte: usize, width: u16) -> Vec<Row> {
-    let mut byte = byte;
-    text::wrap(
-        &line.spans,
-        usize::from(width.max(1)),
-        usize::MAX,
-        text::Wrap::Prose,
-    )
-    .0
-    .into_iter()
-    .map(|(mut wrapped, indent)| {
-        wrapped.style = line.style;
-        let len = wrapped
-            .spans
-            .iter()
-            .skip(pad_spans(&wrapped, indent))
-            .map(|span| span.content.len())
-            .sum();
-        let row = Row {
-            block,
-            byte,
-            len,
-            indent,
-            line: wrapped,
-        };
-        byte += len;
-        row
-    })
-    .collect()
+pub(super) fn wrap_line(line: Line<'static>, block: u64, byte: usize, width: usize) -> Vec<Row> {
+    let mut start = 0;
+    let mut newlines = line
+        .spans
+        .iter()
+        .flat_map(|span| {
+            let base = start;
+            start += span.content.len();
+            span.content
+                .match_indices('\n')
+                .map(move |(at, _)| base + at)
+        })
+        .peekable();
+    let mut offset = 0;
+    text::wrap(&line.spans, width.max(1), usize::MAX, text::Wrap::Prose)
+        .0
+        .into_iter()
+        .map(|(mut wrapped, indent)| {
+            wrapped.style = line.style;
+            let len = wrapped
+                .spans
+                .iter()
+                .skip(pad_spans(&wrapped, indent))
+                .map(|span| span.content.len())
+                .sum();
+            let row = Row {
+                block,
+                byte: byte + offset,
+                len,
+                indent,
+                line: wrapped,
+            };
+            offset += len;
+            if newlines.peek() == Some(&offset) {
+                offset += 1;
+                newlines.next();
+            }
+            row
+        })
+        .collect()
 }

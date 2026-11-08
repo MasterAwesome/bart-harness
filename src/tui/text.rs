@@ -112,6 +112,7 @@ pub(super) fn wrap(
         .collect();
     let mut rows = vec![(Line::default(), 0)];
     let mut used = 0;
+    let mut padding_spans = 0;
     let mut at = 0;
     let mut style = 0;
     let mut word_end = 0;
@@ -179,6 +180,7 @@ pub(super) fn wrap(
                 ));
                 left -= cells;
             }
+            padding_spans = fill.len();
             rows.push((Line::from(fill), pad));
             used = pad;
         }
@@ -192,8 +194,8 @@ pub(super) fn wrap(
                 style += 1;
             }
             let to = end.min(styles[style].0);
-            let (line, pad) = rows.last_mut().expect("one row");
-            if line.spans.len() > usize::from(*pad > 0)
+            let (line, _) = rows.last_mut().expect("one row");
+            if line.spans.len() > padding_spans
                 && let Some(last) = line.spans.last_mut()
                 && last.style == styles[style].1
             {

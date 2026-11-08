@@ -117,8 +117,8 @@ impl Pane {
             .take(usize::from(self.area.height))
             .enumerate()
         {
-            let line = if range.is_some() {
-                selection::columns(row, range).0
+            let line = if let Some(range) = range {
+                selection::highlight(row, range)
             } else {
                 selection::borrowed(&row.line)
             };
@@ -529,7 +529,7 @@ impl Viewer {
                     .into_iter()
                     .enumerate()
                     .flat_map(|(number, line)| {
-                        selection::wrap_line(line, number as u64, 0, size.width)
+                        selection::wrap_line(line, number as u64, 0, usize::from(size.width))
                     })
                     .collect()
             } else {
@@ -571,7 +571,7 @@ impl Viewer {
         for (number, line) in output.into_iter().enumerate() {
             let (line, starts) = highlighted(line, &query);
             let first = self.output.lines.len();
-            let rows = selection::wrap_line(line, number as u64, 0, size.width);
+            let rows = selection::wrap_line(line, number as u64, 0, usize::from(size.width));
             let mut starts = starts.into_iter().peekable();
             for (index, row) in rows.iter().enumerate() {
                 while starts

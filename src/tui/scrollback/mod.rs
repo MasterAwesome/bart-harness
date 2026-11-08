@@ -49,7 +49,7 @@ fn wrapped(source: &[RenderRow], block: u64, width: u16) -> Vec<Row> {
                 byte += len + 1;
                 continue;
             }
-            let wrapped = selection::wrap_line(line, block, byte, width);
+            let wrapped = selection::wrap_line(line, block, byte, usize::from(width));
             byte = wrapped.last().map_or(byte, |row| row.byte + row.len) + 1;
             rows.extend(wrapped);
         }
@@ -259,7 +259,7 @@ impl Scrollback {
             .shown
             .iter()
             .map(|row| match selection {
-                Some(range) => selection::columns(row, Some(range)).0,
+                Some(range) => selection::highlight(row, range),
                 None => selection::borrowed(&row.line),
             })
             .collect();

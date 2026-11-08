@@ -1,6 +1,9 @@
-use crate::tui::text::Wrap::Prose;
+use crate::tui::selection::{self, Point, Row};
 use crate::tui::text::{self, Clean};
-use ratatui::text::{Line, Span};
+use ratatui::{
+    layout::Rect,
+    text::{Line, Span},
+};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 #[derive(Clone, Default)]
@@ -10,12 +13,16 @@ pub(super) struct Composer {
     width: usize,
     pastes: Vec<Fold>,
     layout: Option<DraftLayout>,
+    selection: Option<(Point, Point, bool)>,
+    dragging: bool,
+    area: Rect,
+    first: usize,
 }
 
 #[derive(Clone)]
 struct DraftLayout {
     width: usize,
-    rows: Vec<(Line<'static>, usize)>,
+    rows: Vec<Row>,
 }
 
 #[derive(Clone)]
@@ -35,6 +42,7 @@ impl Composer {
             paste.end += offset;
         }
         self.layout = None;
+        self.clear_selection();
         self.text.push_str(&other.text);
         self.pastes.extend(other.pastes);
         self.end();
@@ -215,6 +223,7 @@ impl Composer {
             }
         }
         self.layout = None;
+        self.clear_selection();
         self.text.insert_str(at, text);
         self.cursor += text.chars().count();
         let cursor = self
@@ -372,6 +381,7 @@ impl Composer {
             true
         });
         self.layout = None;
+        self.clear_selection();
         self.text.replace_range(from..to, "");
         self.cursor = start;
     }
@@ -465,19 +475,82 @@ impl Composer {
             .as_ref()
             .is_none_or(|cached| cached.width != width)
         {
-            let rows = text::wrap(&[Span::raw(self.text.clone())], width, usize::MAX, Prose).0;
+            let rows = selection::wrap_line(Line::from(Span::raw(self.text.clone())), 0, 0, width);
             self.layout = Some(DraftLayout { width, rows });
         }
     }
 
-    pub(super) fn layout(&mut self, width: usize) -> (&[(Line<'static>, usize)], (usize, usize)) {
+    pub(super) fn layout(&mut self, width: usize) -> (&[Row], (usize, usize)) {
         self.width = width.max(1);
         let at = self.visual_position();
         (&self.cached().rows, at)
     }
 
+    pub(super) fn painted(&mut self, area: Rect, first: usize) {
+        self.area = area;
+        self.first = first;
+    }
+
+    pub(super) fn contains(&self, column: u16, row: u16) -> bool {
+        self.area.contains((column, row).into())
+    }
+
+    pub(super) fn clear_selection(&mut self) {
+        self.selection = None;
+        self.dragging = false;
+    }
+
+    pub(super) fn selecting(&self) -> bool {
+        self.dragging
+    }
+
+    pub(super) fn selected_range(&self) -> Option<(Point, Point)> {
+        self.selection
+            .filter(|(_, _, moved)| *moved)
+            .map(|(a, b, _)| (a.min(b), a.max(b)))
+    }
+
+    pub(super) fn select(&mut self, column: u16, row: u16, extend: bool) {
+        if extend && !self.dragging {
+            return;
+        }
+        let row = self.first
+            + usize::from(
+                row.saturating_sub(self.area.y)
+                    .min(self.area.height.saturating_sub(1)),
+            );
+        let column = usize::from(column.saturating_sub(self.area.x));
+        self.cache_rows();
+        let rows = &self.cached().rows;
+        let Some(row) = rows.get(row.min(rows.len().saturating_sub(1))) else {
+            return;
+        };
+        let point = selection::point_at(row, column);
+        match &mut self.selection {
+            Some((_, end, moved)) if extend => {
+                *end = point;
+                *moved = true;
+            }
+            _ => {
+                self.selection = Some((point, point, false));
+                self.dragging = true;
+            }
+        }
+    }
+
+    pub(super) fn finish_selection(&mut self) -> Option<String> {
+        self.dragging = false;
+        self.selected_text()
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let range = self.selected_range()?;
+        selection::text(&self.cached().rows, range)
+    }
+
     pub(super) fn clear(&mut self) {
         self.layout = None;
+        self.clear_selection();
         self.cursor = 0;
         self.pastes.clear();
         self.text.clear();
@@ -490,6 +563,7 @@ impl Composer {
         }
         self.cursor = text.chars().count();
         self.layout = None;
+        self.clear_selection();
         self.text = text;
         self.pastes.clear();
         true
@@ -499,15 +573,13 @@ impl Composer {
 impl DraftLayout {
     fn walk(&self, text: &str, mut visit: impl FnMut(usize, usize, usize, &str)) {
         let (mut index, mut byte, mut cells) = (0, 0, 0);
-        for (row, (line, indent)) in self.rows.iter().enumerate() {
-            cells = *indent;
-            for span in line.spans.iter().skip(usize::from(*indent > 0)) {
-                for grapheme in span.content.graphemes(true) {
-                    visit(index, row, cells, grapheme);
-                    index += grapheme.chars().count();
-                    byte += grapheme.len();
-                    cells += super::text::width(grapheme);
-                }
+        for (row, source) in self.rows.iter().enumerate() {
+            cells = source.indent;
+            for (_, _, grapheme, _) in selection::graphemes(source) {
+                visit(index, row, cells, grapheme);
+                index += grapheme.chars().count();
+                byte += grapheme.len();
+                cells += super::text::width(grapheme);
             }
             if text[byte..].starts_with('\n') {
                 visit(index, row, cells, "\n");
