@@ -8,6 +8,7 @@ import itertools
 import io
 import importlib
 import json
+import linecache
 import os
 import pathlib
 import re
@@ -1233,7 +1234,21 @@ def execute_cell(code, diffs, cell_number):
             raise KeyboardInterrupt
         return False
     except BaseException as failure:
-        report = traceback.TracebackException.from_exception(failure)
+        # Virtual cell filenames have no filesystem source. Cache only while
+        # extracting the report (which eagerly looks up lines), not across cells.
+        # Python source uses universal newlines, not str.splitlines(): form feed
+        # and Unicode separators inside comments must not shift line numbers.
+        source = code.replace("\r\n", "\n").replace("\r", "\n")
+        previous = linecache.cache.get(filename)
+        linecache.cache[filename] = (
+            len(code), None, [line + "\n" for line in source.split("\n")], filename)
+        try:
+            report = traceback.TracebackException.from_exception(failure)
+        finally:
+            if previous is None:
+                linecache.cache.pop(filename, None)
+            else:
+                linecache.cache[filename] = previous
         pending = [report]
         while pending:
             current = pending.pop()

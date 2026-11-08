@@ -69,6 +69,7 @@ async fn cells_keep_state_and_show_output_values_and_failures() {
     assert_eq!(failed.status, Status::Failed);
     assert!(
         failed.text.contains("].code\", line 2")
+            && failed.text.contains("    1 / 0")
             && failed.text.ends_with("ZeroDivisionError: division by zero"),
         "{}",
         failed.text
@@ -2246,6 +2247,33 @@ async fn oversized_bare_read_streams_a_prefix_and_saves_the_complete_numbered_vi
 }
 
 #[tokio::test]
+async fn cell_traceback_source_uses_python_newlines_and_does_not_leak_cache() {
+    let dir = TempDir::new("cell-traceback-source");
+    let context = session(dir.path(), Confinement::Unrestricted, 10_000);
+    for newline in ["\n", "\r\n", "\r"] {
+        for separator in ["\u{000c}", "\u{000b}", "\u{0085}", "\u{2028}", "\u{2029}"] {
+            let code =
+                format!("# comment{separator}not the failing expression{newline}1 / 0{newline}");
+            let output = cell(&context, &code).await;
+            assert!(output.is_error(), "{}", output.text);
+            assert!(output.text.contains("].code\", line 2"), "{}", output.text);
+            assert!(output.text.contains("    1 / 0"), "{}", output.text);
+            assert!(
+                !output.text.contains("not the failing expression"),
+                "{}",
+                output.text
+            );
+        }
+    }
+    text(
+        &context,
+        "import linecache\nassert not any(k.startswith('cell[') for k in linecache.cache)\nprint('cache clean')",
+        "cache clean",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn imported_project_and_chained_tracebacks_survive_without_harness_frames() {
     let dir = TempDir::new("project-traceback");
     fs::write(
@@ -2259,6 +2287,8 @@ async fn imported_project_and_chained_tracebacks_survive_without_harness_frames(
     for location in [
         "scoring.py",
         "cell[1].code",
+        "try: scoring.score()",
+        "except ValueError as error: raise RuntimeError('wrapper') from error",
         "ValueError: project failure",
         "RuntimeError: wrapper",
     ] {
