@@ -29,10 +29,9 @@ impl Drop for Probe {
 }
 
 pub(super) async fn authenticated() -> Result<(), Error> {
-    let mut command = tokio::process::Command::from(crate::supervise::detached(
-        &std::env::current_exe().map_err(|error| failure(error.to_string()))?,
-        executable(),
-    ));
+    let mut command = tokio::process::Command::from(
+        crate::supervise::detached(executable()).map_err(|error| failure(error.to_string()))?,
+    );
     let mut child = Probe(
         command
             .args([

@@ -156,7 +156,7 @@ async fn run(
     last: Option<&str>,
     limit: usize,
 ) -> io::Result<Vec<u8>> {
-    let mut command = Command::from(crate::supervise::detached(&std::env::current_exe()?, tool));
+    let mut command = Command::from(crate::supervise::detached(tool)?);
     command
         .args(arguments)
         .args(last)

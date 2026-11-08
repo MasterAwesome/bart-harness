@@ -228,11 +228,10 @@ pub(crate) fn open_browser(what: &str, url: &str) {
     } else {
         "xdg-open"
     };
-    let Ok(executable) = std::env::current_exe() else {
+    let Ok(command) = crate::supervise::detached(opener) else {
         return;
     };
-    let mut command =
-        tokio::process::Command::from(crate::supervise::detached(&executable, opener));
+    let mut command = tokio::process::Command::from(command);
     command
         .arg(url)
         .stdin(std::process::Stdio::null())

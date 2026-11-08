@@ -116,10 +116,10 @@ impl Peer {
         tools: Vec<Value>,
         max_output: Option<u64>,
     ) -> Result<Self, Error> {
-        let mut command = tokio::process::Command::from(crate::supervise::detached(
-            &std::env::current_exe().map_err(|error| failure(error.to_string()))?,
-            super::auth::executable(),
-        ));
+        let mut command = tokio::process::Command::from(
+            crate::supervise::detached(super::auth::executable())
+                .map_err(|error| failure(error.to_string()))?,
+        );
         command
             .args(args)
             .env_remove("CLAUDECODE")
@@ -147,7 +147,7 @@ impl Peer {
         }
         let mut child = command.spawn().map_err(|error| {
             failure(format!(
-                "cannot start Claude Code: {error}; check the executable installation"
+                "cannot start Claude Code process wrapper: {error}; check Bart’s launcher and the session working directory"
             ))
         })?;
         let input = child.stdin.take().expect("piped stdin");

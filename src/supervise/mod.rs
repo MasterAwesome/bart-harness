@@ -23,13 +23,14 @@ compile_error!("process supervision supports only Linux and macOS");
 pub(crate) const MODE: &str = "--bart-process-supervisor";
 pub(crate) const DETACHED_MODE: &str = "--bart-detached";
 
-pub(crate) fn detached(
-    executable: &std::path::Path,
-    program: impl AsRef<std::ffi::OsStr>,
-) -> std::process::Command {
+pub(crate) fn detached(program: impl AsRef<std::ffi::OsStr>) -> io::Result<std::process::Command> {
+    #[cfg(target_os = "linux")]
+    let executable = "/proc/self/exe";
+    #[cfg(not(target_os = "linux"))]
+    let executable = std::env::current_exe()?;
     let mut command = std::process::Command::new(executable);
     command.arg(DETACHED_MODE).arg(program);
-    command
+    Ok(command)
 }
 
 pub(crate) fn detached_main() -> ExitCode {
