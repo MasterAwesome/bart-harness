@@ -40,7 +40,7 @@ fn termination_signals_exit_with_their_status_while_stdin_is_open() {
         )
         .unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_bart"))
-            .args(["--provider", "local", "--model", "fixture"])
+            .args(["--provider", "local", "--model", "fixture", "--json"])
             .env("XDG_CONFIG_HOME", dir.join("config"))
             .env("XDG_STATE_HOME", dir.join("state"))
             .current_dir(&dir)
@@ -102,7 +102,7 @@ with tempfile.TemporaryDirectory(prefix="bart-nohup-") as root:
     root = pathlib.Path(root); (root/"config/bart").mkdir(parents=True)
     (root/"config/bart/providers.json").write_text('{"local":{"protocol":"chat","url":"http://127.0.0.1:1/v1","key":false}}')
     env = dict(os.environ, XDG_CONFIG_HOME=str(root/"config"), XDG_STATE_HOME=str(root/"state"))
-    child = subprocess.Popen([sys.argv[1], "--provider", "local", "--model", "fixture"], cwd=root, env=env,
+    child = subprocess.Popen([sys.argv[1], "--provider", "local", "--model", "fixture", "--json"], cwd=root, env=env,
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
     def caught(number):
@@ -263,8 +263,8 @@ os.close(writer)
 assert broken.returncode == 1 and b"cannot write to stdout" in broken.stderr, (broken.returncode, broken.stderr)
 assert len(requests) == 2, f"kept asking the model after stdout closed: {len(requests)} requests"
 reader, writer = os.pipe(); os.close(reader)
-waiting = subprocess.Popen(bart[:-2], cwd=root, env=env, stdin=subprocess.PIPE, stdout=writer, stderr=subprocess.PIPE)
-os.close(writer); waiting.stdin.write(b"plain\n"); waiting.stdin.flush()
+waiting = subprocess.Popen(bart[:-2] + ["--json"], cwd=root, env=env, stdin=subprocess.PIPE, stdout=writer, stderr=subprocess.PIPE)
+os.close(writer); waiting.stdin.write(b'{"type":"user","text":"plain"}\n'); waiting.stdin.flush()
 try: status = waiting.wait(timeout=30)
 except subprocess.TimeoutExpired: waiting.kill(); raise AssertionError("waited for more stdin after stdout closed")
 assert status == 1, (status, waiting.stderr.read())
@@ -283,7 +283,7 @@ server.shutdown(); owned.cleanup()
 }
 
 #[test]
-fn failed_turns_do_not_lose_later_input_and_eof_delivers_outstanding_jobs() {
+fn a_json_session_reports_turns_and_jobs_and_eof_stops_outstanding_jobs() {
     let output=Command::new("python3").args(["-c",r#"
 import http.server, json, os, pathlib, signal, subprocess, sys, tempfile, threading
 owned=tempfile.TemporaryDirectory(prefix="bart-headless-lifecycle-")
@@ -314,17 +314,25 @@ config=root/'config'/'bart'; config.mkdir(parents=True)
 (config/'providers.json').write_text(json.dumps({'local':{'protocol':'chat','url':f'http://127.0.0.1:{server.server_port}/v1','key':False}}))
 (config/'settings.json').write_text('{"models":{"local":{"fixture":{"context_window":100000}}}}')
 env=dict(os.environ,XDG_CONFIG_HOME=str(root/'config'),XDG_STATE_HOME=str(root/'state'))
-child=subprocess.Popen([sys.argv[1],'--provider','local','--model','fixture'],cwd=root,env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+child=subprocess.Popen([sys.argv[1],'--provider','local','--model','fixture','--json'],cwd=root,env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+deadline=threading.Timer(30, child.kill); deadline.start()
 try:
-    child.stdin.write(b'fail\n/compact\nrun\n'); child.stdin.close(); child.stdin=None
-    assert ready.wait(10), 'later input was not answered'
-    assert child.poll() is None, 'EOF exited with an outstanding job'
-    (root/'release').touch()
-    out,err=child.communicate(timeout=10)
-    assert child.returncode!=0 and b'later input answered' in out and 'final-job' in json.dumps(requests[-1]),(out,err)
-    assert all('/compact' not in m.get('content','') for request in requests for m in request['messages'] if m['role']=='user')
-    assert (root/'job-done').exists(), 'job did not finish before exit'
+    events=[]
+    def turn(message):
+        child.stdin.write((json.dumps(message)+'\n').encode()); child.stdin.flush()
+        while True:
+            event=json.loads(child.stdout.readline()); events.append(event)
+            if event['type']=='turn_done': return event
+    assert turn({'type':'user','text':'fail'})['status']=='failed'
+    done=turn({'type':'user','text':'run'})
+    assert done['status']=='completed' and done['message']=='later input answered' and done['jobs_running']==[1],done
+    kinds=[event['type'] for event in events]
+    assert kinds[0]=='session' and events[0]['id'] and 'tool_started' in kinds and 'tool_finished' in kinds and 'usage' not in kinds[:1],kinds
+    child.stdin.close(); child.stdin=None
+    assert child.wait(timeout=10)==0
+    assert not (root/'job-done').exists(), 'job outlived the session'
 finally:
+    deadline.cancel()
     (root/'release').touch()
     try: child.communicate(timeout=5)
     except subprocess.TimeoutExpired:
@@ -401,7 +409,7 @@ with tempfile.TemporaryDirectory(prefix="bart-mcp-diagnostic-") as root:
     secret = "synthetic-mcp-headless-secret"
     code = "import os,sys; print('x'*10000 + os.environ['API_TOKEN'] + '\\x1b[31m broken cause', file=sys.stderr, flush=True); sys.exit(3)"
     (config/"mcp.json").write_text(json.dumps({"mcpServers":{"broken":{"command":"python3","args":["-c",code],"env":{"API_TOKEN":secret}}}}))
-    child = subprocess.Popen([sys.argv[1],"--provider","local","--model","fixture"], cwd=root,
+    child = subprocess.Popen([sys.argv[1],"--provider","local","--model","fixture","--json"], cwd=root,
         env=dict(os.environ, XDG_CONFIG_HOME=str(root/"config"), XDG_STATE_HOME=str(root/"state")),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     seen = bytearray(); reported = threading.Event()

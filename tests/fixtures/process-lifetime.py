@@ -69,11 +69,11 @@ print('OWNERS-READY')"""
     (config / 'providers.json').write_text(json.dumps({'local': {'protocol': 'chat', 'url': f'http://127.0.0.1:{server.server_port}/v1', 'key': False}}))
     (config / 'settings.json').write_text(json.dumps({'models': {'local': {'fixture': {'context_window': 100000}}}}))
     env = dict(os.environ, XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'))
-    bart = subprocess.Popen([sys.argv[1], '--provider', 'local', '--model', 'fixture'], cwd=root, env=env,
+    bart = subprocess.Popen([sys.argv[1], '--provider', 'local', '--model', 'fixture', '--json'], cwd=root, env=env,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True)
     foreign = subprocess.Popen(['sleep', '60'])
     try:
-        bart.stdin.write(b'run\n')
+        bart.stdin.write(b'{"type":"user","text":"run"}\n')
         bart.stdin.flush()
         assert ready.wait(20), 'Bart did not finish the ownership cell'
         assert bart.poll() is None, 'Bart exited with a running adopted job'

@@ -635,10 +635,6 @@ impl Session {
         self.context.jobs.any()
     }
 
-    pub(crate) fn has_pending_commands(&self) -> bool {
-        self.context.jobs.pending_commands()
-    }
-
     pub(crate) async fn settle_recording(&mut self, mut on_event: impl Reporter) {
         self.settle_recording_with(&mut on_event).await;
     }

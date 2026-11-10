@@ -102,7 +102,23 @@ server's status and tools and turns servers on or off.
 Bart follows your project's `AGENTS.md`. Skills in `~/.agents/skills/<name>/SKILL.md`
 are used by starting a message with `/<name>`.
 
-`bart --prompt "…"` runs one turn without the interface, for scripts and CI.
+`bart --prompt "…"` runs one turn without the interface, for scripts and CI; a prompt
+piped to `bart` does the same. Background jobs stop when that turn ends. Continue the
+session later with `--resume` or `--session ID`.
+
+`bart --json` runs a whole session over JSON lines. Write `{"type":"user","text":"…"}`
+to stdin to start a turn (or to steer a running one), `{"type":"interrupt"}` to stop
+it and `{"type":"compact"}` to compact; closing stdin ends the session and stops its
+jobs. Events arrive on stdout, one object per line, each with a `type`: `session`,
+`turn_started`, `text`, `reasoning`, `tool_started`, `tool_finished`, `job_finished`,
+`job_matched`, `usage` and `turn_done`. `turn_done` carries the final message and
+`jobs_running`; when a job ends, a turn with cause `job` starts by itself.
+A compact request during a turn, or a user message exceeding the pending-input budget,
+produces `request_rejected` with `request` and `error` fields. Retry after `turn_done`.
+A `retrying` event with `discarded: true` replaces the failed attempt's displayed text
+with its `message` field. Closing stdin also interrupts an active turn.
+Piped prompts and individual JSON input lines are limited to 16 MiB.
+
 `bart update` installs the latest release.
 
 ## Approval and sandbox

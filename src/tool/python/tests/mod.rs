@@ -1113,10 +1113,12 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
     for escape in [false, true] {
         for web_search in [false, true] {
             for mcp_servers in [&[][..], &servers[..]] {
+                let one_turn = escape != web_search;
                 let text = super::definition(&super::Surface {
                     python: "Python 3.12.3 (/usr/bin/python3)",
                     escape,
                     web_search,
+                    one_turn,
                     mcp_servers,
                 })
                 .description;
@@ -1125,6 +1127,12 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
                     mcp_servers.len()
                 );
                 assert_eq!(text.contains("sandbox"), escape, "{case}");
+                assert_eq!(text.contains("build.wait() instead"), one_turn, "{case}");
+                assert_eq!(
+                    text.contains("the message resumes you"),
+                    !one_turn,
+                    "{case}"
+                );
                 assert_eq!(text.contains("web_search"), web_search, "{case}");
                 assert_eq!(text.contains("mcp"), !mcp_servers.is_empty(), "{case}");
                 let stub = text
@@ -1444,6 +1452,7 @@ async fn every_name_the_stub_defines_exists_in_cells_with_its_parameters() {
         python: "Python 3",
         escape: false,
         web_search: false,
+        one_turn: false,
         mcp_servers: &["fx".to_owned()],
     })
     .description;

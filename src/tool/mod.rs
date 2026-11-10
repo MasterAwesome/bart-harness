@@ -41,6 +41,7 @@ pub(crate) struct Context {
     artifacts: Arc<output::Storage>,
     output_budget: usize,
     pub(crate) diffs: std::sync::atomic::AtomicBool,
+    pub(crate) one_turn: std::sync::atomic::AtomicBool,
     environment: std::sync::Mutex<(Confinement, Arc<crate::mcp::Registry>)>,
     pub(crate) jobs: Arc<Jobs>,
     pub(crate) live: Arc<Live>,
@@ -91,6 +92,7 @@ impl Context {
             spill_dir,
             output_budget,
             diffs: std::sync::atomic::AtomicBool::new(true),
+            one_turn: std::sync::atomic::AtomicBool::new(false),
             environment: std::sync::Mutex::new((confinement, mcp)),
             jobs: Arc::new(Jobs::after(highest_job)),
             live: Arc::default(),
@@ -310,6 +312,7 @@ pub(crate) async fn definitions(context: &Context) -> Vec<Definition> {
         python: &python,
         escape: context.confinement().escape() == Escape::Offered,
         web_search: context.searches(),
+        one_turn: context.one_turn.load(std::sync::atomic::Ordering::Relaxed),
         mcp_servers: &mcp_servers,
     })]
 }

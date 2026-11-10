@@ -108,7 +108,6 @@ impl Request {
 
 struct Running {
     background: bool,
-    command_exited: bool,
     cancel: CancellationToken,
     command: String,
     capture: Option<Value>,
@@ -190,7 +189,6 @@ impl Jobs {
             id,
             Running {
                 background: false,
-                command_exited: false,
                 cancel: cancel.clone(),
                 command: command.to_owned(),
                 capture: None,
@@ -211,7 +209,7 @@ impl Jobs {
         live: &Arc<super::Live>,
         deadline: std::time::Instant,
     ) -> Result<u32, Box<(Reservation, Process, Collector)>> {
-        let mut state = self.state();
+        let state = self.state();
         if reservation.cancel.is_cancelled() || std::time::Instant::now() >= deadline {
             return Err(Box::new((reservation, process, collector)));
         }
@@ -223,11 +221,6 @@ impl Jobs {
             "\n",
             bart!(const Job, "command exited; child process output follows")
         ));
-        state
-            .running
-            .get_mut(&id)
-            .expect("reserved job slot")
-            .command_exited = true;
         self.launch(state, reservation, process, collector, live, None);
         Ok(id)
     }
@@ -274,7 +267,6 @@ impl Jobs {
                     |outcome| {
                         if let Some(jobs) = jobs.upgrade() {
                             let mut state = jobs.state();
-                            state.running.get_mut(&id).expect("running job").command_exited = true;
                             state.notifications.push(Notification {
                                 text: bart!(Job, "job[{id}] command {}; its child processes still run as job[{id}]", outcome.label()).into(),
                                 kind: NotificationKind::JobCommandExited { id, outcome, command: command.clone() },
@@ -419,6 +411,18 @@ impl Jobs {
         Ok(requested.then(|| format!("cancellation requested for job {id}; effects unknown")))
     }
 
+    pub(crate) fn running_ids(&self) -> Vec<u32> {
+        let state = self.state();
+        let mut ids: Vec<u32> = state
+            .running
+            .iter()
+            .filter(|(_, job)| job.background && !job.cancel.is_cancelled())
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     pub(crate) fn running_count(&self) -> usize {
         let state = self.state();
         state
@@ -432,11 +436,6 @@ impl Jobs {
     pub(crate) fn any(&self) -> bool {
         let state = self.state();
         !state.running.is_empty() || !state.notifications.is_empty()
-    }
-
-    pub(crate) fn pending_commands(&self) -> bool {
-        let state = self.state();
-        !state.notifications.is_empty() || state.running.values().any(|job| !job.command_exited)
     }
 
     pub(crate) async fn wake_ready(&self) {

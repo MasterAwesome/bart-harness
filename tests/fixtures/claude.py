@@ -6,6 +6,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 
@@ -178,15 +179,31 @@ def check(binary):
         env = dict(os.environ, BART_CLAUDE_PATH=str(executable), FIXTURE_LOG=str(log),
                    XDG_CONFIG_HOME=str(root / "config"), XDG_STATE_HOME=str(root / "state"))
         args = [binary, "--temporary", "--provider", "claude", "--model", "fixture", "--effort", "medium"]
-        process = subprocess.Popen(args, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=root)
+        process = subprocess.Popen(args + ["--json"], text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=root)
+        output, costs = [], []
+        deadline = threading.Timer(30, process.kill)
+        deadline.start()
         try:
-            output, error = process.communicate("go\nnext\n/compact\nafter-checkpoint\n", timeout=30)
+            for message in ({"type": "user", "text": "go"}, {"type": "user", "text": "next"}, {"type": "compact"},
+                            {"type": "user", "text": "after-checkpoint"}):
+                process.stdin.write(json.dumps(message) + "\n")
+                process.stdin.flush()
+                while True:
+                    event = json.loads(process.stdout.readline())
+                    if event["type"] == "usage":
+                        costs.append(event.get("cost"))
+                    if event["type"] == "turn_done":
+                        assert event["status"] == "completed", event
+                        output.append(event["message"].strip())
+                        break
+            _, error = process.communicate(timeout=30)
         finally:
+            deadline.cancel()
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
                 process.communicate(timeout=5)
         assert process.returncode == 0, error
-        assert output.split() == ["DONE", "NEXT", "AFTER"], output
+        assert output == ["DONE", "NEXT", "", "AFTER"], output
         assert (root / "executions").read_text() == "ab"
         seen = events(log)
         mains = [e for e in seen if e["event"] == "start" and e["configured"] and not e["summary"]]
@@ -196,7 +213,7 @@ def check(binary):
         assert len([e for e in seen if e["event"] == "released"]) == 2
         last = [e for e in seen if e["pid"] == mains[1]["pid"] and e["event"] == "input"][0]
         assert "[Bart summary: replaces earlier context" in last["text"], last
-        assert "~$0.010000" in error, error
+        assert 0.01 in costs, costs
         limited = subprocess.run(args + ["--prompt", "limited"], cwd=root, env=env, text=True,
                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         assert limited.returncode == 0 and limited.stdout.split() == ["RESUMED"], limited

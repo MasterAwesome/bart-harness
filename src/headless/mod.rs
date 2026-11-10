@@ -10,14 +10,29 @@ use crate::{
     terminal_text,
 };
 
+pub(crate) enum Mode {
+    Prompt(String),
+    Stdin,
+    Json { id: String },
+}
+
 pub(crate) async fn run(
     mut session: Session,
-    prompt: Option<String>,
+    mode: Mode,
     mut terminations: Terminations,
 ) -> Result<(), String> {
     let registry = session.tool_context().mcp();
     let result = {
-        let running = headless_session(&mut session, prompt, &mut terminations);
+        let running = async {
+            match mode {
+                Mode::Prompt(prompt) => one_turn(&mut session, prompt, &mut terminations).await,
+                Mode::Stdin => match stdin_prompt(&mut terminations).await? {
+                    Some(prompt) => one_turn(&mut session, prompt, &mut terminations).await,
+                    None => Ok(()),
+                },
+                Mode::Json { id } => json::session(&mut session, &id, &mut terminations).await,
+            }
+        };
         tokio::pin!(running);
         tokio::select! {
             result = &mut running => result,
@@ -30,67 +45,53 @@ pub(crate) async fn run(
     result
 }
 
-async fn headless_session(
+async fn one_turn(
     session: &mut Session,
-    prompt: Option<String>,
+    prompt: String,
     terminations: &mut Terminations,
 ) -> Result<(), String> {
+    session
+        .tool_context()
+        .one_turn
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     session.prewarm().await;
     let output = Output::default();
     let mut display = HeadlessDisplay::new(&output);
-    let mut lines = None;
-    let mut failed = 0_usize;
-    match prompt {
-        Some(prompt) => {
-            if !cancellable(
-                session.turn(prompt.into(), |event: crate::agent::Event<'_>| {
-                    display.event(event);
-                }),
-                terminations,
-                &output,
-            )
-            .await?
-            {
-                return Ok(());
-            }
-        }
-        None => {
-            lines = Some(stdin_lines()?);
-        }
-    }
-    loop {
-        display = HeadlessDisplay::new(&output);
-        if lines.is_none() && !session.has_pending_commands() {
-            return match failed {
-                0 => Ok(()),
-                1 => Err("a turn failed".into()),
-                n => Err(format!("{n} turns failed")),
-            };
-        }
-        let result = tokio::select! {
-            line = async { lines.as_mut().expect("guarded").recv().await.transpose() }, if lines.is_some() => match line? {
-                None => {
-                    lines = None;
-                    continue;
+    let turn = session.turn(prompt.into(), |event: crate::agent::Event<'_>| {
+        display.event(event);
+    });
+    cancellable(turn, terminations, &output).await.map(|_| ())
+}
+
+async fn stdin_prompt(terminations: &mut Terminations) -> Result<Option<String>, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("stdin-prompt".into())
+        .spawn(move || {
+            let result = (|| {
+                let mut prompt = String::new();
+                io::stdin()
+                    .lock()
+                    .take((MAX_STDIN_LINE_BYTES + 1) as u64)
+                    .read_to_string(&mut prompt)
+                    .map_err(|error| format!("cannot read the prompt from stdin: {error}"))?;
+                if prompt.len() > MAX_STDIN_LINE_BYTES {
+                    return Err("stdin prompt exceeds 16 MiB".into());
                 }
-                Some(line) if line.trim().is_empty() => continue,
-                Some(line) if line.trim() == "/compact" => cancellable(session.compact(|event: crate::agent::Event<'_>| display.event(event)), terminations, &output).await,
-                Some(line) => cancellable(session.turn(line.into(), |event: crate::agent::Event<'_>| display.event(event)), terminations, &output).await,
-            },
-            () = session.jobs_ready(), if session.has_jobs() => {
-                cancellable(session.wake(|event: crate::agent::Event<'_>| display.event(event)), terminations, &output).await
-            }
-            _ = terminations.requested() => return Ok(()),
-        };
-        match result {
-            Ok(false) => return Ok(()),
-            Ok(true) => {}
-            Err(error) if output.failure().is_some() => return Err(error),
-            Err(error) => {
-                crate::terminal_text::stderr_line(format_args!("bart: {error}"));
-                failed += 1;
-            }
-        }
+                if prompt.trim().is_empty() {
+                    return Err(
+                        "a headless run needs a prompt: use --prompt, pipe one in, or use --json"
+                            .into(),
+                    );
+                }
+                Ok(prompt)
+            })();
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("cannot start stdin reader: {error}"))?;
+    tokio::select! {
+        result = receiver => result.map_err(|error| format!("stdin reader stopped: {error}"))?.map(Some),
+        _ = terminations.requested() => Ok(None),
     }
 }
 
@@ -359,5 +360,6 @@ fn summary(call: &ToolCall) -> String {
     format!("{}({line})", call.name)
 }
 
+mod json;
 #[cfg(test)]
 mod tests;

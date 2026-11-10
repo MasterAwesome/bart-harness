@@ -71,13 +71,14 @@ pub(super) struct Surface<'a> {
     pub(super) python: &'a str,
     pub(super) escape: bool,
     pub(super) web_search: bool,
+    pub(super) one_turn: bool,
     pub(super) mcp_servers: &'a [String],
 }
 
 fn description(surface: &Surface<'_>) -> String {
     let mut text = header(surface);
     text.push_str(&files());
-    text.push_str(&commands(surface.escape));
+    text.push_str(&commands(surface.escape, surface.one_turn));
     text.push_str(&types());
     if surface.web_search {
         text.push_str(WEB_SEARCH);
@@ -159,7 +160,12 @@ def write(path: str | PathLike[str], content: str) -> None:
     )
 }
 
-fn commands(escape: bool) -> String {
+fn commands(escape: bool, one_turn: bool) -> String {
+    let ending = if one_turn {
+        "This session ends with your turn and stops its jobs: when you need a job's result, call\n    build.wait() instead of ending the turn."
+    } else {
+        "When only the job remains, end the turn with a one-line status; the message resumes you."
+    };
     let default = super::execution::DEFAULT_SECONDS;
     let (run_escape, run_doc, bg_escape, bg_doc) = if escape {
         (
@@ -199,7 +205,7 @@ def bg_run(argv: Sequence[str], *, notify: str | None = None, env: Mapping[str, 
 
     A message arrives when the job ends, and once when a line of its output first matches
     notify (a Rust regex: no look-around or backreferences). Meanwhile do independent work.
-    When only the job remains, end the turn with a one-line status; the message resumes you.
+    {ending}
     Do not poll with sleep or repeated status reads.
     print(build) shows its output so far and its status; build.stdout raises until it ends.
     build.kill() stops it. job[ID] is the same Job, also after an interpreter restart.
@@ -228,6 +234,7 @@ fn types() -> String {
 class Job(Result):
     id: int
     command: str
+    def wait(self) -> Job: ...   # block until it ends; a cell timeout leaves it running
     def kill(self) -> None: ...
 
 class BartError(Exception): ...  # a helper refused or failed; the message says why

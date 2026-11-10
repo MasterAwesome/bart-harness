@@ -52,6 +52,12 @@ struct ChatArgs {
         help = "Run headless with this prompt, taken verbatim even when it starts with a dash",
     )]
     prompt: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "prompt",
+        help = "Run a session over JSON lines: messages on stdin, events on stdout"
+    )]
+    json: bool,
     #[arg(long, value_parser = ["none", "manual", "auto"], help = "Cell approval mode (none, manual, or auto reviewer)")]
     approval: Option<String>,
     #[arg(
@@ -150,6 +156,7 @@ pub(crate) struct Chat {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) prompt: Option<String>,
+    pub(crate) json: bool,
     pub(crate) jail: Option<Network>,
     pub(crate) approval: Option<Mode>,
     pub(crate) resume: Resume,
@@ -194,6 +201,7 @@ pub(crate) fn parse(
                 model: chat.model,
                 reasoning_effort: chat.effort,
                 prompt: chat.prompt,
+                json: chat.json,
                 jail: chat.jail.then_some(network),
                 approval: chat
                     .approval

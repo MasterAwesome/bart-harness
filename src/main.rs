@@ -309,6 +309,7 @@ async fn chat(
         model,
         reasoning_effort,
         prompt,
+        json,
         jail,
         approval,
         resume,
@@ -328,7 +329,8 @@ async fn chat(
     let terminations = signals::Terminations::listen()
         .map_err(|error| format!("cannot listen for signals: {error}"))?;
     let confinement = preferences.effective.permissions.confinement()?;
-    let interactive = prompt.is_none() && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let interactive =
+        prompt.is_none() && !json && io::stdin().is_terminal() && io::stdout().is_terminal();
     if !interactive && preferences.effective.permissions.approval.mode() == Mode::Manual {
         return Err(
             "manual approval needs the terminal interface to ask you; use --approval auto or none"
@@ -394,8 +396,13 @@ async fn chat(
         "a headless run needs --provider and --model the first time; see bart --help".to_owned()
     })?;
     crate::terminal_text::stderr_line(format_args!("{}", settings.describe(confinement)));
-    let (session, _) = opener.open(settings, preferences, resumed).await?;
-    Box::pin(headless::run(session, prompt, terminations)).await
+    let (session, id) = opener.open(settings, preferences, resumed).await?;
+    let mode = match prompt {
+        Some(prompt) => headless::Mode::Prompt(prompt),
+        None if json => headless::Mode::Json { id },
+        None => headless::Mode::Stdin,
+    };
+    Box::pin(headless::run(session, mode, terminations)).await
 }
 
 fn resumed(sessions: &Sessions, resume: Resume) -> Result<Option<Resumed>, String> {
