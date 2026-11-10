@@ -9,6 +9,8 @@ updates:
         patterns: ["*"]
         update-types: ["patch"]
     ignore:
+      - dependency-name: flate2
+        versions: ["1.1.11"]
       - dependency-name: sha1
         versions: [">=0.11"]
       - dependency-name: sha2

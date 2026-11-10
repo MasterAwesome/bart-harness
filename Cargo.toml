@@ -37,7 +37,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 ratatui-crossterm = "0.1.2"
 regex = "1.13.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2", "form", "json"] }
-rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "auth"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "auth"] }
 rustix = { version = "1.1.6", features = ["event", "fs", "process", "net", "stdio"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = { version = "1.0.154", features = ["raw_value"] }
@@ -61,7 +61,7 @@ sha1 = { version = "0.10.7", default-features = false }
 bytes = "1.12.1"
 tempfile = "3.27.0"
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "parsing", "regex-fancy"] }
-uuid = "1.29.0"
+uuid = "1.29.2"
 filedescriptor = "0.8.3"
 signal-hook = { version = "0.3.18", default-features = false }
 
