@@ -129,7 +129,6 @@ dependencies = [
  "signal-hook 0.4.6",
  "similar",
  "soketto",
- "sse-stream",
  "syntect",
  "tempfile",
  "tokio",

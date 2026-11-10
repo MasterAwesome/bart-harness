@@ -261,7 +261,7 @@ pub(super) async fn client(
         .await
         .map_err(|error| format!("stored sign-in for {server} is unusable: {error}"))?;
     Ok(usable.then(|| Authorized {
-        http: super::http::Http(client.clone()),
+        http: client.clone(),
         manager: Arc::new(tokio::sync::Mutex::new(manager)),
         tokens,
     }))
@@ -269,7 +269,7 @@ pub(super) async fn client(
 
 #[derive(Clone)]
 pub(super) struct Authorized {
-    http: super::http::Http,
+    http: Client,
     manager: Arc<tokio::sync::Mutex<AuthorizationManager>>,
     tokens: Tokens,
 }

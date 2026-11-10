@@ -35,6 +35,7 @@ use crate::{auth::Store, tool::Place};
 
 mod command;
 mod config;
+#[cfg(test)]
 mod http;
 pub(crate) mod oauth;
 
@@ -47,7 +48,7 @@ const MAX_TOOLS: usize = 10_000;
 const MAX_CATALOG_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REGISTRY_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STARTUPS: usize = 4;
-const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LINE_BYTES: usize = rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH;
 const STDERR_TAIL_BYTES: usize = 4096;
 const MAX_LISTED: usize = 200;
 const MAX_GUIDANCE_BYTES: usize = 4096;
@@ -762,10 +763,7 @@ async fn connect(
                     None => {
                         client_config()
                             .serve_with_lifecycle(
-                                StreamableHttpClientTransport::with_client(
-                                    http::Http(client.clone()),
-                                    config,
-                                ),
+                                StreamableHttpClientTransport::with_client(client.clone(), config),
                                 lifecycle,
                             )
                             .await
@@ -880,7 +878,7 @@ async fn stdio(
     ))
 }
 
-// rmcp's stdio transport buffers unbounded lines (modelcontextprotocol/rust-sdk#1049).
+// Fail closed so pending calls do not wait for replies discarded by rmcp.
 struct Lines<R> {
     inner: R,
     line: usize,
@@ -895,17 +893,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for Lines<R> {
         let before = buf.filled().len();
         std::task::ready!(std::pin::Pin::new(&mut self.inner).poll_read(context, buf))?;
         let mut line = self.line;
-        for (index, segment) in buf.filled()[before..]
-            .split(|&byte| byte == b'\n')
-            .enumerate()
-        {
-            line = if index == 0 { line } else { 0 } + segment.len();
+        for segment in buf.filled()[before..].split_inclusive(|&byte| byte == b'\n') {
+            line += segment.len();
             if line > MAX_LINE_BYTES {
                 buf.set_filled(before);
                 return std::task::Poll::Ready(Err(std::io::Error::other(format!(
                     "a message exceeded {} MiB",
                     MAX_LINE_BYTES >> 20
                 ))));
+            }
+            if segment.ends_with(b"\n") {
+                line = 0;
             }
         }
         self.line = line;

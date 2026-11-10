@@ -64,7 +64,7 @@ async fn authorized(store: &Store, endpoint: &str) -> super::Authorized {
     manager.set_credential_store(tokens.clone());
     assert!(manager.initialize_from_store().await.unwrap());
     super::Authorized {
-        http: super::super::http::Http(Client::new()),
+        http: Client::new(),
         manager: std::sync::Arc::new(tokio::sync::Mutex::new(manager)),
         tokens,
     }
