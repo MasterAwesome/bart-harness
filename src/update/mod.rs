@@ -38,7 +38,7 @@ pub(crate) async fn run() -> Result<(), String> {
         })
         .ok_or_else(|| format!("release v{latest} has no checksum for {asset}"))?;
     let bytes = download(&client, &format!("{release}/{asset}"), MAX_BINARY_BYTES).await?;
-    if format!("{:x}", Sha256::digest(&bytes)) != expected {
+    if checksum(&bytes).as_slice() != expected.as_bytes() {
         return Err(format!(
             "{asset} from release v{latest} failed its checksum"
         ));
@@ -46,6 +46,17 @@ pub(crate) async fn run() -> Result<(), String> {
     install(&binary, &bytes, &latest)?;
     println!("updated bart {VERSION} to {latest}");
     Ok(())
+}
+
+fn checksum(bytes: &[u8]) -> [u8; 64] {
+    use std::io::Write as _;
+
+    let mut checksum = [0; 64];
+    let mut output = checksum.as_mut_slice();
+    for byte in Sha256::digest(bytes) {
+        write!(output, "{byte:02x}").expect("SHA-256 fits in 64 hex bytes");
+    }
+    checksum
 }
 
 async fn latest() -> Result<String, String> {
