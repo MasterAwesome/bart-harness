@@ -1187,13 +1187,13 @@ async fn main_requests_keep_affinity_and_prefixes_across_turns_resume_and_compac
     let key = format!("bart-{id}");
     for (index, request) in requests.iter().enumerate() {
         assert_eq!(request["prompt_cache_key"], key);
-        if index == 4 {
-            let system = request["instructions"].as_str().unwrap();
-            assert!(system.starts_with(requests[0]["instructions"].as_str().unwrap()));
-            assert!(system.contains("checkpoint output contract takes precedence"));
-        } else {
-            assert_eq!(request["instructions"], requests[0]["instructions"]);
-        }
+        assert_eq!(request["instructions"], requests[0]["instructions"]);
+        assert_eq!(
+            request
+                .to_string()
+                .contains("checkpoint output contract takes precedence"),
+            index == 4
+        );
         assert_eq!(request["tools"], requests[0]["tools"]);
     }
     for pair in requests[..4].windows(2) {
@@ -2410,8 +2410,12 @@ async fn checkpoint_generation_and_continuation_work_on_all_four_protocols() {
         let normal = system(&requests[1]);
         let checkpoint = system(&requests[0]);
         assert!(normal.contains("Always answer with a JSON object."));
-        assert!(checkpoint.starts_with(&normal));
-        assert!(checkpoint.contains("checkpoint output contract takes precedence"));
+        assert_eq!(checkpoint, normal);
+        assert!(
+            requests[0]
+                .to_string()
+                .contains("checkpoint output contract takes precedence")
+        );
         assert!(!normal.contains("Bart is creating a continuation checkpoint"));
         let messages = if matches!(protocol, Protocol::Responses) {
             &requests[1]["input"]

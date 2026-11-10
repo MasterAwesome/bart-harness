@@ -349,7 +349,7 @@ pub(super) async fn summarize(
     base: &provider::Request<'_>,
     on_event: &mut impl Reporter,
 ) -> Result<String, Error> {
-    let instructions = format!("{}\n\n{MODE}", base.instructions);
+    let instructions = base.instructions;
     let mut summary = String::new();
     let output_tokens = plan
         .output_tokens
@@ -367,9 +367,9 @@ pub(super) async fn summarize(
             ));
         }
         history.extend_from_slice(segment);
-        history.push(Message::User(format!("{PROMPT}\n\nHistory archive: {}.\nCurrent Python state (after the latest executed cell): {}\nOutput budget: {} tokens.\n{}", format_args!("history[{archive}]"), plan.inventory, output_tokens,
+        history.push(Message::User(format!("{}\n{MODE}\n\n{PROMPT}\n\nHistory archive: {}.\nCurrent Python state (after the latest executed cell): {}\nOutput budget: {} tokens.\n{}", bart!(const Summary, "request"), format_args!("history[{archive}]"), plan.inventory, output_tokens,
             if plan.tail.is_empty() { "" } else { "The latest tool exchange will follow your summary verbatim; the inventory includes its effects." }).into()));
-        let mut request = routing.request(&history, &[], &instructions, base.cache);
+        let mut request = routing.request(&history, &[], instructions, base.cache);
         request.tools = match base.tools {
             provider::Tools::Functions(definitions) | provider::Tools::Disabled(definitions) => {
                 provider::Tools::Disabled(definitions)
