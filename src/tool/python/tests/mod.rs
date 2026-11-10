@@ -95,7 +95,7 @@ async fn cells_keep_state_and_show_output_values_and_failures() {
     assert!(
         rebinding.text.starts_with("'mine'")
             && rebinding.text.ends_with(
-                "[edit, read: Bart builtin; this cell's own binding was removed after it ran]"
+                "[Bart cell: edit, read are built-ins; this cell's bindings of them were removed]"
             ),
         "a cell's rebinding works inside it and is reported: {}",
         rebinding.text
@@ -234,7 +234,7 @@ async fn run_preserves_failure_adopts_survivors_and_kills_on_timeout() {
         "a leftover process held sh open"
     );
     assert!(
-        left.text.contains("\"retained_job\":") && left.text.contains("\"return_code\":0"),
+        left.text.contains("left processes running as job[") && left.text.contains("exit 0"),
         "{}",
         left.text
     );
@@ -256,7 +256,7 @@ async fn run_preserves_failure_adopts_survivors_and_kills_on_timeout() {
         )
         .await;
         assert!(!output.is_error(), "{}", output.text);
-        assert!(output.text.contains("\"outcome\":\"killed\""));
+        assert!(output.text.contains("] killed"));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
     let output = cell(
@@ -316,13 +316,6 @@ async fn long_output_is_bounded_and_saved() {
         fs::read_to_string(path).unwrap().lines().count(),
         5_000,
         "the saved output is whole"
-    );
-    let kept = call(&json!({ "code": "for n in range(1, 5001): print(f'line {n}' if n != 2500 else 'error: bad')", "keep_matching": ["error"] }), &context).await;
-    assert!(kept.text.contains("error: bad"), "{}", kept.text);
-    assert!(
-        fs::read_to_string(&kept.saved.as_ref().unwrap().path)
-            .unwrap()
-            .contains("error: bad")
     );
 }
 
@@ -388,7 +381,7 @@ async fn cells_reach_mcp_servers() {
         "the timeout covers helpers"
     );
     assert!(hung.is_error(), "{}", hung.text);
-    assert!(!hung.text.contains("did not stop"), "{}", hung.text);
+    assert!(!hung.text.contains("is still running"), "{}", hung.text);
     text(&context, "6*7", "42").await;
     let failed = cell(&context, "mcp(\"com.example / staging'$\", 'fail')").await;
     assert!(
@@ -641,7 +634,7 @@ print('complete data; complete numbered representation')"#,
     assert!(!output.is_error(), "{}", output.text);
     assert_eq!(output.text.matches("RIGHT").count(), 1);
     assert_eq!(output.text.matches("crlf.txt").count(), 1);
-    assert!(output.text.contains("requested lines") && output.text.contains(r"\u202e"));
+    assert!(output.text.contains("[Bart read: ") && output.text.contains(r"\u202e"));
     assert!(!output.text.contains('\u{202e}'));
     assert!(
         output
@@ -747,8 +740,8 @@ print('DONE')"#,
     )
     .await;
     assert!(!output.is_error(), "{}", output.text);
-    assert_eq!(output.text.matches("[a.txt]").count(), 1);
-    assert_eq!(output.text.matches("[b.txt]").count(), 1);
+    assert_eq!(output.text.matches("[Bart read: a.txt:1-1]").count(), 1);
+    assert_eq!(output.text.matches("[Bart read: b.txt:1-1]").count(), 1);
     assert_eq!(output.text.matches("BETA").count(), 1);
     let output = cell(
         &context,
@@ -768,7 +761,7 @@ print('DONE')"#,
     )
     .await;
     assert!(!output.is_error(), "{}", output.text);
-    assert_eq!(output.text.matches("[a.txt]").count(), 2);
+    assert_eq!(output.text.matches("[Bart read: a.txt:1-1]").count(), 2);
     assert!(!output.text.contains("BETA"));
     let output = cell(
         &context,
@@ -1025,7 +1018,7 @@ async fn edit_batches_match_the_original_and_report_where_they_fail() {
     assert!(!partial.text.contains("Created ") && !partial.text.contains("Edited "));
     let effects = partial
         .text
-        .split_once("[before the failure, this cell ")
+        .split_once("[Bart cell: before failing it ")
         .unwrap()
         .1;
     assert_eq!(effects.matches("edited ").count(), 1, "{effects}");
@@ -1287,7 +1280,7 @@ async fn a_call_that_only_waited_for_a_busy_cell_is_not_numbered_as_one() {
         &context,
     )
     .await;
-    assert!(busy.text.contains("did not stop"), "{}", busy.text);
+    assert!(busy.text.contains("is still running"), "{}", busy.text);
     let waited = call(&json!({"code": "print('never')", "timeout": 1}), &context).await;
     assert!(waited.text.contains("not run"), "{}", waited.text);
     assert_eq!(
@@ -1346,7 +1339,7 @@ async fn showing_a_saved_image_again_names_it_without_its_path() {
     let saved = context.artifacts.dir().to_string_lossy().into_owned();
     assert!(!shown.text.contains(&saved), "{}", shown.text);
     assert_eq!(shown.images.len(), 1);
-    assert_eq!(shown.images[0].label, "[image[3]]");
+    assert_eq!(shown.images[0].label, "[Bart image: image[3]]");
     assert!(shown.text.is_empty(), "{}", shown.text);
     let images = crate::tool::deliver(&mut shown, &context, 8, true).await;
     assert_eq!(
@@ -1372,7 +1365,7 @@ async fn a_busy_cell_keeps_its_number_and_shell_order_while_the_next_call_waits(
     )
     .await;
     let first = busy.cell.unwrap();
-    assert!(busy.text.contains("did not stop"), "{}", busy.text);
+    assert!(busy.text.contains("is still running"), "{}", busy.text);
     let next = call(&json!({"code": "print('next')", "timeout": 20}), &context).await;
     assert!(
         next.text[..next.prefix_len.unwrap()].contains("second")
@@ -1827,10 +1820,7 @@ hidden = run(["bash", "-c", 'printf hidden'])
         .filter(|line| line.starts_with('{'))
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(
-        summaries,
-        vec![json!({"processes": [1, 2], "return_code": 0})]
-    );
+    assert_eq!(summaries, Vec::<serde_json::Value>::new());
     assert!(!output.text.contains("hidden") && !output.text.contains("warning"));
     let after = cell(&context, "print(r.stdout); print(read(cell[1].run[1]))").await;
     assert!(
@@ -1887,7 +1877,10 @@ run(["bash", "-c", "printf stderr-output >&2; exit 7"])
     ] {
         assert_eq!(output.text.matches(word).count(), 1, "{}", output.text);
         let reference = format!("cell[1].run[{number}]");
-        assert_eq!(output.text.matches(&reference).count(), 1);
+        assert_eq!(
+            output.text.matches(&reference).count(),
+            if number == 7 { 2 } else { 1 }
+        );
         assert!(output.text.find(&reference).unwrap() < output.text.find(word).unwrap());
     }
     assert!(output.text.contains("[Bart run: exit 7; cell[1].run[7]]"));
@@ -2061,7 +2054,7 @@ j = bg_run(['python3', '-c', "import os;open('env-result','w').write(os.environ[
 }
 
 #[tokio::test]
-async fn repetitive_success_statuses_compact_without_hiding_failure_or_incomplete_output() {
+async fn success_statuses_stay_out_of_the_result_without_hiding_failure_or_incomplete_output() {
     let dir = TempDir::new("python-summary-ranges");
     let context = session(dir.path(), Confinement::Unrestricted, 4000);
     let output = cell(
@@ -2070,18 +2063,9 @@ async fn repetitive_success_statuses_compact_without_hiding_failure_or_incomplet
     )
     .await;
     assert!(!output.is_error(), "{}", output.text);
+    assert!(!output.text.contains("] exit 0"), "{}", output.text);
     assert!(
-        output.text.contains("\"processes\":[1,70]"),
-        "{}",
-        output.text
-    );
-    assert!(
-        output.text.contains("\"process\":71,\"return_code\":7"),
-        "{}",
-        output.text
-    );
-    assert!(
-        output.text.contains("\"process\":72,\"return_code\":0"),
+        output.text.contains("cell[1].run[71] exit 7"),
         "{}",
         output.text
     );
@@ -2095,11 +2079,7 @@ async fn repetitive_success_statuses_compact_without_hiding_failure_or_incomplet
         "r=run(['true']); r=run(['bash','-c','echo prefix; sleep 30 &']); job[r.retained_job].kill(); r=run(['true'])",
     )
     .await;
-    assert!(
-        output.text.contains("stdout_file_incomplete"),
-        "{}",
-        output.text
-    );
+    assert!(output.text.contains("stdout incomplete"), "{}", output.text);
     assert!(!output.text.contains("\"processes\""), "{}", output.text);
 }
 
@@ -2232,7 +2212,7 @@ async fn oversized_bare_read_streams_a_prefix_and_saves_the_complete_numbered_vi
     assert!(
         output
             .text
-            .starts_with("[many.txt]\n[Bart read: requested lines 1-5001]\n     1\tαβγ"),
+            .starts_with("[Bart read: many.txt:1-5001]\n     1\tαβγ"),
         "{}",
         output.text
     );
@@ -2302,7 +2282,7 @@ async fn imported_project_and_chained_tracebacks_survive_without_harness_frames(
 async fn late_process_failures_survive_match_pressure_and_status_overflow_is_recoverable() {
     let dir = TempDir::new("late-process-status");
     let context = session(dir.path(), Confinement::Unrestricted, 4000);
-    let arguments = json!({"code":"print('padding' * 2000); print('MATCH ' + 'x' * 1900)\nfor _ in range(70): r=run(['false'])\nrecords=[json.loads(line) for line in cell[1].status.read_text().splitlines()]\nassert len(records)==70 and records[-1]['process']==70 and records[-1]['return_code']==1", "keep_matching":["MATCH"]});
+    let arguments = json!({"code":"print('padding' * 2000); print('MATCH ' + 'x' * 1900)\nfor _ in range(70): r=run(['false'])\nrecords=[json.loads(line) for line in cell[1].status.read_text().splitlines()]\nassert len(records)==70 and records[-1]['process']==70 and records[-1]['return_code']==1"});
     let call = crate::history::ToolCall {
         id: "status-overflow".into(),
         name: "python".into(),
@@ -2313,18 +2293,10 @@ async fn late_process_failures_survive_match_pressure_and_status_overflow_is_rec
     live.finish(output.status);
     super::super::deliver(&mut output, &context, 0, true).await;
     assert!(!output.is_error(), "{}", output.text);
-    assert!(
-        output.text.contains("\"process\":64,\"return_code\":1"),
-        "{}",
-        output.text
-    );
-    assert!(
-        output.text.contains("\"process_statuses_omitted\":6"),
-        "{}",
-        output.text
-    );
+    assert!(output.text.contains(".run[64] exit 1"), "{}", output.text);
+    assert!(output.text.contains("6 more not shown"), "{}", output.text);
     assert!(output.text.contains("cell[1].status"), "{}", output.text);
-    assert!(!output.text.contains("process statuses not saved"));
+    assert!(!output.text.contains("records not saved"));
 }
 
 #[tokio::test]
@@ -2334,12 +2306,8 @@ async fn a_status_archive_failure_is_explicit_and_does_not_hide_process_outcomes
     fs::create_dir(context.artifacts().dir().join("status-1.jsonl")).unwrap();
     let output = cell(&context, "r=run(['false'])").await;
     assert!(!output.is_error(), "{}", output.text);
-    assert!(
-        output.text.contains("process statuses not saved"),
-        "{}",
-        output.text
-    );
-    assert!(output.text.contains("\"return_code\":1"), "{}", output.text);
+    assert!(output.text.contains("records not saved"), "{}", output.text);
+    assert!(output.text.contains(".run[1] exit 1"), "{}", output.text);
 }
 
 #[tokio::test]
@@ -2372,8 +2340,8 @@ async fn web_search_batches_display_and_validate_queries() {
     let output = cell(&context, "web_search('first query', 'second query')").await;
     assert_eq!(output.status, Status::Succeeded, "{}", output.text);
     assert!(
-        output.text.contains("[Bart web search 1: first query]")
-            && output.text.contains("[Bart web search 2: second query]"),
+        output.text.contains("[Bart web_search: 1; first query]")
+            && output.text.contains("[Bart web_search: 2; second query]"),
         "{}",
         output.text
     );
@@ -2454,7 +2422,7 @@ print(j)
     assert!(!complete.is_error(), "{}", complete.text);
     assert!(complete.text.contains("exit 7") && complete.text.contains("warning"));
     let notes = context.jobs.take_notifications();
-    let projected = notes.last().unwrap().model_text();
+    let projected = &notes.last().unwrap().text;
     assert!(projected.contains(&format!("job[{id}]")));
     assert!(!projected.contains(&context.spill_dir.to_string_lossy().to_string()));
     context.stop();

@@ -129,7 +129,7 @@ pub(super) fn body(request: &Request) -> std::io::Result<Value> {
         .rposition(|message| !matches!(message, Message::Assistant(_) | Message::ToolResult(_)));
     for (at, message) in request.history.iter().enumerate() {
         match message {
-            Message::Notification(note) => push("user", json!({"text":note.model_text()})),
+            Message::Notification(note) => push("user", json!({"text":&*note.text})),
 
             Message::User(_)
             | Message::UserSource(_)

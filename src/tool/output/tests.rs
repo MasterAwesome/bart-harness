@@ -2,31 +2,6 @@ use super::*;
 use crate::tool::test_support::TempDir;
 
 #[test]
-fn selected_matches_are_bounded_metadata_never_appended_to_the_prefix() {
-    let dir = TempDir::new("output-matches");
-    let budget = 16 * 1024;
-    let keep = ["error".to_owned()];
-    let mut collector = Collector::new(
-        budget,
-        &Storage::open(dir.path()).unwrap(),
-        crate::tool::output::Name::Output(1),
-        &keep,
-    )
-    .unwrap();
-    for n in 0..10_000 {
-        collector.line(&format!("{n:05} error {}", "x".repeat(200)));
-    }
-    let (text, notes, _) = collector.finish();
-    assert!(text.len() < budget + 400, "{} bytes", text.len());
-    assert!(notes.contains("matching lines"));
-    assert!(notes.len() < 3000);
-    assert!(!text.contains("Bart matches:"));
-    let saved = fs::read_to_string(dir.path().join("output-1.log")).unwrap();
-    assert_eq!(text, saved[..text.len()]);
-    assert_eq!(text.len(), budget);
-}
-
-#[test]
 fn a_huge_unicode_line_shows_an_exact_prefix_and_saves_the_whole_capture() {
     let dir = TempDir::new("output-clip");
     let budget = 16 * 1024 + 3;
@@ -34,7 +9,6 @@ fn a_huge_unicode_line_shows_an_exact_prefix_and_saves_the_whole_capture() {
         budget,
         &Storage::open(dir.path()).unwrap(),
         crate::tool::output::Name::Output(2),
-        &[],
     )
     .unwrap();
     let line = "😀".repeat(16 * 1024);
@@ -67,7 +41,6 @@ fn one_file_stops_at_its_limit_and_says_so() {
         100,
         &Storage::open(dir.path()).unwrap(),
         crate::tool::output::Name::Output(3),
-        &[],
     )
     .unwrap();
     let line = "x".repeat(1024 * 1024 - 1);
@@ -139,7 +112,7 @@ async fn reopening_an_incomplete_output_keeps_it_incomplete_and_counts_from_its_
     let filler = fs::File::create(dir.path().join("filler")).unwrap();
     filler.set_len(MAX_SESSION_BYTES - 2000).unwrap();
     let storage = Storage::open(dir.path()).unwrap();
-    let mut first = Collector::new(100, &storage, Name::Output(1), &[]).unwrap();
+    let mut first = Collector::new(100, &storage, Name::Output(1)).unwrap();
     first.line("EARLY");
     first.line(&"m".repeat(3500));
     let earlier = first.saved();
@@ -173,7 +146,7 @@ async fn raw_stream_artifacts_obey_quotas_and_report_capture_and_save_failures()
         let dir = TempDir::new("raw-output-bounds");
         let storage = Storage::open(dir.path()).unwrap();
         let mut collector =
-            Collector::new(100, &storage, Name::Process { cell: 1, call: 1 }, &[]).unwrap();
+            Collector::new(100, &storage, Name::Process { cell: 1, call: 1 }).unwrap();
         if failure == "create" {
             fs::write(dir.path().join("run-1-1.stdout"), b"existing").unwrap();
         }
@@ -214,7 +187,7 @@ async fn raw_stream_artifacts_obey_quotas_and_report_capture_and_save_failures()
 fn multiline_prefix_never_resumes_after_an_omitted_unicode_character() {
     let dir = TempDir::new("output-prefix-unicode");
     let mut collector =
-        Collector::new(5, &Storage::open(dir.path()).unwrap(), Name::Output(1), &[]).unwrap();
+        Collector::new(5, &Storage::open(dir.path()).unwrap(), Name::Output(1)).unwrap();
     collector.line("abc");
     collector.line("😀rest");
     collector.line("TAIL");
@@ -236,7 +209,7 @@ fn display_omission_and_incomplete_capture_are_distinct_and_not_saved_as_source(
     ] {
         let dir = TempDir::new("output-capture-prefix");
         let mut collector =
-            Collector::new(4, &Storage::open(dir.path()).unwrap(), Name::Output(1), &[]).unwrap();
+            Collector::new(4, &Storage::open(dir.path()).unwrap(), Name::Output(1)).unwrap();
         collector.line("captured");
         collector.capture_failed(failure);
         let (text, notes, saved) = collector.finish();
@@ -253,13 +226,8 @@ fn display_omission_and_incomplete_capture_are_distinct_and_not_saved_as_source(
 fn short_and_exact_budget_output_need_no_delivery_notice() {
     for budget in [6, 20] {
         let dir = TempDir::new("output-prefix-short");
-        let mut collector = Collector::new(
-            budget,
-            &Storage::open(dir.path()).unwrap(),
-            Name::Output(1),
-            &[],
-        )
-        .unwrap();
+        let mut collector =
+            Collector::new(budget, &Storage::open(dir.path()).unwrap(), Name::Output(1)).unwrap();
         collector.line("hello");
         let (text, notes, saved) = collector.finish();
         assert_eq!(text, "hello\n");

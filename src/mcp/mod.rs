@@ -514,7 +514,7 @@ impl Registry {
         if let Some(guidance) = &connection.guidance {
             let cut = guidance.floor_char_boundary(guidance.len().min(MAX_GUIDANCE_BYTES));
             let more = if cut < guidance.len() {
-                "\n[guidance truncated]"
+                concat!("\n", bart!(const Mcp, "guidance truncated"))
             } else {
                 ""
             };
@@ -706,7 +706,7 @@ fn unshown(block: &ContentBlock) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ");
-    format!("[{kind} {detail} not shown]")
+    bart!(Mcp, "{kind} {detail} not shown")
 }
 
 fn client_config() -> ClientConfig {
@@ -1008,7 +1008,7 @@ fn clean(error: &str, secrets: &[String]) -> String {
     if safe.len() <= STDERR_TAIL_BYTES {
         return safe;
     }
-    let marker = "\n[diagnostic truncated]\n";
+    let marker = concat!("\n", bart!(const Mcp, "diagnostic truncated"), "\n");
     let head = safe.floor_char_boundary(STDERR_TAIL_BYTES / 2);
     let tail = safe.ceil_char_boundary(safe.len() - (STDERR_TAIL_BYTES - head - marker.len()));
     format!("{}{marker}{}", &safe[..head], &safe[tail..])

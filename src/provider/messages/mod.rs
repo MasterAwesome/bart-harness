@@ -147,9 +147,7 @@ fn messages(request: &Request) -> std::io::Result<Vec<Value>> {
     };
     for message in request.history {
         match message {
-            Message::Notification(note) => {
-                push("user", json!({"type":"text","text":note.model_text()}))
-            }
+            Message::Notification(note) => push("user", json!({"type":"text","text":&*note.text})),
 
             Message::User(_)
             | Message::UserSource(_)

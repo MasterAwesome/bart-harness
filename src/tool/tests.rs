@@ -28,7 +28,11 @@ async fn delivered_text_fits_the_budget_whatever_is_added_late() {
         output.text.contains("full output: cell[4].output"),
         "the full output stays reachable"
     );
-    assert!(output.text.ends_with("none was shown]"), "{}", output.text);
+    assert!(
+        output.text.ends_with("cannot see images]"),
+        "{}",
+        output.text
+    );
     assert_eq!(output.status, Status::Failed);
 }
 
@@ -44,9 +48,9 @@ async fn delivered_failures_identify_their_cell_without_taxing_successful_output
         if status == Status::Failed {
             assert_eq!(
                 output.text,
-                format!("brief{}[cell 17]", output::HOST_METADATA_BOUNDARY)
+                format!("brief{}[Bart cell: 17]", output::HOST_METADATA_BOUNDARY)
             );
-            assert!(output.notes.starts_with("[cell 17]"));
+            assert!(output.notes.starts_with("[Bart cell: 17]"));
         } else {
             assert_eq!(output.text, "brief");
             assert!(output.notes.is_empty());
@@ -68,7 +72,7 @@ async fn metadata_is_bounded_separate_and_delivery_is_idempotent() {
     deliver(&mut result, &context, 0, true).await;
     assert_eq!(&result.text[..32768], &source[..32768]);
     assert!(!result.text.contains("TAIL"));
-    assert!(result.text.contains("Bart metadata: remainder omitted"));
+    assert!(result.text.contains("Bart output: further notes omitted"));
     assert!(
         result.text.len()
             <= 32768 + output::HOST_METADATA_BOUNDARY.len() + output::HOST_METADATA_BYTES

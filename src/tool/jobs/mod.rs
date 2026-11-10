@@ -31,10 +31,8 @@ pub(crate) enum Cleanup {
 impl Cleanup {
     pub(crate) fn notice(self) -> &'static str {
         match self {
-            Self::Settled => "Tracked background jobs stopped.",
-            Self::Unconfirmed => {
-                "Cancellation was requested, but cleanup was not confirmed; descendants may remain."
-            }
+            Self::Settled => "background jobs stopped",
+            Self::Unconfirmed => "background jobs told to stop, some may remain",
         }
     }
 }
@@ -137,7 +135,20 @@ fn finished(
         summary.push_str(" …");
     }
     Notification {
-        text: format!("[background job {id} finished: {summary}]\n{output}").into(),
+        text: format!(
+            "{}\n{output}",
+            bart!(
+                Job,
+                "job[{id}] {}{}; {summary}",
+                outcome.label(),
+                if capture.is_complete() {
+                    ""
+                } else {
+                    "; output incomplete"
+                }
+            )
+        )
+        .into(),
         kind: NotificationKind::JobFinished {
             id,
             outcome,
@@ -208,7 +219,10 @@ impl Jobs {
         if collector.link(crate::tool::output::Name::Job(id)).is_err() {
             return Err(Box::new((reservation, process, collector)));
         }
-        collector.line("\n[foreground shell exited; descendant output continues below]");
+        collector.line(concat!(
+            "\n",
+            bart!(const Job, "command exited; child process output follows")
+        ));
         state
             .running
             .get_mut(&id)
@@ -262,7 +276,7 @@ impl Jobs {
                             let mut state = jobs.state();
                             state.running.get_mut(&id).expect("running job").command_exited = true;
                             state.notifications.push(Notification {
-                                text: format!("[background job {id} command exited; descendants retained as job {id}: {outcome:?}]\nThe requested command exited, but its descendants remain owned as job {id}. Use its result to continue; stop temporary descendants with job[{id}].kill() when no longer needed, without stopping intentional services.").into(),
+                                text: bart!(Job, "job[{id}] command {}; its child processes still run as job[{id}]", outcome.label()).into(),
                                 kind: NotificationKind::JobCommandExited { id, outcome, command: command.clone() },
                             });
                             jobs.changed.notify_waiters();
@@ -283,7 +297,10 @@ impl Jobs {
             .await
             .expect("job result worker");
             if let Err(error) = saved {
-                output.push_str(&format!("\n[Bart: job[{id}] result unavailable: {error}]"));
+                output.push_str(&format!(
+                    "\n{}",
+                    bart!(Job, "job[{id}] result unavailable; {error}")
+                ));
             }
             let mut state = reservation.jobs.state();
             if let Some(job) = state.running.remove(&id) {
@@ -311,8 +328,8 @@ impl Jobs {
         };
         self.state().notifications.push(Notification {
             text: format!(
-                "[background job {id} matched {:?}]\n{}{rest}",
-                regex.as_str(),
+                "{}\n{}{rest}",
+                bart!(Job, "job[{id}] matched {:?}", regex.as_str()),
                 &line[..shown]
             )
             .into(),
@@ -336,7 +353,6 @@ impl Jobs {
             context.output_budget,
             &context.artifacts,
             crate::tool::output::Name::Job(id),
-            &[],
         )
         .await
         .map_err(|error| format!("cannot create the job's output file: {error}"))?;

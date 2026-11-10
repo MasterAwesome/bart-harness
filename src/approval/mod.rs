@@ -399,7 +399,7 @@ impl Gate<'_> {
         if self.approval.mode == Mode::Auto {
             if let Err(reason) = envelope(&[], &action) {
                 self.stopped = true;
-                return Err(format!("[not run: parent denied: {reason}]"));
+                return Err(bart!(NotRun, "reviewer denied; {reason}"));
             }
             self.journal.settle_recording().await;
             if let Some(reason) = self.journal.take_recording_notice() {
@@ -428,8 +428,9 @@ impl Gate<'_> {
             } else {
                 "needs user approval".into()
             };
-            return Err(format!(
-                "[not run: {reason}; a headless run cannot ask the user]"
+            return Err(bart!(
+                NotRun,
+                "{reason}; a headless run cannot ask the user"
             ));
         }
         let (sender, receiver) = oneshot::channel();
@@ -445,7 +446,7 @@ impl Gate<'_> {
             return Ok(());
         }
         self.stopped = true;
-        Err("[not run: user denied]".into())
+        Err(bart!(const NotRun, "user denied").into())
     }
 }
 

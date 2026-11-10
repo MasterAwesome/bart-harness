@@ -89,7 +89,6 @@ async fn typed_results_bound_output_timeout_and_cancellation() {
                 cell: context.artifacts.next_cell().unwrap(),
                 call: 1,
             },
-            &[],
         )
         .unwrap();
         let live = context.live.start("test", command, None);
@@ -127,7 +126,6 @@ async fn typed_results_bound_output_timeout_and_cancellation() {
             cell: context.artifacts.next_cell().unwrap(),
             call: 1,
         },
-        &[],
     )
     .unwrap();
     let live = context.live.start("test", "", None);
@@ -184,7 +182,6 @@ async fn adoption_keeps_descendants_and_the_same_output_file_until_killed() {
                 cell: context.artifacts.next_cell().unwrap(),
                 call: 1,
             },
-            &[],
         )
         .unwrap();
         let path = collector.path().to_owned();
@@ -217,8 +214,7 @@ async fn adoption_keeps_descendants_and_the_same_output_file_until_killed() {
         wait_until_dead(fs::read_to_string(dir.path().join("pid")).unwrap().trim()).await;
         let saved = fs::read_to_string(path).unwrap();
         assert!(saved.contains("before"), "{saved}");
-        assert!(saved.contains("descendant output continues"), "{saved}");
-        assert!(saved.contains("shell and descendants ended"), "{saved}");
+        assert!(saved.contains("child process output follows"), "{saved}");
     }
 }
 
@@ -234,7 +230,6 @@ async fn session_end_kills_adopted_jobs() {
             cell: context.artifacts.next_cell().unwrap(),
             call: 1,
         },
-        &[],
     )
     .unwrap();
     let live = context.live.start("test", command, None);
@@ -271,7 +266,6 @@ async fn timeout_and_cancellation_kill_detached_and_double_forked_descendants() 
                 cell: context.artifacts.next_cell().unwrap(),
                 call: 1,
             },
-            &[],
         )
         .unwrap();
         let live = context.live.start("test", command, None);
@@ -317,7 +311,6 @@ async fn fast_shell_exit_preserves_output_status_and_reaps_the_supervisor() {
                 cell: context.artifacts.next_cell().unwrap(),
                 call: 1,
             },
-            &[],
         )
         .unwrap();
         let live = context.live.start("fast", &command, None);
@@ -352,7 +345,6 @@ async fn pending_exit_never_adopts_after_deadline_or_cancellation() {
                 cell: context.artifacts.next_cell().unwrap(),
                 call: 1,
             },
-            &[],
         )
         .unwrap();
         let live = context.live.start("race", command, None);
@@ -400,7 +392,6 @@ async fn adopted_partial_output_continues_once_in_the_same_file_and_job_output()
             cell: context.artifacts.next_cell().unwrap(),
             call: 1,
         },
-        &[],
     )
     .unwrap();
     let path = collector.path().to_owned();
@@ -446,7 +437,7 @@ async fn adopted_partial_output_continues_once_in_the_same_file_and_job_output()
     let notes = context.jobs.take_notifications();
     assert_eq!(notes.len(), 1);
     assert!(
-        notes[0].text.contains("exit 4") && notes[0].text.contains("shell and descendants ended"),
+        notes[0].text.contains("exit 4") && notes[0].text.contains("beforeafter"),
         "{}",
         notes[0].text
     );

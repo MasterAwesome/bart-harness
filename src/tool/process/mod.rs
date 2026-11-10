@@ -421,7 +421,7 @@ impl Process {
         }
         if let Some(Err(error)) = &scope {
             outcome = JobOutcome::Unknown;
-            footer = format!("[cleanup failed: {error}; descendants may remain]");
+            footer = bart!(Job, "cleanup failed ({error}); child processes may remain");
             self.observation
                 .lock()
                 .expect(crate::NOT_POISONED)
@@ -433,9 +433,6 @@ impl Process {
             .timed_out = timed_out;
         if timeout.is_none() {
             collector.line(&footer);
-            if matches!(scope, Some(Ok(_))) {
-                collector.line("[shell and descendants ended]");
-            }
         }
         let (text, saved, streams) = tokio::task::spawn_blocking(move || {
             let streams = collector.finish_streams([end_stdout, end_stderr]);
@@ -551,20 +548,32 @@ fn termination(
     let mut footer = String::new();
     let _ = match status {
         Some(Ok(status)) => match status.code() {
-            Some(code) => write!(footer, "[exit {code}, {elapsed:.1}s]"),
+            Some(code) => write!(footer, "{}", bart!(Job, "exit {code} after {elapsed:.1}s")),
             None => write!(
                 footer,
-                "[terminated by signal {}, {elapsed:.1}s]",
-                status.signal().expect("exited or signaled status")
+                "{}",
+                bart!(
+                    Job,
+                    "signal {} after {elapsed:.1}s",
+                    status.signal().expect("exited or signaled status")
+                )
             ),
         },
         Some(Err(error)) => {
-            write!(footer, "[exit status unavailable: {error}, {elapsed:.1}s]")
+            write!(
+                footer,
+                "{}",
+                bart!(Job, "exit status unavailable ({error}) after {elapsed:.1}s")
+            )
         }
-        None => write!(footer, "[exit status unknown, {elapsed:.1}s]"),
+        None => write!(
+            footer,
+            "{}",
+            bart!(Job, "exit status unknown after {elapsed:.1}s")
+        ),
     };
     if cancelled {
-        footer.push_str("\n[cancelled; effects unknown]");
+        footer.push_str(concat!("\n", bart!(const Job, "cancelled")));
         (JobOutcome::Killed, footer)
     } else {
         (outcome, footer)

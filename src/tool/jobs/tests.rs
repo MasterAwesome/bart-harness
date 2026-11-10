@@ -8,7 +8,7 @@ async fn cleanup_deadline_does_not_claim_reserved_scopes_stopped() {
     assert!(reserved.cancel.is_cancelled());
     let cleanup = jobs.settled().await;
     assert_eq!(cleanup, Cleanup::Unconfirmed);
-    assert!(cleanup.notice().contains("not confirmed"));
+    assert!(cleanup.notice().contains("some may remain"));
     drop(reserved);
     assert_eq!(jobs.settled().await, Cleanup::Settled);
 }

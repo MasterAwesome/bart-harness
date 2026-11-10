@@ -36,12 +36,13 @@ pub(super) fn notices(history: &[Message]) -> Vec<Notification> {
         .iter()
         .any(|message| matches!(message, Message::ToolResult(_)))
     {
-        notices.push(Notification { text: "[Bart resumed in a new process: Python state is gone; prior effects were not rolled back. Inspect current files and rebuild needed state without repeating completed external effects.]".to_owned().into(), kind: NotificationKind::Recovery });
+        notices.push(Notification { text: bart!(const Session, "resumed in a new process; Python state is gone, files and earlier effects remain").to_owned().into(), kind: NotificationKind::Recovery });
     }
     for job in lost {
         notices.push(Notification {
-            text: format!(
-                "[Bart lost track of background job {job} when its previous process exited; it may still be running, and its effects are unknown]"
+            text: bart!(
+                Job,
+                "job[{job}] lost when Bart restarted; it may still be running"
             )
             .into(),
             kind: NotificationKind::JobLost { id: job },

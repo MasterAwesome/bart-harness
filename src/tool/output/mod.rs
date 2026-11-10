@@ -434,13 +434,17 @@ impl StatusWriter {
         }
     }
 
-    pub(in crate::tool) fn finish(self) -> String {
+    pub(in crate::tool) fn finish(self, omitted: u64) -> String {
         match self.artifact {
             Some(Ok(mut artifact)) => {
                 artifact.finalize();
-                format!("[{}]", artifact.describe("process statuses"))
+                if omitted == 0 && artifact.complete() {
+                    String::new()
+                } else {
+                    bart!(Status, "{}", artifact.describe("all records"))
+                }
             }
-            Some(Err(error)) => format!("[process statuses not saved: {error}]"),
+            Some(Err(error)) => bart!(Status, "records not saved; {error}"),
             None => String::new(),
         }
     }
@@ -461,7 +465,6 @@ pub(in crate::tool) struct Collector {
     streams: Option<[io::Result<Artifact>; 2]>,
     capture_failure: Option<CaptureFailure>,
     budget: usize,
-    keep: Vec<String>,
     head: String,
     lines: usize,
     bytes: usize,
@@ -470,9 +473,6 @@ pub(in crate::tool) struct Collector {
     resumed: bool,
     name: Name,
     output: Artifact,
-    matched: usize,
-    matches: Vec<(usize, String)>,
-    match_bytes: usize,
     last_flush: std::time::Instant,
 }
 
@@ -481,22 +481,15 @@ impl Collector {
         budget: usize,
         storage: &Arc<Storage>,
         name: Name,
-        keep: &[String],
     ) -> io::Result<Self> {
-        Ok(Self::with(
-            budget,
-            name,
-            Artifact::named(storage, name)?,
-            keep,
-        ))
+        Ok(Self::with(budget, name, Artifact::named(storage, name)?))
     }
 
-    fn with(budget: usize, name: Name, output: Artifact, keep: &[String]) -> Self {
+    fn with(budget: usize, name: Name, output: Artifact) -> Self {
         Self {
             streams: None,
             capture_failure: None,
             budget,
-            keep: keep.iter().map(|term| term.to_lowercase()).collect(),
             head: String::new(),
             lines: 0,
             bytes: 0,
@@ -505,9 +498,6 @@ impl Collector {
             resumed: false,
             name,
             output,
-            matched: 0,
-            matches: Vec::new(),
-            match_bytes: 0,
             last_flush: std::time::Instant::now(),
         }
     }
@@ -516,14 +506,12 @@ impl Collector {
         budget: usize,
         storage: &Arc<Storage>,
         name: Name,
-        keep: &[String],
     ) -> io::Result<Self> {
         let storage = Arc::clone(storage);
-        let keep = keep.to_vec();
         let lease = storage.try_lease_writer()?;
         tokio::task::spawn_blocking(move || {
             let _lease = lease;
-            Self::new(budget, &storage, name, &keep)
+            Self::new(budget, &storage, name)
         })
         .await
         .map_err(io::Error::other)?
@@ -544,7 +532,7 @@ impl Collector {
                 Completeness::Incomplete(omission) => Some(omission),
             };
             let output = Artifact::append(&storage, name, omission)?;
-            let mut collector = Self::with(budget, name, output, &[]);
+            let mut collector = Self::with(budget, name, output);
             collector.chars = earlier.chars;
             collector.resumed = true;
             Ok(collector)
@@ -557,17 +545,15 @@ impl Collector {
         budget: usize,
         storage: &Arc<Storage>,
         code: &str,
-        keep: &[String],
     ) -> io::Result<Self> {
         let storage = Arc::clone(storage);
         let code = code.to_owned();
-        let keep = keep.to_vec();
         let lease = storage.try_lease_writer()?;
         tokio::task::spawn_blocking(move || {
             let _lease = lease;
             let cell = storage.next_cell()?;
             save(&storage, Name::Code(cell), code.as_bytes())?;
-            Self::new(budget, &storage, Name::Output(cell), &keep)
+            Self::new(budget, &storage, Name::Output(cell))
         })
         .await
         .map_err(io::Error::other)?
@@ -712,7 +698,6 @@ impl Collector {
                 self.overflowed = true;
             }
         }
-        self.keep_line(self.lines, line);
     }
 
     pub(super) fn capture_failed(&mut self, failure: CaptureFailure) {
@@ -754,22 +739,6 @@ impl Collector {
         }
     }
 
-    fn keep_line(&mut self, number: usize, line: &str) {
-        if self.keep.is_empty() {
-            return;
-        }
-        let lowercase = line.to_lowercase();
-        if !self.keep.iter().any(|term| lowercase.contains(term)) {
-            return;
-        }
-        self.matched += 1;
-        let entry = serde_json::json!({"line": number, "text": line}).to_string();
-        if self.match_bytes + entry.len() < (self.budget / 2).min(2048) {
-            self.match_bytes += entry.len() + 1;
-            self.matches.push((number, line.to_owned()));
-        }
-    }
-
     /// Keep output bytes and host-authored delivery metadata separate. The saved
     /// artifact contains captured output only, never an inserted omission notice.
     pub(in crate::tool) fn finish(mut self) -> (String, String, SavedArtifact) {
@@ -786,66 +755,64 @@ impl Collector {
             let resume = resume(&self.head, &self.output.reference);
             let _ = writeln!(
                 notes,
-                "[Bart output: {}/{} {scope}bytes shown; {completeness} output: {}{resume}]",
-                self.head.len(),
-                self.bytes,
-                self.output.reference
+                "{}",
+                bart!(
+                    Output,
+                    "{}/{} {scope}bytes shown; {completeness} output: {}{resume}",
+                    self.head.len(),
+                    self.bytes,
+                    self.output.reference
+                )
             );
-            self.write_matches(&mut notes);
         }
         if !self.output.complete() {
-            let _ = writeln!(notes, "[{}]", self.output.describe("saved output"));
+            let _ = writeln!(
+                notes,
+                "{}",
+                bart!(Output, "{}", self.output.describe("saved"))
+            );
         }
         match &self.capture_failure {
             Some(CaptureFailure::Read(error)) => {
                 let _ = writeln!(
                     notes,
-                    "[Bart capture: {error}; {} incomplete; total output size unknown]",
-                    self.output.reference
+                    "{}",
+                    bart!(
+                        Output,
+                        "{error}; {} incomplete; total output size unknown",
+                        self.output.reference
+                    )
                 );
             }
             Some(CaptureFailure::DrainDeadline) => {
                 let _ = writeln!(
                     notes,
-                    "[Bart capture: drain deadline before EOF; {} incomplete; total output size unknown]",
-                    self.output.reference
+                    "{}",
+                    bart!(
+                        Output,
+                        "drain deadline before EOF; {} incomplete; total output size unknown",
+                        self.output.reference
+                    )
                 );
             }
             None => {}
         }
         (self.head, notes, saved)
     }
-
-    fn write_matches(&self, text: &mut String) {
-        if self.keep.is_empty() {
-            return;
-        }
-        let _ = writeln!(
-            text,
-            "[Bart matches: {}/{} matching lines shown as JSON]",
-            self.matches.len(),
-            self.matched
-        );
-        for (number, line) in &self.matches {
-            let _ = writeln!(
-                text,
-                "{}",
-                serde_json::json!({"line": number, "text": line})
-            );
-        }
-    }
 }
 
 pub(in crate::tool) const HOST_METADATA_BYTES: usize = 24 * 1024;
-pub(in crate::tool) const HOST_METADATA_BOUNDARY: &str = "\n\n[Bart metadata — not source]\n";
+pub(in crate::tool) const HOST_METADATA_BOUNDARY: &str = "\n";
 
 pub(in crate::tool) fn render(prefix: &str, notes: &str) -> String {
     if notes.is_empty() {
         return prefix.to_owned();
     }
-    let omitted = "[Bart metadata: remainder omitted]";
+    let omitted = bart!(const Output, "further notes omitted");
     let mut result = prefix.to_owned();
-    result.push_str(HOST_METADATA_BOUNDARY);
+    if !prefix.is_empty() {
+        result.push_str(HOST_METADATA_BOUNDARY);
+    }
     let start = result.len();
     for line in notes.lines() {
         if result.len() - start + line.len() + 1 > HOST_METADATA_BYTES - omitted.len() - 1 {

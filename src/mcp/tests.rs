@@ -364,7 +364,9 @@ async fn a_tool_past_the_listing_limit_is_found_by_its_input_description() {
         .split_once("server-provided guidance:\n")
         .unwrap()
         .1;
-    let (kept, _) = guidance.split_once("\n[guidance truncated]").unwrap();
+    let (kept, _) = guidance
+        .split_once("\n[Bart mcp: guidance truncated]")
+        .unwrap();
     assert!(kept.len() <= 4096 && kept.chars().all(|c| c == '界'));
 }
 

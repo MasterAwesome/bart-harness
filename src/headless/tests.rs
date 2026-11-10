@@ -61,9 +61,9 @@ async fn headless_finishes_after_root_exit_and_cleans_retained_descendants() {
         let shown = serde_json::to_string(&*requests).unwrap();
         assert!(
             shown.contains(if foreground {
-                "retained_job"
+                "left processes running as job["
             } else {
-                "background_command_exit"
+                "its child processes still run"
             }),
             "{shown}"
         );
@@ -130,5 +130,5 @@ async fn headless_yield_still_waits_for_an_active_command_and_delivers_its_resul
     );
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 3);
-    assert!(requests[2].to_string().contains("background_completion"));
+    assert!(requests[2].to_string().contains("[Bart job: job["));
 }

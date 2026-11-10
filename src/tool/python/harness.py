@@ -21,6 +21,7 @@ import threading
 import time
 import traceback
 import types
+import warnings
 import weakref
 
 if sys.version_info < (3, 10):
@@ -207,6 +208,11 @@ class SavedStream:
 _RUN_VIEW_BYTES = 8 * 1024
 
 
+def _bart(kind, fields):
+    fields = str(fields).replace("\n", " ").replace("\r", " ")
+    return f"[Bart {kind}: {fields}]"
+
+
 class Result:
     """A command result with a bounded, attributed display and complete stream accessors."""
 
@@ -267,7 +273,7 @@ class Result:
         status = ("running" if result.outcome is None else
                   f"exit {result.return_code}" if isinstance(result.outcome, dict) and "exit" in result.outcome else str(result.outcome))
         kind = "bg_run" if reference.startswith("job[") else "run"
-        heading = f"[Bart {kind}: {'; '.join([*flags, status, reference])}]"
+        heading = _bart(kind, "; ".join([*flags, status, reference]))
         return heading + ("\n" + text if text else "")
 
     def __bool__(self):
@@ -442,7 +448,7 @@ def whoami():
 def _background(argv, notify, env, **options):
     result = Job(**_call("background", argv=_argv(argv), notify=notify,
                         env={} if env is None else dict(env), **options))
-    print(f"[Bart bg_run: job[{result.id}] started]")
+    print(_bart("bg_run", f"job[{result.id}] started"))
     return result
 
 
@@ -462,15 +468,11 @@ if _CONFIG["escape"]:
     run, bg_run = run_escaping, bg_run_escaping
 
 
-
-
-
 def web_search(*queries):
     """Search for each query and return its answer and sources."""
     if not all(isinstance(query, str) for query in queries):
         raise BartError("web_search queries must be strings")
     return Text(_call("web_search", queries=queries))
-
 
 
 MAX_FILE_BYTES = _CONFIG["file_bytes"]
@@ -501,11 +503,27 @@ def _reason(error):
     return error.strerror or str(error)
 
 
+def _nearby(path, error):
+    if not isinstance(error, (FileNotFoundError, NotADirectoryError)):
+        return ""
+    parent = os.path.dirname(path) or "."
+    while not os.path.isdir(parent):
+        parent = os.path.dirname(parent) or "."
+    try:
+        with os.scandir(parent) as entries:
+            names = sorted(entry.name for entry in itertools.islice(entries, 25))
+    except OSError:
+        return ""
+    names = ["".join(c if c.isprintable() else "?" for c in name) for name in names]
+    shown = ", ".join(names[:24]) + (", and more" if len(names) > 24 else "")
+    return f"; {parent} has: {shown}" if names else f"; {parent} is empty"
+
+
 def _open_regular(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC)
     except OSError as error:
-        raise BartError(f"cannot access {path}: {_reason(error)}") from None
+        raise BartError(f"cannot access {path}: {_reason(error)}{_nearby(path, error)}") from None
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         os.close(fd)
@@ -526,10 +544,10 @@ class _ReadText(Text):
         name, first, total, counted_all = self._view
         if not self:
             status = "empty file" if counted_all and total == 0 else "no lines"
-            yield f"[{name}: {status}]"
+            yield _bart("read", f"{name}: {status}")
             return
         count = self.count("\n") + (not self.endswith("\n"))
-        yield f"[{name}]\n[Bart read: requested lines {first}-{first + count - 1}]"
+        yield _bart("read", f"{name}:{first}-{first + count - 1}")
         start = 0
         index = first
         while start < len(self):
@@ -597,9 +615,9 @@ def read(path, offset=1, limit=None):
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise BartError(f"{path} is not valid UTF-8 text") from None
-    name = "".join(c if c.isprintable() else ascii(c)[1:-1] for c in os.path.basename(path))
-    if len(name) > 48:
-        name = name[:47] + "…"
+    name = "".join(c if c.isprintable() else ascii(c)[1:-1] for c in path)
+    if len(name) > 56:
+        name = name[:19] + "…" + name[-36:]
     return _ReadText(text, name, first, total, counted_all)
 
 
@@ -1063,8 +1081,8 @@ def display(*images):
             data = file.read(MAX_IMAGE_BYTES + 1)
         saved = pathlib.Path(path)
         stem = saved.name.split(".", 1)[0]
-        label = (f"[image[{stem[6:]}]]" if saved.parent == _SAVED and stem.startswith("image-")
-                 and stem[6:].isdigit() else f"[image {path}]")
+        label = (_bart("image", f"image[{stem[6:]}]") if saved.parent == _SAVED and stem.startswith("image-")
+                 and stem[6:].isdigit() else _bart("image", path))
         _call("image", label=label, data=base64.b64encode(data).decode("ascii"))
 
 
@@ -1193,7 +1211,7 @@ def restore():
     if rebound := sorted(names & namespace.keys()):
         for name in rebound:
             del namespace[name]
-        sys.stderr.write(f"\n[{', '.join(rebound)}: Bart builtin; this cell's own binding was removed after it ran]\n")
+        sys.stderr.write("\n" + _bart("cell", f"{', '.join(rebound)} are built-ins; this cell's bindings of them were removed") + "\n")
 
 
 def execute_cell(code, diffs, cell_number):
@@ -1217,7 +1235,9 @@ def execute_cell(code, diffs, cell_number):
                     del _writable_files[file]
                 else:
                     _track_file(path)
-        tree = ast.parse(code, filename, "exec")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", ".*invalid escape sequence", SyntaxWarning)
+            tree = ast.parse(code, filename, "exec")
         compile(tree, filename, "exec")
         last = tree.body.pop() if tree.body and isinstance(tree.body[-1], ast.Expr) else None
         tree = ast.fix_missing_locations(_ExpressionDisplay().visit(tree))

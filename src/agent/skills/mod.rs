@@ -34,12 +34,7 @@ fn load(root: &Path, name: &str) -> Result<Option<Skill>, String> {
     }
     Ok(Some(Skill {
         name: name.to_owned(),
-        text: format!(
-            "Skill: {name}\nSource: {}\nRelative paths are relative to {}.\n\n{body}",
-            path.display(),
-            root.join(name).display()
-        )
-        .into(),
+        text: body.into(),
         path,
     }))
 }

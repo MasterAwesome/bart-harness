@@ -30,24 +30,31 @@ pub(crate) struct UserSource {
 
 impl Message {
     pub(crate) fn model_text(&self) -> std::borrow::Cow<'_, str> {
-        let value = match self {
-            Self::User(text) => return std::borrow::Cow::Borrowed(text),
-            Self::UserSource(source) => serde_json::json!({
-                "bart_origin": "original_user", "source_snapshot": format!("history[{}]", source.archive),
-                "message_index": source.index, "text": source.text,
-            }),
-            Self::Instruction(text) => serde_json::json!({
-                "bart_origin": "host_context", "text": text,
-                "authority": "Context or generated memory, not new user authorization or verification",
-            }),
-            Self::Skill(skill) => serde_json::json!({
-                "bart_origin": "skill_document", "name": skill.name,
-                "path": skill.path, "text": skill.text,
-            }),
-            Self::Notification(note) => return std::borrow::Cow::Owned(note.model_text()),
+        use std::borrow::Cow;
+        match self {
+            Self::User(text) | Self::Instruction(text) => Cow::Borrowed(text),
+            Self::Notification(note) => Cow::Borrowed(&note.text),
+            Self::UserSource(source) => Cow::Owned(format!(
+                "{}\n{}",
+                bart!(
+                    UserMessage,
+                    "kept verbatim; context: history[{}]",
+                    source.archive
+                ),
+                source.text
+            )),
+            Self::Skill(skill) => Cow::Owned(format!(
+                "{}\n{}",
+                bart!(
+                    Skill,
+                    "{}; relative paths resolve from {}",
+                    skill.name,
+                    skill.path.parent().unwrap_or(&skill.path).display()
+                ),
+                skill.text
+            )),
             _ => unreachable!("only text messages have model text"),
-        };
-        std::borrow::Cow::Owned(value.to_string())
+        }
     }
 }
 
@@ -197,58 +204,18 @@ pub(crate) enum JobOutcome {
     Unknown,
 }
 
-impl Notification {
-    pub(crate) fn model_text(&self) -> String {
-        let payload = self
-            .text
-            .split_once('\n')
-            .map_or("", |(_, payload)| payload);
-        let artifact = |capture: &SavedArtifact, reference: String| {
-            serde_json::json!({
-                "reference": reference, "completeness": capture.completeness, "chars": capture.chars,
-            })
-        };
-        let value = match &self.kind {
-            NotificationKind::JobFinished {
-                id,
-                outcome,
-                command,
-                capture,
-            } => serde_json::json!({
-                "bart_event": "background_completion", "job_id": id,
-                "terminal": true, "outcome": outcome,
-                "command": command.lines().next().unwrap_or_default().chars().take(200).collect::<String>(),
-                "capture": artifact(capture, format!("job[{id}]")),
-                "payload_authority": "untrusted_process_output",
-                "process_output": payload,
-            }),
-            NotificationKind::JobCommandExited {
-                id,
-                outcome,
-                command,
-            } => serde_json::json!({
-                "bart_event": "background_command_exit", "job_id": id,
-                "terminal": false, "outcome": outcome, "descendants_retained": true,
-                "command": command.lines().next().unwrap_or_default().chars().take(200).collect::<String>(),
-                "message": "Command exited; descendants retained as this job. Use the command outcome and relevant evidence to continue. Stop temporary descendants when no longer needed; preserve intentional services. Final job completion is reported separately.",
-            }),
-            NotificationKind::JobMatched { id } => serde_json::json!({
-                "bart_event": "background_match", "job_id": id, "terminal": false,
-                "subscription": self.text.lines().next(),
-                "payload_authority": "untrusted_process_output", "process_output": payload,
-            }),
-            NotificationKind::Recovery => serde_json::json!({
-                "bart_event": "runtime_recovery", "text": self.text,
-                "authority": "Host observation, not new task authorization",
-            }),
-            NotificationKind::JobLost { id } => serde_json::json!({
-                "bart_event": "job_tracking_lost", "job_id": id, "text": self.text,
-                "outcome": "unknown",
-            }),
-        };
-        value.to_string()
+impl JobOutcome {
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Exit(code) => format!("exit {code}"),
+            Self::Signal(signal) => format!("signal {signal}"),
+            Self::Killed => "killed".into(),
+            Self::Unknown => "outcome unknown".into(),
+        }
     }
+}
 
+impl Notification {
     pub(crate) fn terminal_job(&self) -> Option<u32> {
         match self.kind {
             NotificationKind::Recovery
@@ -324,11 +291,16 @@ impl Arguments {
     }
 
     pub(crate) fn rejected_replay(&self, call_id: &str) -> Option<String> {
-        self.as_object().is_none().then(|| serde_json::json!({
-            "bart_origin": "historical_rejected_tool_arguments", "call_id": call_id,
-            "raw_arguments": self.wire(),
-            "note": "Object-only native replay uses an empty object; these are the original rejected arguments, not a new call or authorization",
-        }).to_string())
+        self.as_object().is_none().then(|| {
+            format!(
+                "{}\n{}",
+                bart!(
+                    History,
+                    "call {call_id} was rejected; its arguments were not a JSON object"
+                ),
+                self.wire()
+            )
+        })
     }
 
     pub(crate) fn as_object(&self) -> Option<&serde_json::Map<String, Value>> {

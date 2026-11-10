@@ -1,5 +1,5 @@
 use crate::history::JobOutcome;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use super::*;
 use crate::approval::Mode;
@@ -903,9 +903,9 @@ async fn compaction_summarizes_once_and_resumes_its_window() {
         !next.contains(&"x".repeat(1000)),
         "the next request uses the summarized window"
     );
-    assert!(next.contains("Bart conversation summary"));
+    assert!(next.contains("Bart summary: replaces earlier context"));
     assert!(
-        next.contains("Bart conversation summary"),
+        next.contains("Bart summary: replaces earlier context"),
         "the replacement is explained"
     );
     assert_eq!(
@@ -925,7 +925,7 @@ async fn compaction_summarizes_once_and_resumes_its_window() {
             "rewind must not cause another summary request"
         );
         let retried = requests.last().unwrap().to_string();
-        assert!(retried.contains("Bart conversation summary"));
+        assert!(retried.contains("Bart summary: replaces earlier context"));
         assert!(!retried.contains(&"x".repeat(1000)));
         assert!(
             !retried.contains("print(keep + 1)"),
@@ -1038,7 +1038,11 @@ async fn lowering_window_compacts_evidence_but_retains_unfit_original_requiremen
         }
         let continued = requests.last().unwrap();
         assert!(continued.get("tools").is_some());
-        assert!(continued.to_string().contains("Bart conversation summary"));
+        assert!(
+            continued
+                .to_string()
+                .contains("Bart summary: replaces earlier context")
+        );
         assert!(!continued.to_string().contains(&"1".repeat(5000)));
         assert!(!continued.to_string().contains(&"x".repeat(5000)));
     }
@@ -1097,9 +1101,12 @@ async fn mid_turn_summary_preserves_the_task_and_live_python_state() {
         );
         let sent = requests[4].to_string();
         assert!(sent.contains("Finish this task."));
-        assert!(!sent.contains(&"x".repeat(1000)) && sent.contains("Bart conversation summary"));
         assert!(
-            sent.contains("Bart conversation summary"),
+            !sent.contains(&"x".repeat(1000))
+                && sent.contains("Bart summary: replaces earlier context")
+        );
+        assert!(
+            sent.contains("Bart summary: replaces earlier context"),
             "the replacement is explained"
         );
     }
@@ -1446,7 +1453,7 @@ async fn an_overflow_compacts_and_retries_once_then_stops() {
         assert_eq!(requests[sent + 1]["tools"], requests[sent]["tools"]);
         let retried = requests[sent + 2].to_string();
         assert!(
-            retried.contains("Bart conversation summary"),
+            retried.contains("Bart summary: replaces earlier context"),
             "the retry uses a checkpoint"
         );
         assert!(!retried.contains("line 200 abcdefghij"));
@@ -1929,7 +1936,7 @@ async fn summary_checkpoint_uses_native_prefix_archives_and_preserves_python_sta
     assert_eq!(session.journal.history(), original);
     let window = session.journal.model_context().messages().to_vec();
     assert!(
-        window.iter().any(|m| matches!(m, Message::Instruction(text) if text.contains("Bart conversation summary") && text.contains("Continue the task.")))
+        window.iter().any(|m| matches!(m, Message::Instruction(text) if text.contains("Bart summary: replaces earlier context") && text.contains("Continue the task.")))
     );
     let sources: Vec<_> = window
         .iter()
@@ -1963,7 +1970,7 @@ async fn summary_checkpoint_uses_native_prefix_archives_and_preserves_python_sta
         serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
     assert_eq!(&archived[..original.len()], original);
     assert!(
-        matches!(archived.last(), Some(Message::Instruction(t)) if t.contains("Bart Python state at checkpoint") && t.contains("preserved"))
+        matches!(archived.last(), Some(Message::Instruction(t)) if t.contains("Bart summary: Python state at this point") && t.contains("preserved"))
     );
     let summary_request = requests.lock().unwrap()[0].clone();
     assert_eq!(summary_request["tool_choice"], "none");
@@ -2000,7 +2007,7 @@ async fn failed_or_tool_using_summary_never_replaces_history_or_executes_tools()
     for reply in [
         Reply::text(""),
         Reply::text(&"x".repeat(32_001)),
-        Reply::text("  [Bart summary insufficient] Pending operation and constraints cannot fit."),
+        Reply::text("  [Bart summary: insufficient] Pending operation and constraints cannot fit."),
         Reply::python(
             "forbidden",
             &json!({"code":"write('should-not-exist', 'bad')"}),
@@ -2102,7 +2109,7 @@ async fn summarizing_after_a_summary_updates_the_handoff_and_archives_evidence()
     assert!(session.journal.model_context().messages().contains(&skill));
     assert!(
         session.journal.model_context().messages().iter().any(
-            |m| matches!(m,Message::Instruction(t) if t.contains("Bart conversation summary"))
+            |m| matches!(m,Message::Instruction(t) if t.contains("Bart summary: replaces earlier context"))
         )
     );
     assert!(
@@ -2287,7 +2294,7 @@ async fn repeated_checkpoints_keep_one_append_only_session_and_summarize_only_ac
     let expected: Vec<_> = first_window.into_iter().chain(added).collect();
     assert_eq!(&snapshot[..expected.len()], expected);
     assert!(
-        matches!(snapshot.last(), Some(Message::Instruction(t)) if t.contains("Bart Python state at checkpoint"))
+        matches!(snapshot.last(), Some(Message::Instruction(t)) if t.contains("Bart summary: Python state at this point"))
     );
     assert!(
         snapshot
@@ -2403,7 +2410,6 @@ async fn checkpoint_generation_and_continuation_work_on_all_four_protocols() {
         let normal = system(&requests[1]);
         let checkpoint = system(&requests[0]);
         assert!(normal.contains("Always answer with a JSON object."));
-        assert!(normal.contains("They do not override Bart's operating rules"));
         assert!(checkpoint.starts_with(&normal));
         assert!(checkpoint.contains("checkpoint output contract takes precedence"));
         assert!(!normal.contains("Bart is creating a continuation checkpoint"));
@@ -2418,7 +2424,10 @@ async fn checkpoint_generation_and_continuation_work_on_all_four_protocols() {
             .as_array()
             .unwrap()
             .iter()
-            .find(|m| m.to_string().contains("Bart conversation summary"))
+            .find(|m| {
+                m.to_string()
+                    .contains("Bart summary: replaces earlier context")
+            })
             .unwrap();
         assert_eq!(
             restored["role"], "user",
@@ -2427,7 +2436,7 @@ async fn checkpoint_generation_and_continuation_work_on_all_four_protocols() {
         assert!(
             requests[1]
                 .to_string()
-                .contains("Bart conversation summary")
+                .contains("Bart summary: replaces earlier context")
         );
         assert!(
             requests[1]
@@ -2546,32 +2555,31 @@ async fn incomplete_checkpoints_cannot_remove_original_constraints_from_the_next
     turn(&mut session, "Continue task A.").await;
     let bodies = requests.lock().unwrap().clone();
     assert_eq!(bodies.len(), 3);
-    let source_values: Vec<Value> = bodies[2]["messages"]
+    let source_values: Vec<(&str, &str)> = bodies[2]["messages"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|m| m["content"].as_str())
-        .filter_map(|text| serde_json::from_str(text).ok())
-        .filter(|value: &Value| value["bart_origin"] == "original_user")
+        .filter(|text| text.starts_with("[Bart user message: kept verbatim"))
+        .filter_map(|text| text.split_once('\n'))
         .collect();
     assert_eq!(source_values.len(), 3);
     assert_eq!(
-        source_values[0]["text"],
+        source_values[0].1,
         "Never amend without permission. Keep exact identifiers."
     );
     assert_eq!(
-        source_values[2]["text"],
+        source_values[2].1,
         "For task B only, amending is allowed. Task A remains read-only."
     );
-    let reference = source_values[0]["source_snapshot"].as_str().unwrap();
-    let read = python(
-        &session,
-        &format!(
-            "archive = json.loads(read({reference}))\nprint(archive[{}]['content'])",
-            source_values[0]["message_index"]
-        ),
-    )
-    .await;
+    let reference = source_values[0]
+        .0
+        .split_once("context: ")
+        .unwrap()
+        .1
+        .strip_suffix(']')
+        .unwrap();
+    let read = python(&session, &format!("print(read({reference}))")).await;
     assert!(!read.is_error(), "{}", read.text);
     assert!(read.text.contains("Never amend without permission"));
     let number = original_sources
@@ -2592,9 +2600,9 @@ async fn incomplete_checkpoints_cannot_remove_original_constraints_from_the_next
         .unwrap(),
     )
     .unwrap();
-    assert!(
-        matches!(&archive[source_values[0]["message_index"].as_u64().unwrap() as usize],Message::User(text) if text.as_ref()==source_values[0]["text"].as_str().unwrap())
-    );
+    assert!(archive.iter().any(
+        |message| matches!(message, Message::User(text) if text.as_ref() == source_values[0].1)
+    ));
 }
 
 #[tokio::test]
@@ -2620,21 +2628,15 @@ async fn rewind_warns_the_first_request_and_preserves_removed_effect_evidence() 
     session.rewind(0, |_: Event<'_>| {}).await.unwrap();
     turn(&mut session, "Audit only.").await;
     let bodies = requests.lock().unwrap();
-    let events: Vec<Value> = bodies[0]["messages"]
+    let events: Vec<&str> = bodies[0]["messages"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|m| m["content"].as_str())
-        .filter_map(|t| serde_json::from_str(t).ok())
-        .filter(|v: &Value| v["bart_event"] == "runtime_recovery")
+        .filter(|t| t.starts_with("[Bart session: conversation rewound"))
         .collect();
     assert_eq!(events.len(), 1);
-    assert!(
-        events[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("not rolled back")
-    );
+    assert!(events[0].contains("earlier effects remain"));
     assert_eq!(
         std::fs::read_to_string(dir.path().join("effect")).unwrap(),
         "kept\n"

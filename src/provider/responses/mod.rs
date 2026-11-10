@@ -113,7 +113,7 @@ pub(super) fn body(request: &Request) -> std::io::Result<Value> {
                 "auto"
             }
             .into();
-            body["parallel_tool_calls"] = (!request.provider.codex()).into();
+            body["parallel_tool_calls"] = true.into();
         }
         super::Tools::Disabled(_) => {
             body["tool_choice"] = "none".into();
@@ -153,7 +153,7 @@ pub(super) fn input(request: &Request) -> std::io::Result<Vec<Value>> {
     for message in request.history {
         match message {
             Message::Notification(note) => items.push(json!({
-                "type":"message", "role":"user", "content":[{"type":"input_text","text":note.model_text()}]
+                "type":"message", "role":"user", "content":[{"type":"input_text","text":&*note.text}]
             })),
 
             Message::User(_)

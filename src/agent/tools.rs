@@ -41,9 +41,9 @@ impl Session {
             on_event.flush().await;
             let started = Instant::now();
             let mut output = if let Some(error) = full {
-                Output::error(format!("[not run: {error}]"))
+                Output::error(bart!(NotRun, "{error}"))
             } else if stopped {
-                Output::error("[not run: parent denied: earlier review stopped this turn]".into())
+                Output::error(bart!(const NotRun, "an earlier review stopped this turn").into())
             } else if self
                 .routing
                 .preferences()
@@ -113,7 +113,7 @@ impl Session {
                 activities: crate::tool::Activities::default(),
                 call_id: call.id.clone(),
                 is_error: true,
-                output: format!("[not run: {error}]").into(),
+                output: bart!(NotRun, "{error}").into(),
                 jobs: Vec::new(),
                 saved: None,
                 cell: None,

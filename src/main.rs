@@ -1,3 +1,5 @@
+#[macro_use]
+mod marker;
 mod agent;
 mod approval;
 mod auth;

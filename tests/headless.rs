@@ -368,7 +368,7 @@ with tempfile.TemporaryDirectory(prefix='bart-skill-cli-') as temp:
   def run(prompt):
    return subprocess.run([sys.argv[1],'--provider','local','--model','fixture','--prompt',prompt],env=env,cwd=root,capture_output=True,text=True,timeout=15)
   first=run('/review inspect');assert first.returncode==0,(first.stdout,first.stderr)
-  request=seen[-1];assert any('SKILL_BODY_ONLY' in m['content'] and json.loads(m['content'])['text'].endswith(body) and json.loads(m['content'])['bart_origin']=='skill_document' for m in request['messages'])
+  request=seen[-1];assert any(m['content'].startswith('[Bart skill: review; ') and m['content'].endswith(body) for m in request['messages'])
   assert 'SKILL_BODY_ONLY' not in request['messages'][0]['content']
   assert 'Skill: review' in first.stderr and 'SKILL_BODY_ONLY' not in first.stderr
   for prompt in ['/missing task','/../review task','/ review task','/tmp/x has the results','Discuss /review without invoking it']:

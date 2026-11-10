@@ -359,9 +359,15 @@ pub(crate) async fn deliver(
     if output.images.len() > image_room {
         output.images.truncate(image_room);
         output.notes.push_str(if sees_images {
-            "\n[this response's eight-image limit was reached; excess images were not shown]"
+            concat!(
+                "\n",
+                bart!(const Image, "limit of 8 per response reached; the rest were not shown")
+            )
         } else {
-            "\n[this model cannot see images; none was shown]"
+            concat!(
+                "\n",
+                bart!(const Image, "not shown; this model cannot see images")
+            )
         });
     }
     let mut images = Vec::new();
@@ -369,15 +375,15 @@ pub(crate) async fn deliver(
         match context.save_image(image).await {
             Ok(image) => images.push(image),
             Err(error) => {
-                let _ = write!(output.notes, "\n[image was not shown: {error}]");
+                let _ = write!(output.notes, "\n{}", bart!(Image, "not shown; {error}"));
             }
         }
     }
     if output.is_error()
         && let Some(cell) = output.cell
     {
-        let header = format!("[cell {cell}]\n");
-        if !output.notes.starts_with(&header) {
+        let header = format!("{}\n", bart!(Cell, "{cell}"));
+        if !output.notes.starts_with(&header) && !prefix.contains(&format!("cell[{cell}]")) {
             output.notes.insert_str(0, &header);
         }
     }
@@ -425,7 +431,10 @@ fn fit(
     );
     notes.insert_str(
         0,
-        &format!("[Bart output: {end}/{captured} bytes shown; {reference}]\n"),
+        &format!(
+            "{}\n",
+            bart!(Output, "{end}/{captured} bytes shown; {reference}")
+        ),
     );
     text
 }

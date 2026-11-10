@@ -102,15 +102,26 @@ fn closing(code: &str, open: usize) -> Option<usize> {
 }
 
 fn summary(output: &str, status: Status, jobs: &[u32]) -> (String, Vec<String>) {
-    let source = output
-        .split_once("\n\n[Bart metadata — not source]\n")
-        .map_or(output, |(source, _)| source);
-    let lines: Vec<&str> = source
+    let lines: Vec<&str> = output
         .lines()
-        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            !line.trim().is_empty()
+                && !line.starts_with(crate::marker::PREFIX)
+                && !line.starts_with("{\"process")
+        })
         .collect();
     let mut summary = match status {
-        Status::Failed => lines.last().copied().unwrap_or("failed").to_owned(),
+        Status::Failed => lines
+            .last()
+            .copied()
+            .or_else(|| {
+                let line = output
+                    .lines()
+                    .rfind(|line| line.starts_with(crate::marker::PREFIX))?;
+                line.strip_prefix(crate::marker::PREFIX)?.strip_suffix(']')
+            })
+            .unwrap_or("failed")
+            .to_owned(),
         Status::Succeeded => count(output.lines().count()),
     };
     if !jobs.is_empty() {

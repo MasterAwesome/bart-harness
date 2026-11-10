@@ -25,7 +25,7 @@ pub(super) fn body(request: &Request) -> std::io::Result<Value> {
     for (at, message) in request.history.iter().enumerate() {
         match message {
             Message::Notification(note) => {
-                messages.push(json!({"role":"user","content":note.model_text()}))
+                messages.push(json!({"role":"user","content":&*note.text}))
             }
 
             Message::User(_)

@@ -43,14 +43,13 @@ pub(super) async fn search(
         }
         let _ = writeln!(
             output,
-            "[Bart web search {}: {}]",
-            index + 1,
-            query.escape_debug()
+            "{}",
+            bart!(WebSearch, "{}; {}", index + 1, query.escape_debug())
         );
         match result {
             Ok(text) => output.push_str(&text),
             Err(error) => {
-                let _ = write!(output, "[search failed: {error}]");
+                let _ = write!(output, "{}", bart!(WebSearch, "failed; {error}"));
             }
         }
     }
@@ -132,8 +131,12 @@ fn render(found: &provider::search::SearchResult) -> String {
     if !found.errors.is_empty() {
         let _ = write!(
             text,
-            "\n\n[some searches failed: {}; the answer may be incomplete]",
-            found.errors.join(", ")
+            "\n\n{}",
+            bart!(
+                WebSearch,
+                "some searches failed ({}); the answer may be incomplete",
+                found.errors.join(", ")
+            )
         );
     }
     text

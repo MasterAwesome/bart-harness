@@ -99,15 +99,15 @@ pub(super) fn result_notes(
     if status == Status::Failed && !changed.is_empty() {
         let _ = write!(
             notes,
-            "\n[before the failure, this cell {}]",
-            changed.join("; ")
+            "\n{}",
+            bart!(Cell, "before failing it {}", changed.join("; "))
         );
     }
     if let Some(note) = note {
         notes.insert_str(0, &format!("{note}\n"));
     }
     if !prior.is_empty() {
-        notes.push_str(&format!("\n[earlier cell:] {prior}"));
+        notes.push_str(&format!("\n{} {prior}", bart!(Cell, "earlier cell")));
     }
     (notes, status)
 }
@@ -115,17 +115,19 @@ pub(super) fn result_notes(
 pub(super) fn denied_prior(mut prior: Output, reason: String) -> Output {
     let earlier = prior.cell.take();
     if let Some(cell) = earlier {
-        prior
-            .notes
-            .insert_str(0, &format!("[earlier output: cell[{cell}].output]\n"));
+        prior.notes.insert_str(
+            0,
+            &format!("{}\n", bart!(Cell, "earlier output is cell[{cell}].output")),
+        );
     }
     let prefix = match prior.prefix_len {
         Some(end) => prior.text[..end].to_owned(),
         None => std::mem::take(&mut prior.text),
     };
-    prior
-        .notes
-        .insert_str(0, &format!("{reason}\n[earlier cell result follows]\n"));
+    prior.notes.insert_str(
+        0,
+        &format!("{reason}\n{}\n", bart!(Cell, "earlier cell's result")),
+    );
     prior.prefix_len = Some(prefix.len());
     prior.text = crate::tool::output::render(&prefix, &prior.notes);
     prior.status = Status::Failed;
@@ -142,8 +144,12 @@ pub(super) fn conclude(text: &mut String, end: End, timeout: Duration, ran: bool
                 separate(text);
                 let _ = write!(
                     text,
-                    "[timed out after {}s; interrupted, Python state preserved]",
-                    timeout.as_secs()
+                    "{}",
+                    bart!(
+                        Cell,
+                        "timed out after {}s and was interrupted; Python state kept",
+                        timeout.as_secs()
+                    )
                 );
             }
             if failed {
@@ -154,12 +160,14 @@ pub(super) fn conclude(text: &mut String, end: End, timeout: Duration, ran: bool
         }
         End::Cancelled => {
             separate(text);
-            text.push_str("[the cancelled cell settled; Python state preserved; effects were not rolled back]");
+            text.push_str(bart!(const Cell, "cancelled; Python state kept, effects so far remain"));
             Status::Failed
         }
         End::Discarded => {
             separate(text);
-            text.push_str("[the earlier cell was still running; the restart discarded it, and its effects are unknown]");
+            text.push_str(
+                bart!(const Cell, "the restart discarded an earlier cell that was still running"),
+            );
             Status::Failed
         }
         End::TimedOut => {
@@ -167,14 +175,22 @@ pub(super) fn conclude(text: &mut String, end: End, timeout: Duration, ran: bool
             let _ = if ran {
                 write!(
                     text,
-                    "[timed out after {}s and interrupted, but the cell did not stop: it is still running and Python state is kept; the next call waits for it first, or pass restart: true to discard the interpreter and its state]",
-                    timeout.as_secs()
+                    "{}",
+                    bart!(
+                        Cell,
+                        "timed out after {}s and is still running; the next call waits for it, or pass restart: true",
+                        timeout.as_secs()
+                    )
                 )
             } else {
                 write!(
                     text,
-                    "[the earlier cell is still running after {}s more, so this cell did not run; Python state is kept. A busy cell is not a background job: call again to keep waiting for it, or pass restart: true to discard the interpreter and its state]",
-                    timeout.as_secs()
+                    "{}",
+                    bart!(
+                        NotRun,
+                        "the earlier cell is still running after {}s more; call again to keep waiting, or pass restart: true",
+                        timeout.as_secs()
+                    )
                 )
             };
             Status::Failed
@@ -187,65 +203,42 @@ pub(super) fn conclude(text: &mut String, end: End, timeout: Duration, ran: bool
             separate(text);
             let _ = write!(
                 text,
-                "[{cause}; the interpreter restarts on the next call, without its state; what its helpers changed is unknown]"
+                "{}",
+                bart!(
+                    Cell,
+                    "{cause}; it restarts on the next call without its state"
+                )
             );
             Status::Failed
         }
     }
 }
 
-// Group ordinary successes to save space. Report failures, lost output and jobs
-// with running descendants separately. Track the size as notes are added.
 #[derive(Default)]
 pub(super) struct ProcessSummaries {
     record: Option<crate::tool::output::StatusWriter>,
     lines: Vec<String>,
     bytes: usize,
-    success: Option<(u32, u32)>,
     omitted: u64,
 }
 
 impl ProcessSummaries {
     const OMISSION_RESERVE: usize = 80;
 
-    pub(super) fn push(&mut self, process: u32, summary: serde_json::Value) {
+    pub(super) fn push(&mut self, summary: serde_json::Value, line: String) {
         if let Some(record) = &mut self.record {
             record.write(&summary);
         }
-        if self.omitted > 0 {
-            self.omitted += 1;
-            return;
-        }
-        if summary["return_code"] == 0 && summary.as_object().is_some_and(|s| s.len() == 2) {
-            if let Some((_, last)) = &mut self.success
-                && last.checked_add(1) == Some(process)
-            {
-                *last = process;
-                return;
-            }
-            self.flush();
-            self.success = Some((process, process));
-        } else {
-            self.flush();
-            self.append(summary.to_string(), 1);
+        let plain = summary.as_object().is_some_and(|s| s.len() == 2);
+        if !(plain && summary["return_code"] == 0) {
+            self.append(line);
         }
     }
 
-    fn flush(&mut self) {
-        if let Some((first, last)) = self.success.take() {
-            let status = if first == last {
-                serde_json::json!({"process": first, "return_code": 0})
-            } else {
-                serde_json::json!({"processes": [first, last], "return_code": 0})
-            };
-            self.append(status.to_string(), u64::from(last - first) + 1);
-        }
-    }
-
-    fn append(&mut self, line: String, processes: u64) {
+    fn append(&mut self, line: String) {
         let limit = crate::tool::OUTPUT_BUDGET_BYTES / 2 - Self::OMISSION_RESERVE;
         if self.omitted > 0 || self.lines.len() == 64 || self.bytes + line.len() + 1 > limit {
-            self.omitted += processes;
+            self.omitted += 1;
         } else {
             self.bytes += line.len() + 1;
             self.lines.push(line);
@@ -253,13 +246,13 @@ impl ProcessSummaries {
     }
 
     fn finish(mut self) -> (String, Vec<String>) {
-        self.flush();
         let notice = self
             .record
-            .map_or_else(String::new, |record| record.finish());
+            .take()
+            .map_or_else(String::new, |record| record.finish(self.omitted));
         if self.omitted > 0 {
             self.lines
-                .push(serde_json::json!({"process_statuses_omitted":self.omitted}).to_string());
+                .push(bart!(Status, "{} more not shown", self.omitted));
         }
         (notice, self.lines)
     }

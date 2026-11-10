@@ -186,7 +186,6 @@ async fn the_jail_can_read_but_not_write_git_metadata() {
                 cell: context.artifacts.next_cell().unwrap(),
                 call: 1,
             },
-            &[],
         )
         .unwrap();
         let live = context.live.start("jail", &script, None);

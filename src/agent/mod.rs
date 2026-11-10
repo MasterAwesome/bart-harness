@@ -356,9 +356,9 @@ impl Session {
         }
         let evidence = match self.archive_context(&self.journal.history()[at..]).await {
             Ok(number) => {
-                format!("Removed conversation evidence: history[{number}] (JSON messages).")
+                format!("removed messages: history[{number}]")
             }
-            Err(error) => format!("Removed evidence archive unavailable: {error}."),
+            Err(error) => format!("removed messages were not saved: {error}"),
         };
         let text = self.journal.rewind(at).await?;
         self.rebase_context();
@@ -368,7 +368,7 @@ impl Session {
         self.report_jobs(&mut on_event).await;
         self.context.reset_python();
         self.push(Message::Notification(Notification {
-            text: format!("[Bart conversation rewind] Python state was discarded. {} Files and prior external effects were not rolled back. Removed operations may already have taken effect; inspect their state before repeating them. {evidence}", cleanup.notice()).into(),
+            text: bart!(Session, "conversation rewound; Python state is gone, files and earlier effects remain; {}; {evidence}", cleanup.notice()).into(),
             kind: NotificationKind::Recovery,
         }), &mut on_event).await;
         self.settle_recording_with(&mut on_event).await;
@@ -414,12 +414,22 @@ impl Session {
                 ));
             }
             let interpreter = match restart {
-                Ok(()) => "Python state was discarded and the interpreter restarted.".into(),
-                Err(error) => format!(
-                    "Python restart failed: {error}; do not assume interpreter availability."
-                ),
+                Ok(()) => "interpreter restarted, Python state is gone".into(),
+                Err(error) => format!("interpreter restart failed: {error}"),
             };
-            self.push(Message::Notification(Notification { text: format!("[Bart changed sandbox settings] {interpreter} {} Files and prior external effects remain; rebuild needed state without repeating completed effects.", cleanup.notice()).into(), kind: NotificationKind::Recovery }), &mut on_event).await;
+            self.push(
+                Message::Notification(Notification {
+                    text: bart!(
+                        Session,
+                        "sandbox settings changed; {interpreter}; {}",
+                        cleanup.notice()
+                    )
+                    .into(),
+                    kind: NotificationKind::Recovery,
+                }),
+                &mut on_event,
+            )
+            .await;
         }
         self.context.diffs.store(
             self.routing.preferences().effective.diffs,
@@ -544,7 +554,11 @@ impl Session {
         let inventory = self.context.python_inventory();
         let mut evidence = history.clone();
         evidence.push(Message::Instruction(
-            format!("[Bart Python state at checkpoint]\n{inventory}").into(),
+            format!(
+                "{}\n{inventory}",
+                bart!(const Summary, "Python state at this point")
+            )
+            .into(),
         ));
         let archive = self.archive_context(&evidence).await?;
         let instructions = self.instructions.as_str().to_owned();

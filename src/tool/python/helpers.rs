@@ -171,7 +171,29 @@ pub(super) async fn answer(
             if result.adopted.is_some() {
                 summary["retained_job"] = json!(result.adopted);
             }
-            effects.process_summaries.push(effects.processes, summary);
+            let mut fields = vec![format!(
+                "cell[{cell}].run[{}] {}",
+                effects.processes,
+                result.outcome.label()
+            )];
+            if result.timed_out {
+                fields.push("timed out".into());
+            }
+            if let Some(error) = &result.cleanup_error {
+                fields.push(format!("cleanup failed: {error}"));
+            }
+            if let Some(reason) = &result.stdout_file.incomplete {
+                fields.push(format!("stdout incomplete: {reason}"));
+            }
+            if let Some(reason) = &result.stderr_file.incomplete {
+                fields.push(format!("stderr incomplete: {reason}"));
+            }
+            if let Some(job) = result.adopted {
+                fields.push(format!("left processes running as job[{job}]"));
+            }
+            effects
+                .process_summaries
+                .push(summary, bart!(Status, "{}", fields.join("; ")));
             let mut value = json!(result);
             value["reference"] = json!(format!("cell[{cell}].run[{}]", effects.processes));
             Ok(value)
@@ -188,7 +210,7 @@ pub(super) async fn answer(
                 if let Err(error) = shown {
                     outcome
                         .notes
-                        .push(format!("[{mime} image not shown: {error}]"));
+                        .push(bart!(Image, "{mime} not shown; {error}"));
                 }
             }
             Ok(json!({"value": outcome.value, "error": outcome.error, "notes": outcome.notes}))
@@ -300,7 +322,7 @@ pub(super) async fn start_program(
 ) -> Result<ProgramTask, String> {
     let command = request.command.label();
     let timeout = request.timeout;
-    let collector = Collector::open(PROGRAM_OUTPUT_BYTES, &context.artifacts, name, &[])
+    let collector = Collector::open(PROGRAM_OUTPUT_BYTES, &context.artifacts, name)
         .await
         .map_err(|e| format!("cannot collect program output: {e}"))?;
     live.push(format!("[run: {}]\n", command.lines().next().unwrap_or_default()).as_bytes());
@@ -336,7 +358,7 @@ async fn outside_program(
     let reason = request.outside.as_deref().unwrap_or_default();
     let outside = escape::approve(review, "run", &request.command.review_label(), reason).await?;
     let context = review.context;
-    let collector = Collector::open(PROGRAM_OUTPUT_BYTES, &context.artifacts, name, &[])
+    let collector = Collector::open(PROGRAM_OUTPUT_BYTES, &context.artifacts, name)
         .await
         .map_err(|e| format!("cannot collect program output: {e}"))?;
     live.push(format!("[run outside the sandbox: {}]\n", request.command.label()).as_bytes());
@@ -423,7 +445,7 @@ pub(super) async fn helper(
             tool,
             arguments,
         } => {
-            let label = format!("[image from {server}/{tool}]");
+            let label = bart!(Image, "from {server}/{tool}");
             context
                 .mcp()
                 .call(&server, &tool, arguments)

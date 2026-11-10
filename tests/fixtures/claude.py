@@ -140,7 +140,7 @@ def fixture():
             assert str(42 if index == 1 else 56) in result["result"]["content"][0]["text"]
             images = [block for block in result["result"]["content"] if block["type"] == "image"]
             assert images == ([{"type": "image", "data": PIXEL, "mimeType": "image/png"}] if index == 2 else []), images
-            notes = [block for block in result["result"]["content"] if '"bart_event":"background_completion"' in block.get("text", "")]
+            notes = [block for block in result["result"]["content"] if block.get("text", "").startswith("[Bart job: job[")]
             assert len(notes) == (index == 2), result
             record("released", call=index)
             if index == 1:
@@ -195,7 +195,7 @@ def check(binary):
         assert len(first) == 2, first
         assert len([e for e in seen if e["event"] == "released"]) == 2
         last = [e for e in seen if e["pid"] == mains[1]["pid"] and e["event"] == "input"][0]
-        assert '"bart_origin":"host_context"' in last["text"], last
+        assert "[Bart summary: replaces earlier context" in last["text"], last
         assert "~$0.010000" in error, error
         limited = subprocess.run(args + ["--prompt", "limited"], cwd=root, env=env, text=True,
                                  stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
@@ -214,7 +214,7 @@ def check(binary):
         session = next((root / "state" / "bart" / "sessions").rglob("session.jsonl")).read_text()
         results = [message["content"] for line in session.splitlines() for event in [json.loads(line)]
                    if event["event"] == "messages" for message in event["data"] if message["role"] == "tool_result"]
-        assert [(r["call_id"], r["is_error"], r["output"].startswith("[not run: ")) for r in results] == [
+        assert [(r["call_id"], r["is_error"], r["output"].startswith("[Bart not run: ")) for r in results] == [
             ("native-1", False, False), ("native-2", True, True)], results
         waiting = subprocess.Popen(args + ["--prompt", "wait-for-cancel"], cwd=root, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

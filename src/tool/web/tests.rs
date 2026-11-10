@@ -272,11 +272,11 @@ async fn batch_runs_concurrently_and_keeps_failures_with_their_queries() {
     .expect("both requests must be in flight");
     server.await.unwrap();
     let (first, second) = output
-        .split_once("[Bart web search 2: second query]")
+        .split_once("[Bart web_search: 2; second query]")
         .unwrap();
     assert!(
-        first.contains("[Bart web search 1: first query]") && first.contains("first answer"),
+        first.contains("[Bart web_search: 1; first query]") && first.contains("first answer"),
         "{output}"
     );
-    assert!(second.contains("search failed"), "{output}");
+    assert!(second.contains("failed;"), "{output}");
 }

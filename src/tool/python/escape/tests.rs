@@ -179,7 +179,7 @@ async fn a_reviewer_that_allows_it_lets_it_run_and_otherwise_the_user_decides() 
         }
     };
     let denied = ask(&project, Mode::Auto, true, &mut user).await;
-    assert_eq!(denied, Err("[not run: user denied]".into()));
+    assert_eq!(denied, Err("[Bart not run: user denied]".into()));
     let prompt = asked.expect("the user was asked");
     assert!(prompt.contains("git commit -m fix") && prompt.contains("reason"));
     assert!(
