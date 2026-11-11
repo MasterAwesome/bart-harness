@@ -64,7 +64,7 @@ assert b'BART_TTY_LEAK' not in data, data
     let context = std::sync::Arc::new(context(dir.path(), Confinement::Unrestricted, 1000));
     let live = context.live.start("python", "terminal probe", None);
     let output = crate::tool::python::call(
-        &serde_json::json!({"code": "import subprocess\nassert subprocess.run(['sh', '-c', 'printf BART_TTY_LEAK > /dev/tty'], capture_output=True).returncode != 0\nr = run(['sh', '-c', 'printf BART_TTY_LEAK > /dev/tty'])\nassert r.return_code != 0"}),
+        &serde_json::json!({"code": "import subprocess\nassert subprocess.run(['sh', '-c', 'printf BART_TTY_LEAK > /dev/tty'], capture_output=True).returncode != 0\nr = run(['sh', '-c', 'printf BART_TTY_LEAK > /dev/tty'], check=False)\nassert r.return_code != 0"}),
         "terminal-probe", &context, &live, None,
     ).await;
     assert!(!output.is_error(), "{}", output.text);

@@ -162,7 +162,7 @@ r=run([sys.executable,'-c','import sys,json;print(json.dumps(sys.argv[1:]))','a 
 assert json.loads(r.stdout)==['a ; $(touch bad) *','space name']
 assert not pathlib.Path('bad').exists()
 for code in (0,2,17,255):
-    r=run([sys.executable,'-c',f'raise SystemExit({code})'])
+    r=run([sys.executable,'-c',f'raise SystemExit({code})'], check=False)
     assert r.return_code==code and bool(r)==(code==0)
 write('before','kept')
 run([sys.executable,'-c','import os,signal;os.kill(os.getpid(),signal.SIGTERM)'])
@@ -207,12 +207,51 @@ else:
 }
 
 #[tokio::test]
+async fn run_checks_nonzero_exits_by_default_and_can_opt_out() {
+    let dir = TempDir::new("python-run-check");
+    let context = files(dir.path());
+    for options in ["", ", check=True"] {
+        let output = cell(
+            &context,
+            &format!("run(['python3', '-c', 'print(123); raise SystemExit(7)']{options})\nwrite('after', 'must not run')"),
+        )
+        .await;
+        assert!(
+            output.is_error() && output.text.contains("RunError"),
+            "{}",
+            output.text
+        );
+        assert!(!dir.path().join("after").exists());
+    }
+    let output = cell(
+        &context,
+        r#"
+argv = ['python3', '-c', 'import sys; print("out"); print("err", file=sys.stderr); sys.exit(7)']
+try:
+    run(argv)
+except RunError as error:
+    r = error.result
+    assert r.return_code == 7 and r.outcome == {'exit': 7}
+    assert r.stdout == 'out\n' and r.stderr == 'err\n'
+else:
+    raise AssertionError('nonzero exit did not raise')
+r = run(argv, check=False)
+assert r.return_code == 7 and not r
+assert r.stdout == 'out\n' and r.stderr == 'err\n'
+assert run(['python3', '-c', 'pass'], check=True).return_code == 0
+"#,
+    )
+    .await;
+    assert!(!output.is_error(), "{}", output.text);
+}
+
+#[tokio::test]
 async fn run_preserves_failure_adopts_survivors_and_kills_on_timeout() {
     let dir = TempDir::new("python-sh");
     let context = session(dir.path(), Confinement::Unrestricted, 10_000);
     let result = cell(
         &context,
-        "r = run([\"bash\", \"-c\", 'echo out; echo err >&2; exit 3'])\nr.stdout, r.stderr, r.return_code, bool(r)",
+        "r = run([\"bash\", \"-c\", 'echo out; echo err >&2; exit 3'], check=False)\nr.stdout, r.stderr, r.return_code, bool(r)",
     )
     .await;
     assert!(!result.is_error(), "{}", result.text);
@@ -261,7 +300,7 @@ async fn run_preserves_failure_adopts_survivors_and_kills_on_timeout() {
     }
     let output = cell(
         &context,
-        "r=run([\"bash\", \"-c\", 'exec >&- 2>&-; sleep 1; exit 4']); assert r.return_code==4",
+        "r=run([\"bash\", \"-c\", 'exec >&- 2>&-; sleep 1; exit 4'], check=False); assert r.return_code==4",
     )
     .await;
     assert!(!output.is_error(), "{}", output.text);
@@ -1871,7 +1910,7 @@ def show():
 show()
 data = json.loads(run(["printf", '{"value":7}']).stdout)
 assert data == {"value":7}
-run(["bash", "-c", "printf stderr-output >&2; exit 7"])
+run(["bash", "-c", "printf stderr-output >&2; exit 7"], check=False)
 "#,
     )
     .await;
@@ -1893,7 +1932,7 @@ run(["bash", "-c", "printf stderr-output >&2; exit 7"])
         assert!(output.text.find(&reference).unwrap() < output.text.find(word).unwrap());
     }
     assert!(output.text.contains("[Bart run: exit 7; cell[1].run[7]]"));
-    let mixed = cell(&context, "run(['bash', '-c', 'echo out-success; echo err-success >&2'])\nrun(['bash', '-c', 'echo out-failure; echo err-failure >&2; exit 2'])").await;
+    let mixed = cell(&context, "run(['bash', '-c', 'echo out-success; echo err-success >&2'])\nrun(['bash', '-c', 'echo out-failure; echo err-failure >&2; exit 2'], check=False)").await;
     assert!(!mixed.is_error(), "{}", mixed.text);
     for marker in ["out-success", "err-success", "out-failure", "err-failure"] {
         assert_eq!(mixed.text.matches(marker).count(), 1, "{}", mixed.text);
@@ -2068,7 +2107,7 @@ async fn success_statuses_stay_out_of_the_result_without_hiding_failure_or_incom
     let context = session(dir.path(), Confinement::Unrestricted, 4000);
     let output = cell(
         &context,
-        "for _ in range(70): r=run(['true'])\nr=run(['bash','-c','exit 7'])\nr=run(['true'])",
+        "for _ in range(70): r=run(['true'])\nr=run(['bash','-c','exit 7'], check=False)\nr=run(['true'])",
     )
     .await;
     assert!(!output.is_error(), "{}", output.text);
@@ -2291,7 +2330,7 @@ async fn imported_project_and_chained_tracebacks_survive_without_harness_frames(
 async fn late_process_failures_survive_match_pressure_and_status_overflow_is_recoverable() {
     let dir = TempDir::new("late-process-status");
     let context = session(dir.path(), Confinement::Unrestricted, 4000);
-    let arguments = json!({"code":"print('padding' * 2000); print('MATCH ' + 'x' * 1900)\nfor _ in range(70): r=run(['false'])\nrecords=[json.loads(line) for line in cell[1].status.read_text().splitlines()]\nassert len(records)==70 and records[-1]['process']==70 and records[-1]['return_code']==1"});
+    let arguments = json!({"code":"print('padding' * 2000); print('MATCH ' + 'x' * 1900)\nfor _ in range(70): r=run(['false'], check=False)\nrecords=[json.loads(line) for line in cell[1].status.read_text().splitlines()]\nassert len(records)==70 and records[-1]['process']==70 and records[-1]['return_code']==1"});
     let call = crate::history::ToolCall {
         id: "status-overflow".into(),
         name: "python".into(),
@@ -2313,7 +2352,7 @@ async fn a_status_archive_failure_is_explicit_and_does_not_hide_process_outcomes
     let dir = TempDir::new("status-save-failure");
     let context = session(dir.path(), Confinement::Unrestricted, 4000);
     fs::create_dir(context.artifacts().dir().join("status-1.jsonl")).unwrap();
-    let output = cell(&context, "r=run(['false'])").await;
+    let output = cell(&context, "r=run(['false'], check=False)").await;
     assert!(!output.is_error(), "{}", output.text);
     assert!(output.text.contains("records not saved"), "{}", output.text);
     assert!(output.text.contains(".run[1] exit 1"), "{}", output.text);

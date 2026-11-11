@@ -296,22 +296,26 @@ def _argv(argv):
     return list(argv)
 
 
-def _run(argv, timeout, **options):
+def _run(argv, timeout, check, **options):
+    if not isinstance(check, bool):
+        raise BartError("check must be True or False")
     try:
         result = Result(**_call("run", argv=_argv(argv), timeout=timeout, **options))
     finally:
         importlib.invalidate_caches()
-    if result.timed_out or not isinstance(result.outcome, dict) or "exit" not in result.outcome:
+    if (result.timed_out or not isinstance(result.outcome, dict)
+            or not ({"exit", "signal"} & result.outcome.keys())
+            or (check and result.return_code != 0)):
         raise RunError(result)
     return result
 
 
-def run(argv, *, timeout=_CONFIG["process_default_seconds"], env=None):
-    return _run(argv, timeout, env={} if env is None else dict(env))
+def run(argv, *, timeout=_CONFIG["process_default_seconds"], check=True, env=None):
+    return _run(argv, timeout, check, env={} if env is None else dict(env))
 
 
-def run_escaping(argv, *, timeout=_CONFIG["process_default_seconds"], env=None, sandbox=True, reason=None):
-    return _run(argv, timeout, env={} if env is None else dict(env), sandbox=sandbox, reason=reason)
+def run_escaping(argv, *, timeout=_CONFIG["process_default_seconds"], check=True, env=None, sandbox=True, reason=None):
+    return _run(argv, timeout, check, env={} if env is None else dict(env), sandbox=sandbox, reason=reason)
 
 
 class Job(Result):

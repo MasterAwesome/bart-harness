@@ -26,9 +26,9 @@ with tempfile.TemporaryDirectory(prefix="bart-owner-death-") as directory:
     daemon = f"import os,time; p=os.fork(); os._exit(0) if p else None; {detach}p=os.fork(); os._exit(0) if p else None; open('daemon-pid','w').write(str(os.getpid())); time.sleep(60)"
     command = f"python3 -c {json.dumps(daemon)} >/dev/null 2>&1 & until [ -s daemon-pid ]; do sleep .01; done; exit 5"
     code = f"""for i in range(64):
-    r = run(['bash','-c',f'printf fast; exit {{i % 8}}'])
+    r = run(['bash','-c',f'printf fast; exit {{i % 8}}'], check=False)
     assert r.return_code == i % 8 and r.stdout.strip() == 'fast', (r.return_code, r.stdout)
-r = run(['bash','-c',{command!r}])
+r = run(['bash','-c',{command!r}], check=False)
 assert r.return_code == 5 and r.retained_job is not None, (r.return_code, r.retained_job)
 import subprocess, sys
 p = subprocess.Popen([sys.executable, '-c', "import os,time; open('python-pid','w').write(str(os.getpid())); time.sleep(60)"], start_new_session=sys.platform == 'linux', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

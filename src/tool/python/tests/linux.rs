@@ -51,7 +51,7 @@ async fn a_jail_without_network_reaches_no_host_service_and_no_web_search() {
         "import socket\n\
          def reaches():\n    try:\n        socket.create_connection(('127.0.0.1', {port}), 2).close()\n        return True\n    except OSError:\n        return False\n\
          def searches():\n    try:\n        return callable(web_search)\n    except NameError:\n        return 'absent'\n\
-         child = run([\"python3\", \"-c\", \"import socket; socket.create_connection((\\\"127.0.0.1\\\", {port}), 2)\"]).return_code == 0\n\
+         child = run([\"python3\", \"-c\", \"import socket; socket.create_connection((\\\"127.0.0.1\\\", {port}), 2)\"], check=False).return_code == 0\n\
          print(reaches(), child, searches() == 'absent')"
     );
     for (network, expected) in [
@@ -110,7 +110,7 @@ async fn jailed_commands_adopt_and_python_interrupts_in_its_own_namespace() {
     );
     let adopted = cell(
         &context,
-        "r = run([\"bash\", \"-c\", 'sleep 30 >/dev/null 2>&1 & exit 7'])\nassert r.return_code == 7, r.return_code\nprint(r)",
+        "r = run([\"bash\", \"-c\", 'sleep 30 >/dev/null 2>&1 & exit 7'], check=False)\nassert r.return_code == 7, r.return_code\nprint(r)",
     )
     .await;
     assert!(
@@ -128,7 +128,7 @@ async fn jailed_commands_adopt_and_python_interrupts_in_its_own_namespace() {
     assert_eq!(context.jobs.running_count(), 0);
     let exit = cell(
         &context,
-        "saved=42; r=run([\"bash\", \"-c\", 'exit 3']); assert r.return_code==3",
+        "saved=42; r=run([\"bash\", \"-c\", 'exit 3'], check=False); assert r.return_code==3",
     )
     .await;
     assert!(!exit.is_error(), "{}", exit.text);

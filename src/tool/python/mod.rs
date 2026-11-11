@@ -179,7 +179,7 @@ fn commands(escape: bool, one_turn: bool) -> String {
     };
     format!(
         r#"@auto_display
-def run(argv: Sequence[str], *, timeout: float = {default}, env: Mapping[str, str] | None = None{run_escape}) -> Result:
+def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True, env: Mapping[str, str] | None = None{run_escape}) -> Result:
     """Run one program and wait for it. argv is passed literally: no shell, no globbing.
 
         run(["rg", "-n", r"TODO|FIXME", "src"])                         # raw strings for regexes
@@ -187,9 +187,10 @@ def run(argv: Sequence[str], *, timeout: float = {default}, env: Mapping[str, st
         data = json.loads(run(["cargo", "metadata", "--format-version=1"]).stdout)   # assigned: silent
 
     The view is [Bart run: exit E; cell[N].run[M]], then combined stdout and stderr.
-    Any exit code returns a Result; bool(r) is true for exit 0. A timeout or signal raises
-    RunError, whose .result holds what was captured. A nonzero exit or abnormal end is also
-    reported after the cell's output.
+    A nonzero exit or signal raises RunError and stops the cell unless caught; its .result
+    holds the outcome and captured output. Pass check=False to inspect an expected nonzero
+    result instead. Timeouts and unknown outcomes always raise. bool(r) is true for exit 0.
+    A nonzero exit or abnormal end is also reported after the cell's output.
     The program starts in the session's working directory with the session's environment;
     os.chdir and os.environ do not change that. env= overrides variables. To run elsewhere
     use the program's own option (git -C, make -C) or a shell cd.
