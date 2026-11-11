@@ -70,8 +70,6 @@ impl Fixture {
 #[tokio::test]
 async fn complete_verdicts_and_unavailable_failures() {
     let dir = TempDir::new("approval-verdicts");
-    let mut slow = Reply::text(&verdict("low", "high", "allow"));
-    slow.delay = Duration::from_millis(200);
     let cases = [
         (Reply::text(&verdict("low", "unknown", "allow")), Some(true)),
         (Reply::text(r#"{"constraint_conflict":true,"risk_level":"low","user_authorization":"high","outcome":"allow","rationale":"Read-only audit prohibits this edit"}"#), Some(false)),
@@ -85,7 +83,6 @@ async fn complete_verdicts_and_unavailable_failures() {
         (Reply::text(&verdict("low", "authorized", "allow")), None),
         (Reply::text(&json!({"constraint_conflict":false,"risk_level":"low", "user_authorization":"high", "outcome":"allow", "rationale":"x".repeat(301)}).to_string()), None),
         (Reply { status: 503, chunks: vec![json!({"error":{"message":"busy"}})], delay: Duration::ZERO, authorization: None, ends: true }, None),
-        (slow, None),
         (
             Reply {
                 chunks: vec![
@@ -107,9 +104,12 @@ async fn complete_verdicts_and_unavailable_failures() {
             let mut report = |_: Notice<'_>| {};
             let mut journal = crate::agent::Journal::of(Vec::new());
             let mut gate = fixture.gate(&mut state, &mut journal, &mut report);
-            gate.review("id", json!({"code": "print(1)"}), Duration::from_millis(80))
+            gate.review("id", json!({"code": "print(1)"}), Duration::from_secs(30))
                 .await
         };
+        if let Review::Unavailable(failure) = &result {
+            assert_ne!(failure.reason, "review exceeded its 30 s deadline");
+        }
         assert_eq!(
             !matches!(result, Review::Unavailable(_)),
             expected.is_some(),
@@ -123,6 +123,38 @@ async fn complete_verdicts_and_unavailable_failures() {
         );
         assert_eq!(requests.lock().unwrap().len(), 1, "no retries");
     }
+}
+
+#[tokio::test]
+async fn a_stalled_review_expires_without_retrying() {
+    let dir = TempDir::new("approval-deadline");
+    let mut reply = Reply::text(&verdict("low", "high", "allow"));
+    reply.delay = Duration::from_secs(60);
+    let (_, requests, _, _) = serve_catalog(dir.path(), vec![reply], catalog()).await;
+    let fixture = Fixture::new(dir.path());
+    let mut state = Reviewer::new("test-session");
+    let mut report = |_: Notice<'_>| {};
+    let mut journal = crate::agent::Journal::of(Vec::new());
+    let mut gate = fixture.gate(&mut state, &mut journal, &mut report);
+    let mut review =
+        Box::pin(gate.review("id", json!({"code": "print(1)"}), Duration::from_secs(30)));
+    tokio::select! {
+        result = &mut review => panic!("review ended before the request arrived: {result:?}"),
+        () = async {
+            while requests.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        } => {}
+    }
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    let result = review.await;
+    tokio::time::resume();
+    assert_eq!(
+        result,
+        Review::unavailable("id", "review exceeded its 30 s deadline".into())
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1, "no retries");
 }
 
 #[tokio::test]
