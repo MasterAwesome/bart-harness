@@ -113,7 +113,13 @@ jobs. Events arrive on stdout, one object per line, each with a `type`: `session
 `turn_started`, `text`, `reasoning`, `tool_started`, `tool_finished`, `job_finished`,
 `job_matched`, `usage` and `turn_done`. `turn_done` carries the final message and
 `jobs_running`; when a job ends, a turn with cause `job` starts by itself.
-A compact request during a turn, or a user message exceeding the pending-input budget,
+To keep jobs alive without automatic model turns, send
+`{"type":"set_auto_wake","enabled":false}` while idle, before starting work.
+`auto_wake_changed` acknowledges the setting; `turn_done.auto_wake` confirms it.
+Jobs continue running, but their notifications cannot start another turn until
+auto-wake is re-enabled. Explicit user and compact requests still work. Closing
+stdin still stops the session and its jobs.
+A compact or auto-wake setting request during a turn, or a user message exceeding the pending-input budget,
 produces `request_rejected` with `request` and `error` fields. Retry after `turn_done`.
 A `retrying` event with `discarded: true` replaces the failed attempt's displayed text
 with its `message` field. Closing stdin also interrupts an active turn.

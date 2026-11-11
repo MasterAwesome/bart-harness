@@ -16,6 +16,7 @@ enum Request {
     User { text: String },
     Interrupt,
     Compact,
+    SetAutoWake { enabled: bool },
 }
 
 type Lines = Option<mpsc::Receiver<Result<String, String>>>;
@@ -158,15 +159,21 @@ pub(super) async fn session(
         "session",
     );
     let mut lines: Lines = Some(stdin_lines()?);
+    let mut auto_wake = true;
     while lines.is_some() {
         let work = tokio::select! {
             line = next(&mut lines) => match line? {
                 Some(Request::User { text }) => Work::Turn(text),
                 Some(Request::Compact) => Work::Compact,
                 Some(Request::Interrupt) => continue,
+                Some(Request::SetAutoWake { enabled }) => {
+                    auto_wake = enabled;
+                    output.emit(json!({"enabled": auto_wake}), "auto_wake_changed");
+                    continue;
+                }
                 None => continue,
             },
-            () = session.jobs_ready(), if session.has_jobs() => Work::Wake,
+            () = session.jobs_ready(), if auto_wake && session.has_jobs() => Work::Wake,
             _ = terminations.requested() => return Ok(()),
             error = output.failed() => return Err(error),
         };
@@ -199,6 +206,10 @@ pub(super) async fn session(
                             }
                         }
                         Ok(Some(Request::Interrupt)) => break Ended::Interrupted,
+                        Ok(Some(Request::SetAutoWake { .. })) => output.emit(
+                            json!({"request": "set_auto_wake", "error": "a turn is running; retry after turn_done"}),
+                            "request_rejected",
+                        ),
                         Ok(Some(Request::Compact)) => output.emit(
                             json!({"request": "compact", "error": "a turn is running; retry after turn_done"}),
                             "request_rejected",
@@ -222,6 +233,7 @@ pub(super) async fn session(
                 "error": error,
                 "message": writer.message,
                 "jobs_running": session.jobs().running_ids(),
+                "auto_wake": auto_wake,
             }),
             "turn_done",
         );
