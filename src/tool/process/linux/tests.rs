@@ -19,7 +19,7 @@ async fn launch_child(root: &Path) {
     ]
     .map(|path| format!("test -x '{}'", path.display()))
     .join(" && ");
-    let output = command("bash", &context.place(), &Default::default())
+    let output = command("bash", &context.place(), &Default::default(), &context.cwd)
         .unwrap()
         .args(["-c", &check])
         .output()
@@ -27,11 +27,16 @@ async fn launch_child(root: &Path) {
         .unwrap();
     print!("{}", String::from_utf8_lossy(&output.stdout));
     assert!(output.status.success(), "{output:?}");
-    let output = command("python3", &context.place(), &Default::default())
-        .unwrap()
-        .output()
-        .await
-        .unwrap();
+    let output = command(
+        "python3",
+        &context.place(),
+        &Default::default(),
+        &context.cwd,
+    )
+    .unwrap()
+    .output()
+    .await
+    .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(
         String::from_utf8_lossy(&output.stdout)

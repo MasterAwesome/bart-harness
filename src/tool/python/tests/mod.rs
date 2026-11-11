@@ -1165,7 +1165,7 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
                     "escape={escape} web_search={web_search} mcp={}",
                     mcp_servers.len()
                 );
-                assert_eq!(text.contains("sandbox"), escape, "{case}");
+                assert_eq!(text.contains("sandbox: bool"), escape, "{case}");
                 assert_eq!(text.contains("build.wait() instead"), one_turn, "{case}");
                 assert_eq!(
                     text.contains("the message resumes you"),
@@ -2069,6 +2069,44 @@ async fn missing_program_names_the_executable_and_does_not_claim_cleanup_failed(
         output.text
     );
     assert!(!output.text.contains("cleanup failed"), "{}", output.text);
+}
+
+#[tokio::test]
+async fn command_directories_are_explicit_local_and_shared_by_background() {
+    let dir = TempDir::new("python-command-cwd");
+    let context = files(dir.path());
+    let output = cell(&context, r#"
+base = pathlib.Path.cwd()
+child = base / 'directory with spaces'
+child.mkdir()
+probe = ['python3', '-c', 'import os; print(os.getcwd())']
+assert pathlib.Path(run(probe, cwd=child).stdout.strip()) == child
+os.chdir(child)
+assert pathlib.Path(run(probe).stdout.strip()) == base
+assert pathlib.Path(run(probe, cwd='directory with spaces').stdout.strip()) == child
+j = bg_run(['python3', '-c', "from pathlib import Path; Path('result').write_text('done')"], cwd=child)
+j.wait()
+assert (child / 'result').read_text() == 'done'
+assert not (base / 'result').exists()
+for invalid in ('', '\0', b'.'):
+    for command in (run, bg_run):
+        try:
+            command(['touch', 'must-not-run'], cwd=invalid)
+        except BartError:
+            pass
+        else:
+            raise AssertionError('invalid cwd accepted')
+for missing in ('missing-directory', child / 'result'):
+    try:
+        run(['touch', 'must-not-run'], cwd=missing)
+    except BartError:
+        pass
+    else:
+        raise AssertionError('unusable cwd accepted')
+assert not (base / 'must-not-run').exists()
+assert not (child / 'must-not-run').exists()
+"#).await;
+    assert!(!output.is_error(), "{}", output.text);
 }
 
 #[tokio::test]

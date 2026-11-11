@@ -96,6 +96,7 @@ pub(super) fn command(
     program: &str,
     place: &Place,
     env: &std::collections::BTreeMap<String, String>,
+    cwd: &Path,
 ) -> Result<Command, String> {
     let tools = tools(&place.cwd)?;
     let mut command = Command::from_command(tokio::process::Command::from(host_command(
@@ -125,7 +126,9 @@ pub(super) fn command(
     }
     command
         .arg(&tools.bwrap)
-        .args(jail_arguments(place, &tools)?);
+        .args(jail_arguments(place, &tools)?)
+        .arg("--chdir")
+        .arg(cwd);
     if let Some(file) = environment {
         command.args(["--args", "3"]);
         command.argument_file(file);
@@ -312,13 +315,7 @@ fn jail_arguments(place: &Place, tools: &Tools) -> Result<Vec<OsString>, String>
     for path in tools.hidden_directories() {
         push(&["--ro-bind-try".as_ref(), path.as_os_str(), path.as_os_str()]);
     }
-    push(&[
-        "--bind".as_ref(),
-        cwd.as_os_str(),
-        cwd.as_os_str(),
-        "--chdir".as_ref(),
-        cwd.as_os_str(),
-    ]);
+    push(&["--bind".as_ref(), cwd.as_os_str(), cwd.as_os_str()]);
     // Git runs repository hooks and config on the host later, so the jail may read them, never write.
     for metadata in git_metadata(cwd)? {
         push(&[

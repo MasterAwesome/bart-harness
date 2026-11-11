@@ -179,7 +179,8 @@ fn commands(escape: bool, one_turn: bool) -> String {
     };
     format!(
         r#"@auto_display
-def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True, env: Mapping[str, str] | None = None{run_escape}) -> Result:
+def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True,
+        cwd: str | PathLike[str] | None = None, env: Mapping[str, str] | None = None{run_escape}) -> Result:
     """Run one program and wait for it. argv is passed literally: no shell, no globbing.
 
         run(["rg", "-n", r"TODO|FIXME", "src"])                         # raw strings for regexes
@@ -192,12 +193,14 @@ def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True, 
     result instead. Timeouts and unknown outcomes always raise. bool(r) is true for exit 0.
     A nonzero exit or abnormal end is also reported after the cell's output.
     The program starts in the session's working directory with the session's environment;
-    os.chdir and os.environ do not change that. env= overrides variables. To run elsewhere
-    use the program's own option (git -C, make -C) or a shell cd.
+    os.chdir and os.environ do not change that. cwd= selects a directory (relative paths
+    resolve from the session directory); env= overrides variables. Neither changes the
+    defaults for later commands or expands sandbox access.
     timeout is {min}-{max} seconds. Processes the program leaves running become a
     background job, named by r.retained_job.{run_doc}"""
 
-def bg_run(argv: Sequence[str], *, notify: str | None = None, env: Mapping[str, str] | None = None{bg_escape}) -> Job:
+def bg_run(argv: Sequence[str], *, notify: str | None = None,
+           cwd: str | PathLike[str] | None = None, env: Mapping[str, str] | None = None{bg_escape}) -> Job:
     """Start a long-running program without waiting; shows [Bart bg_run: job[ID] started].
     Use it, not subprocess, for servers, watchers and slow builds or tests.
 
@@ -210,7 +213,7 @@ def bg_run(argv: Sequence[str], *, notify: str | None = None, env: Mapping[str, 
     Do not poll with sleep or repeated status reads.
     print(build) shows its output so far and its status; build.stdout raises until it ends.
     build.kill() stops it. job[ID] is the same Job, also after an interpreter restart.
-    No shell and no time limit; working directory and env as in run.{bg_doc}"""
+    No shell and no time limit; cwd and env as in run.{bg_doc}"""
 
 "#,
         min = super::execution::MIN_SECONDS,

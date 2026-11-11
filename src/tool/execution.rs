@@ -18,6 +18,7 @@ struct Wire {
     timeout: f64,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    cwd: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +28,7 @@ struct EscapingWire {
     timeout: f64,
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    cwd: Option<String>,
     sandbox: bool,
     reason: Option<String>,
 }
@@ -40,18 +42,18 @@ pub(super) struct Request {
 impl Request {
     pub(super) fn parse(arguments: Value, escape: Escape) -> Result<Self, String> {
         let invalid = |e: serde_json::Error| format!("invalid run request: {e}");
-        let (command, timeout, outside, env) = match escape {
+        let (command, timeout, outside, env, cwd) = match escape {
             Escape::Withheld => {
                 let wire: Wire = serde_json::from_value(arguments).map_err(invalid)?;
-                (wire.argv, wire.timeout, None, wire.env)
+                (wire.argv, wire.timeout, None, wire.env, wire.cwd)
             }
             Escape::Offered => {
                 let wire: EscapingWire = serde_json::from_value(arguments).map_err(invalid)?;
                 let outside = outside(wire.sandbox, wire.reason)?;
-                (wire.argv, wire.timeout, outside, wire.env)
+                (wire.argv, wire.timeout, outside, wire.env, wire.cwd)
             }
         };
-        let command = Argv::parse(command)?.with_env(env)?;
+        let command = Argv::parse(command)?.with_env(env)?.with_cwd(cwd)?;
         if !timeout.is_finite() || !(MIN_SECONDS..=MAX_SECONDS).contains(&timeout) {
             return Err(format!(
                 "timeout must be a finite number from {MIN_SECONDS} to {MAX_SECONDS} seconds"
@@ -69,6 +71,7 @@ impl Request {
 pub(super) struct Argv {
     args: Vec<String>,
     env: std::collections::BTreeMap<String, String>,
+    cwd: Option<String>,
 }
 
 impl Argv {
@@ -86,6 +89,7 @@ impl Argv {
         Ok(Self {
             args: argv,
             env: Default::default(),
+            cwd: None,
         })
     }
 
@@ -108,15 +112,31 @@ impl Argv {
         Ok(self)
     }
 
+    pub(super) fn with_cwd(mut self, cwd: Option<String>) -> Result<Self, String> {
+        if cwd.as_ref().is_some_and(|path| {
+            path.is_empty() || path.contains('\0') || path.len() > COMMAND_BYTES
+        }) {
+            return Err("cwd must be a nonempty path without NUL, at most 32 KiB".into());
+        }
+        self.cwd = cwd;
+        Ok(self)
+    }
+
+    pub(super) fn cwd(&self, base: &std::path::Path) -> std::path::PathBuf {
+        self.cwd
+            .as_ref()
+            .map_or_else(|| base.to_owned(), |path| base.join(path))
+    }
+
     pub(super) fn env(&self) -> &std::collections::BTreeMap<String, String> {
         &self.env
     }
 
     pub(super) fn review_label(&self) -> String {
-        if self.env.is_empty() {
+        if self.env.is_empty() && self.cwd.is_none() {
             self.label()
         } else {
-            serde_json::json!({"argv": self.args, "env": self.env}).to_string()
+            serde_json::json!({"argv": self.args, "env": self.env, "cwd": self.cwd}).to_string()
         }
     }
 
@@ -124,7 +144,10 @@ impl Argv {
         &self.args
     }
     pub(super) fn label(&self) -> String {
-        serde_json::to_string(&self.args).expect("argv strings serialize")
+        match &self.cwd {
+            Some(cwd) => serde_json::json!({"argv": self.args, "cwd": cwd}).to_string(),
+            None => serde_json::to_string(&self.args).expect("argv strings serialize"),
+        }
     }
 }
 

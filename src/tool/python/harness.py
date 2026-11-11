@@ -296,6 +296,15 @@ def _argv(argv):
     return list(argv)
 
 
+def _cwd(cwd):
+    if cwd is None:
+        return None
+    path = os.fspath(cwd)
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise BartError("cwd must be a nonempty text path without NUL")
+    return path
+
+
 def _run(argv, timeout, check, **options):
     if not isinstance(check, bool):
         raise BartError("check must be True or False")
@@ -310,12 +319,12 @@ def _run(argv, timeout, check, **options):
     return result
 
 
-def run(argv, *, timeout=_CONFIG["process_default_seconds"], check=True, env=None):
-    return _run(argv, timeout, check, env={} if env is None else dict(env))
+def run(argv, *, timeout=_CONFIG["process_default_seconds"], check=True, cwd=None, env=None):
+    return _run(argv, timeout, check, cwd=_cwd(cwd), env={} if env is None else dict(env))
 
 
-def run_escaping(argv, *, timeout=_CONFIG["process_default_seconds"], check=True, env=None, sandbox=True, reason=None):
-    return _run(argv, timeout, check, env={} if env is None else dict(env), sandbox=sandbox, reason=reason)
+def run_escaping(argv, *, timeout=_CONFIG["process_default_seconds"], check=True, cwd=None, env=None, sandbox=True, reason=None):
+    return _run(argv, timeout, check, cwd=_cwd(cwd), env={} if env is None else dict(env), sandbox=sandbox, reason=reason)
 
 
 class Job(Result):
@@ -461,14 +470,14 @@ def _background(argv, notify, env, **options):
     return result
 
 
-def bg_run(argv, *, notify=None, env=None):
+def bg_run(argv, *, notify=None, cwd=None, env=None):
     """Start one program; outcomes arrive as events."""
-    return _background(argv, notify, env)
+    return _background(argv, notify, env, cwd=_cwd(cwd))
 
 
-def bg_run_escaping(argv, *, notify=None, env=None, sandbox=True, reason=None):
+def bg_run_escaping(argv, *, notify=None, cwd=None, env=None, sandbox=True, reason=None):
     """bg_run with an explicit request to leave the sandbox."""
-    return _background(argv, notify, env, sandbox=sandbox, reason=reason)
+    return _background(argv, notify, env, cwd=_cwd(cwd), sandbox=sandbox, reason=reason)
 
 
 run_escaping.__name__ = run_escaping.__qualname__ = "run"

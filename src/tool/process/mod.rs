@@ -95,13 +95,14 @@ impl Process {
             |error: io::Error| format!("cannot start program {:?}: {error}", command.args()[0]);
         let (reader, writer) = io::pipe().map_err(failed)?;
         let (err_reader, err_writer) = io::pipe().map_err(failed)?;
-        let mut program = launch(
+        let mut program = launch_in(
             &command.args()[0],
             &Place {
                 confinement,
                 ..context.place()
             },
             command.env(),
+            &command.cwd(&context.cwd),
         )?;
         program.retain_descendants();
         program
@@ -632,6 +633,7 @@ fn jailed_command(
     _: &str,
     _: &Place,
     _: &std::collections::BTreeMap<String, String>,
+    _: &std::path::Path,
 ) -> Result<Command, String> {
     Err(UNSUPPORTED.into())
 }
@@ -641,6 +643,15 @@ pub(crate) fn launch(
     place: &Place,
     env: &std::collections::BTreeMap<String, String>,
 ) -> Result<Command, String> {
+    launch_in(program, place, env, &place.cwd)
+}
+
+fn launch_in(
+    program: &str,
+    place: &Place,
+    env: &std::collections::BTreeMap<String, String>,
+    cwd: &std::path::Path,
+) -> Result<Command, String> {
     let mut command = match place.confinement {
         Confinement::Unrestricted => {
             let mut command =
@@ -648,9 +659,9 @@ pub(crate) fn launch(
             command.envs(ENVIRONMENT).envs(env);
             command
         }
-        Confinement::Jailed(..) => jailed_command(program, place, env)?,
+        Confinement::Jailed(..) => jailed_command(program, place, env, cwd)?,
     };
-    command.current_dir(&place.cwd);
+    command.current_dir(cwd);
     Ok(command)
 }
 

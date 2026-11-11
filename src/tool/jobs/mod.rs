@@ -64,6 +64,7 @@ impl Request {
             notify: Option<String>,
             #[serde(default)]
             env: std::collections::BTreeMap<String, String>,
+            cwd: Option<String>,
         }
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -72,22 +73,25 @@ impl Request {
             notify: Option<String>,
             #[serde(default)]
             env: std::collections::BTreeMap<String, String>,
+            cwd: Option<String>,
             sandbox: bool,
             reason: Option<String>,
         }
         let invalid = |error: serde_json::Error| format!("invalid bg_run request: {error}");
-        let (argv, notify, outside, env) = match escape {
+        let (argv, notify, outside, env, cwd) = match escape {
             super::Escape::Withheld => {
                 let wire: Wire = serde_json::from_value(arguments).map_err(invalid)?;
-                (wire.argv, wire.notify, None, wire.env)
+                (wire.argv, wire.notify, None, wire.env, wire.cwd)
             }
             super::Escape::Offered => {
                 let wire: EscapingWire = serde_json::from_value(arguments).map_err(invalid)?;
                 let outside = super::execution::outside(wire.sandbox, wire.reason)?;
-                (wire.argv, wire.notify, outside, wire.env)
+                (wire.argv, wire.notify, outside, wire.env, wire.cwd)
             }
         };
-        let command = super::execution::Argv::parse(argv)?.with_env(env)?;
+        let command = super::execution::Argv::parse(argv)?
+            .with_env(env)?
+            .with_cwd(cwd)?;
         let pattern = notify.map(|pattern| {
             if pattern.len() > super::execution::COMMAND_BYTES {
                 return Err("notify pattern must be at most 32 KiB".to_owned());

@@ -101,6 +101,32 @@ async fn an_interpreter_offering_escape_has_sandbox_on_run_and_bg_run() {
 
 #[tokio::test]
 #[ignore = "needs a systemd user session and bubblewrap"]
+async fn command_cwd_does_not_move_the_jail_write_boundary() {
+    let dir = TempDir::new("python-jail-cwd");
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join(".git/config"), "protected").unwrap();
+    let context = session(
+        dir.path(),
+        Confinement::Jailed(Network::On, crate::tool::Escape::Withheld),
+        4000,
+    );
+    let output = cell(&context, r#"
+base = pathlib.Path.cwd()
+program = 'from pathlib import Path; import os; assert os.getcwd() == "/etc"; Path(' + repr(str(base/'allowed')) + ').write_text("ok")'
+run(['python3', '-c', program], cwd='/etc')
+j = bg_run(['python3', '-c', program], cwd='/etc')
+j.wait()
+assert j.return_code == 0
+assert (base/'allowed').read_text() == 'ok'
+r = run(['python3', '-c', 'from pathlib import Path; Path("config").write_text("bad")'], cwd=base/'.git', check=False)
+assert r.return_code != 0
+assert (base/'.git/config').read_text() == 'protected'
+"#).await;
+    assert!(!output.is_error(), "{}", output.text);
+}
+
+#[tokio::test]
+#[ignore = "needs a systemd user session and bubblewrap"]
 async fn jailed_commands_adopt_and_python_interrupts_in_its_own_namespace() {
     let dir = TempDir::new("python-jail-lifetime");
     let context = session(
