@@ -206,6 +206,7 @@ class SavedStream:
 
 
 _RUN_VIEW_BYTES = 8 * 1024
+_RUN_ERROR_VIEW_BYTES = 2 * 1024
 
 
 def _bart(kind, fields):
@@ -254,15 +255,23 @@ class Result:
         return self._complete_text(self._snapshot().stderr_file, "stderr")
 
     def __repr__(self):
+        return self._view(_RUN_VIEW_BYTES)
+
+    def _view(self, limit, *, tail=False):
         result = self._snapshot()
         reference = result._reference
         flags = []
         try:
             with pathlib.Path(result._output["path"]).open("rb") as file:
                 size = os.fstat(file.fileno()).st_size
-                data = file.read(_RUN_VIEW_BYTES)
+                start = max(0, size - limit) if tail else 0
+                file.seek(start)
+                data = file.read(limit)
+            if start:
+                while data and data[0] & 0xC0 == 0x80:
+                    data = data[1:]
             if size > len(data):
-                flags.append("truncated")
+                flags.append("truncated; output tail" if tail else "truncated")
             text = data.decode("utf-8", errors="backslashreplace").rstrip("\n")
         except OSError as error:
             flags.append("output unavailable")
@@ -287,7 +296,8 @@ class RunError(BartError):
     def __init__(self, result):
         self.result = result
         cause = "timed out" if result.timed_out else f"ended with {result.outcome}"
-        super().__init__(f"program {cause}; return code {result.return_code}; inspect error.result.stdout_file and error.result.stderr_file")
+        message = f"program {cause}; return code {result.return_code}; inspect error.result.stdout_file and error.result.stderr_file"
+        super().__init__(message + "\n" + result._view(_RUN_ERROR_VIEW_BYTES, tail=True))
 
 
 def _argv(argv):
