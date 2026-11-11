@@ -13,7 +13,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::history::{JobOutcome, Notification, NotificationKind};
+use crate::history::{Notification, NotificationKind};
 
 use super::{
     Context,
@@ -113,7 +113,7 @@ impl Request {
 struct Running {
     background: bool,
     cancel: CancellationToken,
-    command: String,
+    command: super::execution::Argv,
     capture: Option<Value>,
 }
 
@@ -127,36 +127,28 @@ pub(super) struct Started {
 
 fn finished(
     id: u32,
-    command: &str,
+    command: &super::execution::Argv,
     output: &str,
-    capture: crate::history::SavedArtifact,
-    outcome: JobOutcome,
+    result: &super::process::ProgramResult,
+    completion: &super::process::Completion,
 ) -> Notification {
-    let first = command.lines().next().unwrap_or_default();
+    let display = command.display();
+    let first = display.lines().next().unwrap_or_default();
     let mut summary: String = first[..first.floor_char_boundary(200)].into();
-    if summary.len() < command.len() {
+    if summary.len() < display.len() {
         summary.push_str(" …");
     }
     Notification {
         text: format!(
             "{}\n{output}",
-            bart!(
-                Job,
-                "job[{id}] {}{}; {summary}",
-                outcome.label(),
-                if capture.is_complete() {
-                    ""
-                } else {
-                    "; output incomplete"
-                }
-            )
+            bart!(Job, "job[{id}] {}; {summary}", completion.state(result))
         )
         .into(),
         kind: NotificationKind::JobFinished {
             id,
-            outcome,
-            command: command.to_owned(),
-            capture,
+            outcome: result.outcome,
+            command: command.label(),
+            capture: result.output_file.clone(),
         },
     }
 }
@@ -170,7 +162,10 @@ impl Jobs {
         }
     }
 
-    pub(super) fn reserve(self: &Arc<Self>, command: &str) -> Result<Reservation, String> {
+    pub(super) fn reserve(
+        self: &Arc<Self>,
+        command: &super::execution::Argv,
+    ) -> Result<Reservation, String> {
         let mut state = self.state();
         if state.running.len()
             + state
@@ -194,7 +189,7 @@ impl Jobs {
             Running {
                 background: false,
                 cancel: cancel.clone(),
-                command: command.to_owned(),
+                command: command.clone(),
                 capture: None,
             },
         );
@@ -249,17 +244,19 @@ impl Jobs {
         job.background = true;
         let [stdout_file, stderr_file] = collector.saved_streams([false; 2]);
         job.capture = Some(serde_json::json!({
-            "return_code": null, "outcome": null, "timed_out": false,
+            "return_code": null, "outcome": null, "timed_out": false, "state": super::process::RUNNING,
+            "reference": super::output::Name::Job(id).reference(),
             "cleanup_error": null, "retained_job": null,
             "output_file": collector.saved(), "stdout_file": stdout_file, "stderr_file": stderr_file,
         }));
-        let mut run = live.start(&format!("job {id}: {command}"), &command, Some(id));
+        let display = command.display();
+        let mut run = live.start(&format!("job {id}: {display}"), &display, Some(id));
         run.progress().file(collector.path());
         let jobs = Arc::downgrade(self);
         let cancel = reservation.cancel.clone();
         let artifacts_storage = Arc::clone(collector.storage());
         tokio::spawn(async move {
-            let (mut output, result) = process
+            let (mut output, result, completion) = process
                 .finish_watched(
                     collector,
                     &mut run,
@@ -272,8 +269,17 @@ impl Jobs {
                         if let Some(jobs) = jobs.upgrade() {
                             let mut state = jobs.state();
                             state.notifications.push(Notification {
-                                text: bart!(Job, "job[{id}] command {}; its child processes still run as job[{id}]", outcome.label()).into(),
-                                kind: NotificationKind::JobCommandExited { id, outcome, command: command.clone() },
+                                text: bart!(
+                                    Job,
+                                    "job[{id}] command {}; child processes still run",
+                                    outcome.label()
+                                )
+                                .into(),
+                                kind: NotificationKind::JobCommandExited {
+                                    id,
+                                    outcome,
+                                    command: command.label(),
+                                },
                             });
                             jobs.changed.notify_waiters();
                         }
@@ -281,14 +287,13 @@ impl Jobs {
                     cancel,
                 )
                 .await;
-            let outcome = result.outcome;
-            let capture = result.output_file.clone();
-            let saved = tokio::task::spawn_blocking(move || {
-                super::output::save(
+            let (result, saved) = tokio::task::spawn_blocking(move || {
+                let saved = super::output::save(
                     &artifacts_storage,
                     super::output::Name::JobResult(id),
                     &serde_json::to_vec(&result).expect("serializable result"),
-                )
+                );
+                (result, saved)
             })
             .await
             .expect("job result worker");
@@ -302,7 +307,7 @@ impl Jobs {
             if let Some(job) = state.running.remove(&id) {
                 state
                     .notifications
-                    .push(finished(id, &job.command, &output, capture, outcome));
+                    .push(finished(id, &job.command, &output, &result, &completion));
             }
             drop(state);
             reservation.jobs.changed.notify_waiters();
@@ -343,7 +348,7 @@ impl Jobs {
         let Request {
             command, pattern, ..
         } = request;
-        let reservation = self.reserve(&command.label())?;
+        let reservation = self.reserve(&command)?;
         let id = reservation.id;
         let mut collector = Collector::open(
             context.output_budget,
@@ -370,7 +375,7 @@ impl Jobs {
         );
         Ok(Started {
             id,
-            command: command.label(),
+            command: command.display(),
         })
     }
 
@@ -388,7 +393,7 @@ impl Jobs {
                 .ok_or_else(|| format!("job[{id}] has no retained result; it may be unknown or lost during session shutdown"))?;
             let result: super::process::ProgramResult = serde_json::from_slice(&bytes)
                 .map_err(|_| format!("job[{id}] result is incomplete or invalid"))?;
-            Ok(serde_json::to_value(result).expect("serializable result"))
+            Ok(result.payload(super::output::Name::Job(id)))
         }).await.map_err(|error| format!("job result worker failed: {error}"))?
     }
 

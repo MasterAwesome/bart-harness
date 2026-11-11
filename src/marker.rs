@@ -1,7 +1,13 @@
 pub(crate) const PREFIX: &str = "[Bart ";
 
+pub(crate) fn open(kind: &str, fields: &str) -> String {
+    format!("{PREFIX}{kind}: {}", fields.replace(['\n', '\r'], " "))
+}
+
 pub(crate) fn line(kind: &str, fields: &str) -> String {
-    format!("{PREFIX}{kind}: {}]", fields.replace(['\n', '\r'], " "))
+    let mut line = open(kind, fields);
+    line.push(']');
+    line
 }
 
 macro_rules! bart {
@@ -13,9 +19,9 @@ macro_rules! bart {
     (@name NotRun) => { "not run" };
     (@name Output) => { "output" };
     (@name Project) => { "project" };
+    (@name Run) => { "run" };
     (@name Session) => { "session" };
     (@name Skill) => { "skill" };
-    (@name Status) => { "status" };
     (@name Summary) => { "summary" };
     (@name UserMessage) => { "user message" };
     (@name WebSearch) => { "web_search" };

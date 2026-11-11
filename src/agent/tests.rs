@@ -903,9 +903,8 @@ async fn compaction_summarizes_once_and_resumes_its_window() {
         !next.contains(&"x".repeat(1000)),
         "the next request uses the summarized window"
     );
-    assert!(next.contains("Bart summary: replaces earlier context"));
     assert!(
-        next.contains("Bart summary: replaces earlier context"),
+        next.contains("\"[Bart summary: replaces earlier context"),
         "the replacement is explained"
     );
     assert_eq!(
@@ -925,7 +924,7 @@ async fn compaction_summarizes_once_and_resumes_its_window() {
             "rewind must not cause another summary request"
         );
         let retried = requests.last().unwrap().to_string();
-        assert!(retried.contains("Bart summary: replaces earlier context"));
+        assert!(retried.contains("\"[Bart summary: replaces earlier context"));
         assert!(!retried.contains(&"x".repeat(1000)));
         assert!(
             !retried.contains("print(keep + 1)"),
@@ -1041,7 +1040,7 @@ async fn lowering_window_compacts_evidence_but_retains_unfit_original_requiremen
         assert!(
             continued
                 .to_string()
-                .contains("Bart summary: replaces earlier context")
+                .contains("\"[Bart summary: replaces earlier context")
         );
         assert!(!continued.to_string().contains(&"1".repeat(5000)));
         assert!(!continued.to_string().contains(&"x".repeat(5000)));
@@ -1101,12 +1100,9 @@ async fn mid_turn_summary_preserves_the_task_and_live_python_state() {
         );
         let sent = requests[4].to_string();
         assert!(sent.contains("Finish this task."));
+        assert!(!sent.contains(&"x".repeat(1000)));
         assert!(
-            !sent.contains(&"x".repeat(1000))
-                && sent.contains("Bart summary: replaces earlier context")
-        );
-        assert!(
-            sent.contains("Bart summary: replaces earlier context"),
+            sent.contains("\"[Bart summary: replaces earlier context"),
             "the replacement is explained"
         );
     }
@@ -1453,7 +1449,7 @@ async fn an_overflow_compacts_and_retries_once_then_stops() {
         assert_eq!(requests[sent + 1]["tools"], requests[sent]["tools"]);
         let retried = requests[sent + 2].to_string();
         assert!(
-            retried.contains("Bart summary: replaces earlier context"),
+            retried.contains("\"[Bart summary: replaces earlier context"),
             "the retry uses a checkpoint"
         );
         assert!(!retried.contains("line 200 abcdefghij"));
@@ -1936,7 +1932,7 @@ async fn summary_checkpoint_uses_native_prefix_archives_and_preserves_python_sta
     assert_eq!(session.journal.history(), original);
     let window = session.journal.model_context().messages().to_vec();
     assert!(
-        window.iter().any(|m| matches!(m, Message::Instruction(text) if text.contains("Bart summary: replaces earlier context") && text.contains("Continue the task.")))
+        window.iter().any(|m| matches!(m, Message::Instruction(text) if text.starts_with("[Bart summary: replaces earlier context") && text.contains("Continue the task.")))
     );
     let sources: Vec<_> = window
         .iter()
@@ -2109,7 +2105,7 @@ async fn summarizing_after_a_summary_updates_the_handoff_and_archives_evidence()
     assert!(session.journal.model_context().messages().contains(&skill));
     assert!(
         session.journal.model_context().messages().iter().any(
-            |m| matches!(m,Message::Instruction(t) if t.contains("Bart summary: replaces earlier context"))
+            |m| matches!(m,Message::Instruction(t) if t.starts_with("[Bart summary: replaces earlier context"))
         )
     );
     assert!(
@@ -2430,7 +2426,7 @@ async fn checkpoint_generation_and_continuation_work_on_all_four_protocols() {
             .iter()
             .find(|m| {
                 m.to_string()
-                    .contains("Bart summary: replaces earlier context")
+                    .contains("\"[Bart summary: replaces earlier context")
             })
             .unwrap();
         assert_eq!(
@@ -2440,7 +2436,7 @@ async fn checkpoint_generation_and_continuation_work_on_all_four_protocols() {
         assert!(
             requests[1]
                 .to_string()
-                .contains("Bart summary: replaces earlier context")
+                .contains("\"[Bart summary: replaces earlier context")
         );
         assert!(
             requests[1]

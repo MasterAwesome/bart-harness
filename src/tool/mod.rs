@@ -361,16 +361,13 @@ pub(crate) async fn deliver(
     };
     if output.images.len() > image_room {
         output.images.truncate(image_room);
+        if !output.notes.is_empty() && !output.notes.ends_with('\n') {
+            output.notes.push('\n');
+        }
         output.notes.push_str(if sees_images {
-            concat!(
-                "\n",
-                bart!(const Image, "limit of 8 per response reached; the rest were not shown")
-            )
+            bart!(const Image, "limit of 8 per response reached; the rest were not shown")
         } else {
-            concat!(
-                "\n",
-                bart!(const Image, "not shown; this model cannot see images")
-            )
+            bart!(const Image, "not shown; this model cannot see images")
         });
     }
     let mut images = Vec::new();
@@ -378,16 +375,11 @@ pub(crate) async fn deliver(
         match context.save_image(image).await {
             Ok(image) => images.push(image),
             Err(error) => {
-                let _ = write!(output.notes, "\n{}", bart!(Image, "not shown; {error}"));
+                if !output.notes.is_empty() && !output.notes.ends_with('\n') {
+                    output.notes.push('\n');
+                }
+                let _ = write!(output.notes, "{}", bart!(Image, "not shown; {error}"));
             }
-        }
-    }
-    if output.is_error()
-        && let Some(cell) = output.cell
-    {
-        let header = format!("{}\n", bart!(Cell, "{cell}"));
-        if !output.notes.starts_with(&header) && !prefix.contains(&format!("cell[{cell}]")) {
-            output.notes.insert_str(0, &header);
         }
     }
     let prefix = fit(
@@ -421,22 +413,20 @@ fn fit(
         end -= 1;
     }
     text.truncate(end);
-    let reference = cell.map_or_else(
-        || "no saved output".to_owned(),
-        |cell| {
-            let reference = output::Name::Output(cell).reference();
-            format!(
-                "{} output: {reference}{}",
-                if complete { "full" } else { "incomplete" },
-                output::resume(&text, &reference)
-            )
-        },
-    );
+    let reference = cell.map(|cell| output::Name::Output(cell).reference());
     notes.insert_str(
         0,
         &format!(
             "{}\n",
-            bart!(Output, "{end}/{captured} bytes shown; {reference}")
+            output::truncation(
+                &text,
+                captured,
+                reference.as_deref(),
+                output::Truncation {
+                    complete,
+                    resumed: false
+                }
+            )
         ),
     );
     text
@@ -474,6 +464,7 @@ pub(crate) enum Status {
 }
 
 impl Output {
+    #[cfg(test)]
     #[must_use]
     fn success(text: String) -> Self {
         Self {

@@ -23,9 +23,9 @@ async fn delivered_text_fits_the_budget_whatever_is_added_late() {
     );
     assert_eq!(&output.text[..999], "界".repeat(333));
     assert!(output.text[999..].starts_with(output::HOST_METADATA_BOUNDARY));
-    assert!(output.notes.contains("999/6000 bytes shown"));
+    assert!(output.notes.contains("first 999 of 6000 bytes shown"));
     assert!(
-        output.text.contains("full output: cell[4].output"),
+        output.text.contains("all of it: cell[4].output"),
         "the full output stays reachable"
     );
     assert!(
@@ -34,32 +34,6 @@ async fn delivered_text_fits_the_budget_whatever_is_added_late() {
         output.text
     );
     assert_eq!(output.status, Status::Failed);
-}
-
-#[tokio::test]
-async fn delivered_failures_identify_their_cell_without_taxing_successful_output() {
-    let dir = test_support::TempDir::new("deliver-cell-id");
-    let context = test_support::context(dir.path(), Confinement::Unrestricted, 1000);
-    for status in [Status::Succeeded, Status::Failed] {
-        let mut output = Output::error("brief".into());
-        output.status = status;
-        output.cell = Some(17);
-        deliver(&mut output, &context, 0, false).await;
-        if status == Status::Failed {
-            assert_eq!(
-                output.text,
-                format!("brief{}[Bart cell: 17]", output::HOST_METADATA_BOUNDARY)
-            );
-            assert!(output.notes.starts_with("[Bart cell: 17]"));
-        } else {
-            assert_eq!(output.text, "brief");
-            assert!(output.notes.is_empty());
-        }
-        assert_eq!(output.status, status);
-    }
-    let mut not_run = Output::error("not run".into());
-    deliver(&mut not_run, &context, 0, false).await;
-    assert_eq!(not_run.text, "not run");
 }
 
 #[tokio::test]

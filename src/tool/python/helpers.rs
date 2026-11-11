@@ -92,8 +92,18 @@ pub(super) async fn answer(
             arguments,
             review.context.confinement().escape(),
         ) {
-            Ok(request) if request.outside.is_some() => Work::Outside(request),
-            Ok(request) => Work::Program(request),
+            Ok(request) => {
+                effects.processes += 1;
+                let name = Name::Process {
+                    cell,
+                    call: effects.processes,
+                };
+                if request.outside.is_some() {
+                    Work::Outside(request, name)
+                } else {
+                    Work::Program(request, name)
+                }
+            }
             Err(error) => {
                 exchange.queue(&HostMessage::Error(&error));
                 requests.write_all_buf(&mut exchange.unsent).await?;
@@ -103,17 +113,9 @@ pub(super) async fn answer(
         Some(Helper::Background(arguments)) => Work::Background(arguments),
         Some(call) => Work::Other(call),
     };
-    let process_name = matches!(work, Work::Program(_) | Work::Outside(_)).then(|| {
-        effects.processes += 1;
-        Name::Process {
-            cell,
-            call: effects.processes,
-        }
-    });
     let helped = match work {
         Work::Resume => execute(None, review.context, replies, live, process_task).await?,
-        Work::Program(request) => {
-            let name = process_name.expect("a process call is numbered");
+        Work::Program(request, name) => {
             execute(
                 Some((request, name)),
                 review.context,
@@ -126,17 +128,14 @@ pub(super) async fn answer(
         work => {
             let helping = async {
                 match work {
-                    Work::Outside(request) => Box::pin(outside_program(
-                        request,
-                        process_name.expect("a process call is numbered"),
-                        review,
-                        live,
-                    ))
-                    .await
-                    .map(Helped::Program),
+                    Work::Outside(request, name) => {
+                        Box::pin(outside_program(request, name, review, live))
+                            .await
+                            .map(|result| Helped::Program(name, result))
+                    }
                     Work::Background(arguments) => job(arguments, review).await,
                     Work::Other(call) => helper(call, review.context, live).await,
-                    Work::Resume | Work::Program(_) => unreachable!("handled above"),
+                    Work::Resume | Work::Program(..) => unreachable!("handled above"),
                 }
             };
             tokio::select! {
@@ -150,7 +149,7 @@ pub(super) async fn answer(
     };
     let answer = match helped {
         Ok(Helped::Value(value)) => Ok(value),
-        Ok(Helped::Program(result)) => {
+        Ok(Helped::Program(name, result)) => {
             effects.jobs.extend(result.adopted);
             let mut summary = json!({"process": effects.processes, "return_code": result.code});
             if !matches!(result.outcome, crate::history::JobOutcome::Exit(_)) {
@@ -171,32 +170,8 @@ pub(super) async fn answer(
             if result.adopted.is_some() {
                 summary["retained_job"] = json!(result.adopted);
             }
-            let mut fields = vec![format!(
-                "cell[{cell}].run[{}] {}",
-                effects.processes,
-                result.outcome.label()
-            )];
-            if result.timed_out {
-                fields.push("timed out".into());
-            }
-            if let Some(error) = &result.cleanup_error {
-                fields.push(format!("cleanup failed: {error}"));
-            }
-            if let Some(reason) = &result.stdout_file.incomplete {
-                fields.push(format!("stdout incomplete: {reason}"));
-            }
-            if let Some(reason) = &result.stderr_file.incomplete {
-                fields.push(format!("stderr incomplete: {reason}"));
-            }
-            if let Some(job) = result.adopted {
-                fields.push(format!("left processes running as job[{job}]"));
-            }
-            effects
-                .process_summaries
-                .push(summary, bart!(Status, "{}", fields.join("; ")));
-            let mut value = json!(result);
-            value["reference"] = json!(format!("cell[{cell}].run[{}]", effects.processes));
-            Ok(value)
+            effects.process_summaries.push(summary, name, &result);
+            Ok(result.payload(name))
         }
         Ok(Helped::Job(job)) => {
             effects.jobs.push(job.id);
@@ -227,8 +202,8 @@ pub(super) async fn answer(
 
 enum Work {
     Resume,
-    Program(crate::tool::execution::Request),
-    Outside(crate::tool::execution::Request),
+    Program(crate::tool::execution::Request, Name),
+    Outside(crate::tool::execution::Request, Name),
     Background(Value),
     Other(Helper),
 }
@@ -251,13 +226,14 @@ fn admit(images: &mut Vec<InlineImage>, image: InlineImage) -> Result<(), String
 
 pub(super) enum Helped {
     Value(Value),
-    Program(crate::tool::process::ProgramResult),
+    Program(Name, crate::tool::process::ProgramResult),
     Job(crate::tool::jobs::Started),
     Image(InlineImage),
     Mcp(crate::mcp::Outcome, String),
 }
 
 pub(super) struct ProgramTask {
+    name: Name,
     pub(super) task: tokio::task::JoinHandle<crate::tool::process::ProgramResult>,
     cancellation: Option<crate::tool::jobs::CommandCancellation>,
 }
@@ -284,9 +260,11 @@ pub(super) async fn execute(
             Err(error) => return Ok(Err(error)),
         }
     }
+    let program = pending.as_mut().expect("shell started");
+    let name = program.name;
     let result = tokio::select! {
-        result = &mut pending.as_mut().expect("shell started").task => {
-            if result.is_ok() { pending.as_mut().expect("shell completed").cancellation.take(); }
+        result = &mut program.task => {
+            if result.is_ok() { program.cancellation.take(); }
             result.map_err(|e| format!("shell collection failed: {e}"))
         }
         read = replies.read(MAX_FRAME_BYTES) => {
@@ -295,7 +273,7 @@ pub(super) async fn execute(
         }
     };
     pending.take();
-    Ok(result.map(Helped::Program))
+    Ok(result.map(|result| Helped::Program(name, result)))
 }
 
 pub(super) fn interrupt(
@@ -342,6 +320,7 @@ pub(super) async fn start_program(
     let progress = live.clone();
     let cancellation = Some(process.cancellation());
     Ok(ProgramTask {
+        name,
         cancellation,
         task: tokio::spawn(
             async move { process.finish_result(collector, &progress, timeout).await },

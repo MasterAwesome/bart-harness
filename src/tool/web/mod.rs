@@ -41,11 +41,7 @@ pub(super) async fn search(
         if index > 0 {
             output.push_str("\n\n");
         }
-        let _ = writeln!(
-            output,
-            "{}",
-            bart!(WebSearch, "{}; {}", index + 1, query.escape_debug())
-        );
+        let _ = writeln!(output, "{}", bart!(WebSearch, "{}", query.escape_debug()));
         match result {
             Ok(text) => output.push_str(&text),
             Err(error) => {

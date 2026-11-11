@@ -24,9 +24,13 @@ fn a_huge_unicode_line_shows_an_exact_prefix_and_saves_the_whole_capture() {
     assert_eq!(text, line[..16 * 1024]);
     assert_eq!(
         notes,
-        "[Bart output: 16384/65537 bytes shown; full output: cell[2].output]\n"
+        "[Bart output: first 16384 of 65537 bytes shown; all of it: cell[2].output]\n"
     );
     assert!(!text.contains("Bart output:"));
+    assert_eq!(
+        render("output", "\nfirst note\n\nsecond note\n"),
+        "output\n\nfirst note\n\nsecond note"
+    );
     assert_eq!(
         fs::read_to_string(path).unwrap(),
         format!("{line}\n"),
@@ -130,7 +134,7 @@ async fn reopening_an_incomplete_output_keeps_it_incomplete_and_counts_from_its_
     );
     assert_eq!(saved.chars, earlier.chars + 801);
     assert_eq!(text, "z".repeat(100));
-    assert!(notes.contains("100/801 new output bytes shown"));
+    assert!(notes.contains("first 100 of 801 new bytes shown"));
     assert!(notes.contains("cell[1].output, incomplete"), "{notes}");
     assert!(
         !fs::read_to_string(dir.path().join("output-1.log"))
@@ -193,7 +197,7 @@ fn multiline_prefix_never_resumes_after_an_omitted_unicode_character() {
     collector.line("TAIL");
     let (text, notes, saved) = collector.finish();
     assert_eq!(text, "abc\n");
-    assert!(notes.contains("4/18 bytes shown"));
+    assert!(notes.contains("first 4 of 18 bytes shown"));
     assert!(saved.is_complete());
     assert_eq!(
         fs::read_to_string(saved.path).unwrap(),
@@ -215,8 +219,8 @@ fn display_omission_and_incomplete_capture_are_distinct_and_not_saved_as_source(
         let (text, notes, saved) = collector.finish();
         assert_eq!(text, "capt");
         assert!(!saved.is_complete());
-        assert!(notes.contains("4/9 bytes shown"));
-        assert!(notes.contains("incomplete output:"));
+        assert!(notes.contains("first 4 of 9 bytes shown"));
+        assert!(notes.contains("saved copy (incomplete):"));
         assert!(notes.contains("total output size unknown"));
         assert_eq!(fs::read_to_string(saved.path).unwrap(), "captured\n");
     }

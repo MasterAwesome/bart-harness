@@ -56,6 +56,8 @@ pub(in crate::tool) struct ProgramResult {
     pub(in crate::tool) adopted: Option<u32>,
 }
 
+pub(super) const RUNNING: &str = "running";
+
 pub(super) enum Launch {
     Session,
     Outside(crate::approval::Outside),
@@ -67,7 +69,7 @@ impl Process {
         context: &Context,
         within: Launch,
     ) -> Result<Self, String> {
-        let reservation = context.jobs.reserve(&command.label())?;
+        let reservation = context.jobs.reserve(command)?;
         let mut process = Self::spawn_command(command, context, within).await?;
         process.reservation = Some(reservation);
         Ok(process)
@@ -142,17 +144,16 @@ impl Process {
         observe: impl FnMut(&str),
         on_exit: impl FnMut(JobOutcome),
         cancel: tokio_util::sync::CancellationToken,
-    ) -> (String, ProgramResult) {
+    ) -> (String, ProgramResult, Completion) {
         let progress = live.progress().clone();
         let observation = std::sync::Arc::clone(&self.observation);
-        let Collected::Done(mut text, saved, outcome, footer, cancelled, streams) = self
+        let Collected::Done(mut text, saved, outcome, completion, streams) = self
             .collect(collector, &progress, None, observe, on_exit, cancel)
             .await
         else {
             unreachable!("background collections never adopt")
         };
         text.truncate(text.trim_end_matches('\n').len());
-        live.result(&footer);
         let result = ProgramResult::new(
             outcome,
             saved,
@@ -160,14 +161,15 @@ impl Process {
             &observation,
             None,
         );
-        if !cancelled {
+        live.result(&bart!(Job, "{}", completion.state(&result)));
+        if !completion.cancelled {
             live.finish(if outcome == JobOutcome::Exit(0) {
                 super::Status::Succeeded
             } else {
                 super::Status::Failed
             });
         }
-        (text, result)
+        (text, result, completion)
     }
 
     pub(super) async fn finish_result(
@@ -192,7 +194,7 @@ impl Process {
         let mut adopted = None;
         let (outcome, output_file, [stdout_file, stderr_file]) = loop {
             match result {
-                Collected::Done(_, saved, outcome, _, _, streams) => {
+                Collected::Done(_, saved, outcome, _, streams) => {
                     break (
                         outcome,
                         saved,
@@ -393,7 +395,7 @@ impl Process {
             });
         }
         if adopt {
-            let (outcome, _) = termination(status, self.started.elapsed().as_secs_f64(), false);
+            let outcome = exit_outcome(self.exited.as_ref().expect("adopted command exited"));
             self.stream = Some(stream);
             return Collected::Adopt(Box::new((self, collector, outcome)));
         }
@@ -415,14 +417,13 @@ impl Process {
         if matches!(scope, Some(Ok(_))) && status.is_none() {
             status = Some(self.child.target_exit().await.map(|exit| exit.status));
         }
-        let (mut outcome, mut footer) =
+        let (mut outcome, completion) =
             termination(status, self.started.elapsed().as_secs_f64(), cancelled);
         if timed_out {
             outcome = JobOutcome::Killed;
         }
         if let Some(Err(error)) = &scope {
             outcome = JobOutcome::Unknown;
-            footer = bart!(Job, "cleanup failed ({error}); child processes may remain");
             self.observation
                 .lock()
                 .expect(crate::NOT_POISONED)
@@ -432,9 +433,6 @@ impl Process {
             .lock()
             .expect(crate::NOT_POISONED)
             .timed_out = timed_out;
-        if timeout.is_none() {
-            collector.line(&footer);
-        }
         let (text, saved, streams) = tokio::task::spawn_blocking(move || {
             let streams = collector.finish_streams([end_stdout, end_stderr]);
             let (text, notes, saved) = collector.finish();
@@ -446,18 +444,42 @@ impl Process {
         for line in lines {
             observe(&line);
         }
-        Collected::Done(
-            text,
-            saved,
-            outcome,
-            footer,
-            cancelled,
-            streams.map(Box::new),
-        )
+        Collected::Done(text, saved, outcome, completion, streams.map(Box::new))
     }
 }
 
 impl ProgramResult {
+    pub(super) fn state(&self) -> String {
+        let mut state = self.outcome.label();
+        if self.timed_out {
+            state.push_str("; timed out");
+        }
+        state
+    }
+
+    pub(super) fn details(&self) -> Option<String> {
+        let mut parts: Vec<_> = [
+            ("cleanup failed", &self.cleanup_error),
+            ("stdout incomplete", &self.stdout_file.incomplete),
+            ("stderr incomplete", &self.stderr_file.incomplete),
+        ]
+        .into_iter()
+        .filter_map(|(label, reason)| reason.as_ref().map(|reason| format!("{label}: {reason}")))
+        .collect();
+        if let Some(job) = self.adopted {
+            parts.push(format!("left processes running as job[{job}]"));
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
+    pub(super) fn payload(self, name: super::output::Name) -> serde_json::Value {
+        let state = self.state();
+        let mut value = serde_json::json!(self);
+        value["state"] = state.into();
+        value["reference"] = name.reference().into();
+        value
+    }
+
     fn new(
         outcome: JobOutcome,
         output_file: SavedArtifact,
@@ -489,8 +511,7 @@ enum Collected {
         String,
         SavedArtifact,
         JobOutcome,
-        String,
-        bool,
+        Completion,
         Option<Box<[SavedStream; 2]>>,
     ),
     Adopt(Box<(Process, Collector, JobOutcome)>),
@@ -537,48 +558,50 @@ fn exit_outcome(status: &ExitStatus) -> JobOutcome {
     )
 }
 
+pub(super) struct Completion {
+    elapsed: f64,
+    cancelled: bool,
+    status_error: Option<String>,
+}
+
+impl Completion {
+    pub(super) fn state(&self, result: &ProgramResult) -> String {
+        let mut state = format!("{} after {:.1}s", result.state(), self.elapsed);
+        if !result.output_file.is_complete() {
+            state.push_str("; output incomplete");
+        }
+        if self.cancelled {
+            state.push_str("; cancelled");
+        }
+        if let Some(details) = result.details() {
+            let _ = write!(state, "; {details}");
+        }
+        if let Some(error) = &self.status_error {
+            let _ = write!(state, "; exit status unavailable ({error})");
+        }
+        state
+    }
+}
+
 fn termination(
     status: Option<io::Result<ExitStatus>>,
     elapsed: f64,
     cancelled: bool,
-) -> (JobOutcome, String) {
-    let outcome = status
-        .as_ref()
-        .and_then(|result| result.as_ref().ok())
-        .map_or(JobOutcome::Unknown, exit_outcome);
-    let mut footer = String::new();
-    let _ = match status {
-        Some(Ok(status)) => match status.code() {
-            Some(code) => write!(footer, "{}", bart!(Job, "exit {code} after {elapsed:.1}s")),
-            None => write!(
-                footer,
-                "{}",
-                bart!(
-                    Job,
-                    "signal {} after {elapsed:.1}s",
-                    status.signal().expect("exited or signaled status")
-                )
-            ),
-        },
-        Some(Err(error)) => {
-            write!(
-                footer,
-                "{}",
-                bart!(Job, "exit status unavailable ({error}) after {elapsed:.1}s")
-            )
-        }
-        None => write!(
-            footer,
-            "{}",
-            bart!(Job, "exit status unknown after {elapsed:.1}s")
-        ),
-    };
-    if cancelled {
-        footer.push_str(concat!("\n", bart!(const Job, "cancelled")));
-        (JobOutcome::Killed, footer)
+) -> (JobOutcome, Completion) {
+    let outcome = if cancelled {
+        JobOutcome::Killed
     } else {
-        (outcome, footer)
-    }
+        status
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map_or(JobOutcome::Unknown, exit_outcome)
+    };
+    let completion = Completion {
+        elapsed,
+        cancelled,
+        status_error: status.and_then(Result::err).map(|error| error.to_string()),
+    };
+    (outcome, completion)
 }
 
 const ENVIRONMENT: [(&str, &str); 4] = [

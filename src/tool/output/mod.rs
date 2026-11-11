@@ -441,10 +441,22 @@ impl StatusWriter {
                 if omitted == 0 && artifact.complete() {
                     String::new()
                 } else {
-                    bart!(Status, "{}", artifact.describe("all records"))
+                    let records = artifact.describe("all records");
+                    if omitted > 0 {
+                        bart!(Run, "{omitted} more not shown; {records}")
+                    } else {
+                        bart!(Run, "{records}")
+                    }
                 }
             }
-            Some(Err(error)) => bart!(Status, "records not saved; {error}"),
+            Some(Err(error)) => {
+                let failure = bart!(Run, "records not saved; {error}");
+                if omitted > 0 {
+                    format!("{}\n{failure}", bart!(Run, "{omitted} more not shown"))
+                } else {
+                    failure
+                }
+            }
             None => String::new(),
         }
     }
@@ -746,22 +758,17 @@ impl Collector {
         let saved = self.saved();
         let mut notes = String::new();
         if self.overflowed {
-            let scope = if self.resumed { "new output " } else { "" };
-            let completeness = if saved.is_complete() {
-                "full"
-            } else {
-                "incomplete"
-            };
-            let resume = resume(&self.head, &self.output.reference);
             let _ = writeln!(
                 notes,
                 "{}",
-                bart!(
-                    Output,
-                    "{}/{} {scope}bytes shown; {completeness} output: {}{resume}",
-                    self.head.len(),
+                truncation(
+                    &self.head,
                     self.bytes,
-                    self.output.reference
+                    Some(&self.output.reference),
+                    Truncation {
+                        complete: saved.is_complete(),
+                        resumed: self.resumed
+                    },
                 )
             );
         }
@@ -810,7 +817,7 @@ pub(in crate::tool) fn render(prefix: &str, notes: &str) -> String {
     }
     let omitted = bart!(const Output, "further notes omitted");
     let mut result = prefix.to_owned();
-    if !prefix.is_empty() {
+    if !prefix.is_empty() && !prefix.ends_with('\n') {
         result.push_str(HOST_METADATA_BOUNDARY);
     }
     let start = result.len();
@@ -838,15 +845,43 @@ pub(crate) fn thousands(value: usize) -> String {
     grouped
 }
 
-// The prefix can end mid-line, so continue at that line. A prefix without a newline
-// is one line too long to show, and no offset helps.
-pub(super) fn resume(head: &str, reference: &str) -> String {
-    if head.contains('\n') {
-        let next = head.lines().count() + usize::from(head.ends_with('\n'));
-        format!("; continue with read({reference}, offset={next})")
-    } else {
-        String::new()
-    }
+pub(super) struct Truncation {
+    pub(super) complete: bool,
+    pub(super) resumed: bool,
+}
+
+pub(super) fn truncation(
+    head: &str,
+    total: usize,
+    reference: Option<&str>,
+    Truncation { complete, resumed }: Truncation,
+) -> String {
+    let recovery = match reference {
+        Some(reference) if head.contains('\n') => {
+            let next = head.lines().count() + usize::from(head.ends_with('\n'));
+            let incomplete = if complete {
+                ""
+            } else {
+                "; saved copy incomplete"
+            };
+            format!("read({reference}, offset={next}){incomplete}")
+        }
+        Some(reference) => {
+            let label = if complete {
+                "all of it"
+            } else {
+                "saved copy (incomplete)"
+            };
+            format!("{label}: {reference}")
+        }
+        None => "the rest was not saved".into(),
+    };
+    let scope = if resumed { "new " } else { "" };
+    bart!(
+        Output,
+        "first {} of {total} {scope}bytes shown; {recovery}",
+        head.len()
+    )
 }
 
 #[cfg(test)]

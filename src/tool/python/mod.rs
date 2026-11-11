@@ -9,7 +9,7 @@ use super::{
     output::{Collector, Name},
     parse_arguments,
 };
-use capture::{Capture, Effects, denied_prior};
+use capture::{Capture, Earlier, EarlierNotes, Effects, Participation, denied_prior};
 use host::{End, Lease, Slot, start_cell};
 pub(in crate::tool) use host::{Interpreter, identity};
 
@@ -187,11 +187,12 @@ def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True,
         run(["bash", "-o", "pipefail", "-c", "make 2>&1 | tail -20"])   # pipes and redirects need a shell
         data = json.loads(run(["cargo", "metadata", "--format-version=1"]).stdout)   # assigned: silent
 
-    The view is [Bart run: exit E; cell[N].run[M]], then combined stdout and stderr.
+    The view is [Bart run: cell[N].run[M] exit E], then combined stdout and stderr.
     A nonzero exit or signal raises RunError and stops the cell unless caught; its .result
-    holds the outcome and captured output. Pass check=False to inspect an expected nonzero
-    result instead. Timeouts and unknown outcomes always raise. bool(r) is true for exit 0.
-    A nonzero exit or abnormal end is also reported after the cell's output.
+    holds the outcome and captured output; the error message is its view. Pass check=False
+    to inspect an expected nonzero result. Timeouts and unknown outcomes always raise.
+    bool(r) is true for exit 0.
+    A failing run whose view is not shown is reported after the cell's output.
     The program starts in the session's working directory with the session's environment;
     os.chdir and os.environ do not change that. cwd= selects a directory (relative paths
     resolve from the session directory); env= overrides variables. Neither changes the
@@ -201,7 +202,9 @@ def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True,
 
 def bg_run(argv: Sequence[str], *, notify: str | None = None,
            cwd: str | PathLike[str] | None = None, env: Mapping[str, str] | None = None{bg_escape}) -> Job:
-    """Start a long-running program without waiting; shows [Bart bg_run: job[ID] started].
+    """Start a long-running program without waiting; prints [Bart job: job[ID] started].
+    print(build) shows [Bart job: job[ID] running] (or exit E), then its output so far.
+    Completion shows [Bart job: job[ID] exit 0 after 0.3s; make test].
     Use it, not subprocess, for servers, watchers and slow builds or tests.
 
         build = bg_run(["cargo", "test", "--locked"])
@@ -211,7 +214,7 @@ def bg_run(argv: Sequence[str], *, notify: str | None = None,
     notify (a Rust regex: no look-around or backreferences). Meanwhile do independent work.
     {ending}
     Do not poll with sleep or repeated status reads.
-    print(build) shows its output so far and its status; build.stdout raises until it ends.
+    build.stdout raises until it ends.
     build.kill() stops it. job[ID] is the same Job, also after an interpreter restart.
     No shell and no time limit; cwd and env as in run.{bg_doc}"""
 
@@ -278,8 +281,8 @@ def web_search(*queries: str) -> Text:
 
         web_search("WHATWG SSE event framing", "RFC 7636 PKCE requirements")
 
-    One failed query does not fail the others. Put a query that depends on an answer in a
-    later cell, after reading that answer."""
+    Each answer starts with [Bart web_search: query]. One failed query does not fail the others.
+    Put a query that depends on an answer in a later cell, after reading that answer."""
 "#;
 
 const MCP: &str = r#"
@@ -350,6 +353,14 @@ pub(super) async fn call(
         .unwrap_or_else(Output::error)
 }
 
+enum Refusal {
+    Unsettled(Earlier),
+    Denied {
+        earlier: Option<Earlier>,
+        reason: String,
+    },
+}
+
 async fn run(
     arguments: &Value,
     id: &str,
@@ -363,60 +374,56 @@ async fn run(
         .is_none_or(|g| g.approval.mode() == crate::approval::Mode::None)
         .then(|| time::Instant::now() + timeout);
     let mut review = CellReview { id, context, gate };
-    let mut prior = Output::success(String::new());
-    let mut slot = match prepared_slot(
+    let (mut slot, prior) = match prepared_slot(
         &arguments,
         id,
         context,
         live,
         review.gate.as_deref_mut(),
         timeout,
-        &mut prior,
     )
     .await
     {
-        Ok(slot) => slot,
-        Err(reason) => return Ok(denied_prior(prior, reason)),
+        Ok(prepared) => prepared,
+        Err(refusal) => return Ok(denied_prior(refusal)),
     };
-    let mut collector =
+    let collector =
         Collector::open_cell(context.output_budget, &context.artifacts, &arguments.code)
             .await
             .map_err(|error| format!("cannot create the output file: {error}"))?;
     let path = collector.path().to_path_buf();
     live.progress().file(&path);
-    if !prior.text.is_empty() {
-        collector.line(&format!(
-            concat!(
-                bart!(const Cell, "earlier cell's result"),
-                "\n{}\n",
-                bart!(const Cell, "this cell")
-            ),
-            &prior.text[..prior.prefix_len.unwrap_or(prior.text.len())]
-        ));
+    let mut capture = Capture::new(collector, Effects::default(), live);
+    if let Some(earlier) = &prior {
+        capture
+            .collector
+            .line(earlier.prefix().trim_end_matches('\n'));
+        capture
+            .collector
+            .line(&bart!(Cell, "cell[{}] result", capture.cell));
     }
+    let prior = prior.map(|earlier| {
+        let output = *earlier.output;
+        capture.effects.jobs = output.jobs;
+        capture.effects.images = output.images;
+        capture.effects.diffs = output.diffs;
+        EarlierNotes {
+            cell: earlier.cell,
+            notes: output.notes,
+        }
+    });
     let (running, note) = match start_cell(&mut slot, arguments.restart, context).await {
         Ok(started) => started,
         Err(error) => {
-            collector.discard();
-            return Err(error);
+            capture.collector.discard();
+            return Err(bart!(Cell, "cell[{}] not started; {error}", capture.cell));
         }
     };
     let mut lease = Lease {
         stopped: Arc::clone(&context.interpreter.stopped),
         slot: Some(slot),
         running: Some(running),
-        capture: Some(Capture::new(
-            collector,
-            Effects {
-                process_summaries: Default::default(),
-                processes: 0,
-                jobs: prior.jobs,
-                images: prior.images,
-                diffs: prior.diffs,
-                changed: Vec::new(),
-            },
-            live,
-        )),
+        capture: Some(capture),
     };
     let started = time::Instant::now();
     let deadline = execution_deadline
@@ -435,7 +442,13 @@ async fn run(
         .await;
     let capture = lease.finish(&end);
     Ok(capture
-        .finish(end, timeout, true, note.map(str::to_owned), prior.notes)
+        .finish(
+            end,
+            timeout,
+            Participation::Started,
+            note.map(str::to_owned),
+            prior,
+        )
         .await)
 }
 
@@ -446,8 +459,8 @@ async fn prepared_slot(
     live: &Run,
     mut gate: Option<&mut crate::approval::Gate<'_>>,
     timeout: Duration,
-    prior: &mut Output,
-) -> Result<OwnedMutexGuard<Slot>, String> {
+) -> Result<(OwnedMutexGuard<Slot>, Option<Earlier>), Refusal> {
+    let mut prior = None;
     let mut slot = Arc::clone(&context.interpreter.slot).lock_owned().await;
     context.interpreter.apply_reset(&mut slot);
     let reviewed = gate
@@ -462,29 +475,44 @@ async fn prepared_slot(
         } else {
             end
         };
-        *prior = capture
-            .finish(end, timeout, false, None, String::new())
-            .await;
+        prior = Some(Earlier {
+            cell: capture.cell,
+            continued: capture.continued,
+            output: Box::new(
+                capture
+                    .finish(end, timeout, Participation::Waited, None, None)
+                    .await,
+            ),
+        });
     }
     if (reviewed || !arguments.restart)
         && (slot.cancelled.is_some() || slot.running.as_ref().is_some_and(|r| r.busy.is_some()))
     {
-        let settled;
-        (slot, settled) =
-            collect_earlier(slot, id, context, live, gate.as_deref_mut(), timeout, prior).await?;
+        let (collected_slot, earlier, settled) =
+            collect_earlier(slot, id, context, live, gate.as_deref_mut(), timeout)
+                .await
+                .map_err(|reason| Refusal::Denied {
+                    earlier: None,
+                    reason,
+                })?;
+        slot = collected_slot;
         if !settled && !arguments.restart {
             if let Some(gate) = gate.as_mut() {
                 gate.stopped = true;
             }
-            return Err(bart!(const NotRun, "an earlier cell is still running").into());
+            return Err(Refusal::Unsettled(earlier));
         }
+        prior = Some(earlier);
     }
     if context
         .interpreter
         .stopped
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        return Err(bart!(const NotRun, "session stopped").into());
+        return Err(Refusal::Denied {
+            earlier: prior,
+            reason: bart!(const NotRun, "session stopped").into(),
+        });
     }
     if let Some(gate) = gate.filter(|g| g.approval.mode() != crate::approval::Mode::None) {
         drop(slot);
@@ -497,13 +525,15 @@ async fn prepared_slot(
             },
             arguments.code
         );
-        gate.check(id, json!({
+        if let Err(reason) = gate.check(id, json!({
             "code": arguments.code, "restart": arguments.restart,
             "timeout": timeout.as_secs(),
             "cwd": context.cwd, "confinement": format!("{:?}", context.confinement()),
             "active_jobs": context.live.jobs().iter().filter(|job| job.state == super::LiveState::Running).map(|job| json!({"id": job.job, "command": job.title})).collect::<Vec<_>>(),
-            "untrusted_earlier_cell_result": prior.text,
-        }), &prompt).await?;
+            "untrusted_earlier_cell_result": prior.as_ref().map_or("", |earlier| earlier.output.text.as_str()),
+        }), &prompt).await {
+            return Err(Refusal::Denied { earlier: prior, reason });
+        }
         slot = Arc::clone(&context.interpreter.slot).lock_owned().await;
     }
     if context
@@ -511,9 +541,12 @@ async fn prepared_slot(
         .stopped
         .load(std::sync::atomic::Ordering::Acquire)
     {
-        return Err(bart!(const NotRun, "session stopped").into());
+        return Err(Refusal::Denied {
+            earlier: prior,
+            reason: bart!(const NotRun, "session stopped").into(),
+        });
     }
-    Ok(slot)
+    Ok((slot, prior))
 }
 
 async fn collect_earlier(
@@ -523,8 +556,7 @@ async fn collect_earlier(
     live: &Run,
     gate: Option<&mut crate::approval::Gate<'_>>,
     timeout: Duration,
-    prior: &mut Output,
-) -> Result<(OwnedMutexGuard<Slot>, bool), String> {
+) -> Result<(OwnedMutexGuard<Slot>, Earlier, bool), String> {
     let cancelled = slot.cancelled.take();
     let (capture, settled) = if let Some((mut capture, end)) = cancelled {
         capture.stream.redirect(live.progress());
@@ -534,23 +566,23 @@ async fn collect_earlier(
             .running
             .as_ref()
             .and_then(|running| running.busy.clone())
-            .ok_or("cannot collect earlier cell: it is not running")?;
-        let mut collector = Collector::reopen(
+            .ok_or_else(|| "cannot collect earlier cell: it is not running".to_owned())?;
+        let collector = Collector::reopen(
             context.output_budget,
             &context.artifacts,
             Name::Output(busy.cell),
             busy.saved,
         )
         .await
-        .map_err(|e| format!("cannot collect earlier cell: {e}"))?;
-        collector
-            .line(bart!(const Cell, "an earlier cell was still running; its output continues"));
+        .map_err(|e| format!("cannot collect cell[{}]: {e}", busy.cell))?;
         let effects = Effects {
             processes: busy.processes,
             ..Effects::default()
         };
-        (Capture::new(collector, effects, live), None)
+        (Capture::continuation(collector, effects, live), None)
     };
+    let cell = capture.cell;
+    let continued = capture.continued;
     let running = slot.running.take();
     let mut lease = Lease {
         stopped: Arc::clone(&context.interpreter.stopped),
@@ -575,12 +607,19 @@ async fn collect_earlier(
         }
     };
     let settled = matches!(end, End::Done { .. } | End::Cancelled);
-    *prior = lease
-        .finish(&end)
-        .finish(end, timeout, false, None, String::new())
-        .await;
+    let earlier = Earlier {
+        cell,
+        continued,
+        output: Box::new(
+            lease
+                .finish(&end)
+                .finish(end, timeout, Participation::Waited, None, None)
+                .await,
+        ),
+    };
     Ok((
         Arc::clone(&context.interpreter.slot).lock_owned().await,
+        earlier,
         settled,
     ))
 }

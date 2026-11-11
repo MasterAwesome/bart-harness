@@ -18,3 +18,20 @@ pub(crate) fn quote(value: &str) -> String {
     quoted.push('\'');
     quoted
 }
+
+pub(crate) fn argv(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if !arg.is_empty()
+                && arg
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+            {
+                arg.clone()
+            } else {
+                quote(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}

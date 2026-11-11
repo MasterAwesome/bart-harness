@@ -68,6 +68,7 @@ impl Request {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Argv {
     args: Vec<String>,
     env: std::collections::BTreeMap<String, String>,
@@ -143,6 +144,10 @@ impl Argv {
     pub(super) fn args(&self) -> &[String] {
         &self.args
     }
+    pub(super) fn display(&self) -> String {
+        crate::shell_quote::argv(&self.args)
+    }
+
     pub(super) fn label(&self) -> String {
         match &self.cwd {
             Some(cwd) => serde_json::json!({"argv": self.args, "cwd": cwd}).to_string(),

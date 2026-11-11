@@ -36,10 +36,9 @@ pub(super) struct Slot {
     pub(super) cancelled: Option<(Capture, End)>,
 }
 
-pub(super) const LOST: &str =
-    bart!(const Cell, "the interpreter had stopped; earlier Python state is gone");
+pub(super) const LOST: &str = "interpreter had stopped; earlier Python state is gone";
 pub(super) const REWOUND: &str =
-    bart!(const Cell, "interpreter restarted after a rewind; earlier Python state is gone");
+    "interpreter restarted after a rewind; earlier Python state is gone";
 
 impl Interpreter {
     pub(in crate::tool) fn inventory(&self) -> String {
@@ -207,8 +206,7 @@ pub(super) async fn start_cell(
     let mut note = slot.notice.take();
     let mut running = slot.running.take();
     if restart && running.take().is_some() {
-        note =
-            Some(bart!(const Cell, "interpreter restarted as asked; earlier Python state is gone"));
+        note = Some("interpreter restarted as asked; earlier Python state is gone");
     }
     let running = match running {
         Some(running) => running,

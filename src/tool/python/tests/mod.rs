@@ -94,9 +94,10 @@ async fn cells_keep_state_and_show_output_values_and_failures() {
     .await;
     assert!(
         rebinding.text.starts_with("'mine'")
-            && rebinding.text.ends_with(
-                "[Bart cell: edit, read are built-ins; this cell's bindings of them were removed]"
-            ),
+            && rebinding.text.ends_with(&format!(
+                "[Bart cell: cell[{}] helper bindings removed; edit, read are built-ins]",
+                rebinding.cell.unwrap()
+            )),
         "a cell's rebinding works inside it and is reported: {}",
         rebinding.text
     );
@@ -340,7 +341,7 @@ async fn long_output_is_bounded_and_saved() {
     let cell = long.cell.unwrap();
     assert!(
         long.text
-            .contains(&format!("full output: cell[{cell}].output")),
+            .contains(&format!("read(cell[{cell}].output, offset=")),
         "{}",
         long.text
     );
@@ -1057,7 +1058,10 @@ async fn edit_batches_match_the_original_and_report_where_they_fail() {
     assert!(!partial.text.contains("Created ") && !partial.text.contains("Edited "));
     let effects = partial
         .text
-        .split_once("[Bart cell: before failing it ")
+        .split_once(&format!(
+            "[Bart cell: cell[{}] changes made before the failure: ",
+            partial.cell.unwrap()
+        ))
         .unwrap()
         .1;
     assert_eq!(effects.matches("edited ").count(), 1, "{effects}");
@@ -1107,6 +1111,14 @@ async fn background_notifications_match_once_and_complete() {
         assert_eq!(
             serde_json::from_str::<Vec<String>>(original).unwrap(),
             ["bash", "-c", command]
+        );
+        assert!(
+            notes[0]
+                .text
+                .starts_with(&format!("[Bart job: job[{}] exit 0 after ", output.jobs[0]))
+                && notes[0].text.contains("s; bash -c "),
+            "{}",
+            notes[0].text
         );
         fs::remove_file(dir.path().join("release")).unwrap();
     }
@@ -1329,7 +1341,10 @@ async fn a_call_that_only_waited_for_a_busy_cell_is_not_numbered_as_one() {
     .await;
     assert!(busy.text.contains("is still running"), "{}", busy.text);
     let waited = call(&json!({"code": "print('never')", "timeout": 1}), &context).await;
-    assert!(waited.text.contains("not run"), "{}", waited.text);
+    assert_eq!(
+        waited.text,
+        "[Bart cell: cell[1] output continues]\n[Bart not run: cell[1] is still running after 1s more; call again to keep waiting, or pass restart: true]"
+    );
     assert_eq!(
         waited.cell, None,
         "its code never ran, so nothing may point at it"
@@ -1416,6 +1431,9 @@ async fn a_busy_cell_keeps_its_number_and_shell_order_while_the_next_call_waits(
     let next = call(&json!({"code": "print('next')", "timeout": 20}), &context).await;
     assert!(
         next.text[..next.prefix_len.unwrap()].contains("second")
+            && next
+                .text
+                .contains(&format!("[Bart cell: cell[{}] result]", first + 1))
             && next.text[..next.prefix_len.unwrap()].ends_with("next"),
         "{}",
         next.text
@@ -1690,6 +1708,14 @@ async fn root_exit_wakes_the_model_without_finishing_or_releasing_inherited_desc
             matches!(notes[0].kind, NotificationKind::JobCommandExited { outcome, .. } if outcome == expected)
         );
         assert!(notes[0].terminal_job().is_none());
+        assert_eq!(
+            notes[0].text.as_ref(),
+            format!(
+                "[Bart job: job[{}] command {}; child processes still run]",
+                output.jobs[0],
+                expected.label()
+            )
+        );
         assert_eq!(context.jobs.running_count(), 1);
         assert_eq!(
             fs::read_to_string(dir.path().join("receipt")).unwrap(),
@@ -1925,13 +1951,10 @@ run(["bash", "-c", "printf stderr-output >&2; exit 7"], check=False)
     ] {
         assert_eq!(output.text.matches(word).count(), 1, "{}", output.text);
         let reference = format!("cell[1].run[{number}]");
-        assert_eq!(
-            output.text.matches(&reference).count(),
-            if number == 7 { 2 } else { 1 }
-        );
+        assert_eq!(output.text.matches(&reference).count(), 1);
         assert!(output.text.find(&reference).unwrap() < output.text.find(word).unwrap());
     }
-    assert!(output.text.contains("[Bart run: exit 7; cell[1].run[7]]"));
+    assert!(output.text.contains("[Bart run: cell[1].run[7] exit 7]"));
     let mixed = cell(&context, "run(['bash', '-c', 'echo out-success; echo err-success >&2'])\nrun(['bash', '-c', 'echo out-failure; echo err-failure >&2; exit 2'], check=False)").await;
     assert!(!mixed.is_error(), "{}", mixed.text);
     for marker in ["out-success", "err-success", "out-failure", "err-failure"] {
@@ -1940,7 +1963,7 @@ run(["bash", "-c", "printf stderr-output >&2; exit 7"], check=False)
     let later = cell(&context, "held").await;
     assert!(later.text.contains("cell[1].run[1]") && later.text.contains("held-output"));
     let empty = cell(&context, "run(['true'])").await;
-    assert!(empty.text.starts_with("[Bart run: exit 0; cell[4].run[1]]"));
+    assert!(empty.text.starts_with("[Bart run: cell[4].run[1] exit 0]"));
     assert!(!empty.text.contains("full") && !empty.text.contains("[no output]"));
 }
 
@@ -1964,7 +1987,9 @@ else:
     assert!(
         output
             .text
-            .contains("[Bart run: truncated; exit 0; cell[1].run[1]]")
+            .contains("[Bart run: cell[1].run[1] exit 0; first 8192 of 20008 bytes shown]"),
+        "{}",
+        &output.text[..output.text.len().min(300)]
     );
     assert!(!output.text.contains("END"));
     let binary = cell(
@@ -2380,8 +2405,19 @@ async fn late_process_failures_survive_match_pressure_and_status_overflow_is_rec
     super::super::deliver(&mut output, &context, 0, true).await;
     assert!(!output.is_error(), "{}", output.text);
     assert!(output.text.contains(".run[64] exit 1"), "{}", output.text);
-    assert!(output.text.contains("6 more not shown"), "{}", output.text);
-    assert!(output.text.contains("cell[1].status"), "{}", output.text);
+    assert!(
+        output
+            .text
+            .contains("[Bart run: 6 more not shown; all records: cell[1].status]"),
+        "{}",
+        output.text
+    );
+    assert!(
+        output.text.find(".run[64] exit 1").unwrap()
+            < output.text.find("6 more not shown; all records:").unwrap(),
+        "{}",
+        output.text
+    );
     assert!(!output.text.contains("records not saved"));
 }
 
@@ -2393,7 +2429,12 @@ async fn a_status_archive_failure_is_explicit_and_does_not_hide_process_outcomes
     let output = cell(&context, "r=run(['false'], check=False)").await;
     assert!(!output.is_error(), "{}", output.text);
     assert!(output.text.contains("records not saved"), "{}", output.text);
-    assert!(output.text.contains(".run[1] exit 1"), "{}", output.text);
+    assert!(
+        output.text.find(".run[1] exit 1").unwrap()
+            < output.text.find("records not saved").unwrap(),
+        "{}",
+        output.text
+    );
 }
 
 #[tokio::test]
@@ -2426,8 +2467,8 @@ async fn web_search_batches_display_and_validate_queries() {
     let output = cell(&context, "web_search('first query', 'second query')").await;
     assert_eq!(output.status, Status::Succeeded, "{}", output.text);
     assert!(
-        output.text.contains("[Bart web_search: 1; first query]")
-            && output.text.contains("[Bart web_search: 2; second query]"),
+        output.text.contains("[Bart web_search: first query]")
+            && output.text.contains("[Bart web_search: second query]"),
         "{}",
         output.text
     );
@@ -2446,16 +2487,15 @@ async fn background_launches_report_their_handles_once_even_when_assigned() {
         assert!(!output.is_error(), "{}", output.text);
         assert_eq!(output.jobs.len(), 1);
         assert_eq!(output.text.lines().count(), 1, "{}", output.text);
-        assert!(output.text.contains(&format!("job[{}]", output.jobs[0])));
+        assert_eq!(
+            output.text,
+            format!("[Bart job: job[{}] started]", output.jobs[0])
+        );
         context.jobs.settled().await;
         context.jobs.take_notifications();
     }
     let printed = cell(&context, "print(j)").await;
-    assert!(
-        printed.text.contains("job[2]") && printed.text.contains("exit 0"),
-        "{}",
-        printed.text
-    );
+    assert_eq!(printed.text, "[Bart job: job[2] exit 0]");
     let refused = cell(&context, "bg_run(['bart-no-such-launch-program'])").await;
     assert!(refused.is_error() && !refused.text.contains("started]"));
 }
@@ -2545,7 +2585,13 @@ print(j)
     )
     .await;
     assert!(!finished.is_error(), "{}", finished.text);
-    assert!(finished.text.contains("signal") && finished.text.contains("truncated"));
+    assert!(
+        finished
+            .text
+            .contains("[Bart job: job[1] signal 15; first 8192 of "),
+        "{}",
+        &finished.text[..finished.text.len().min(300)]
+    );
     assert!(finished.text.len() < 12_000);
     let stopped = cell(
         &context,

@@ -56,6 +56,19 @@ with open(os.devnull, "rb") as null:
 os.dup2(2, 1)
 sys.stdout = os.fdopen(1, "w", buffering=1, encoding="utf-8", errors="replace", closefd=False)
 sys.stderr = os.fdopen(2, "w", buffering=1, encoding="utf-8", errors="replace", closefd=False)
+_diagnostics = os.fdopen(2, "w", buffering=1, encoding="utf-8", errors="replace", closefd=False)
+
+
+def _diagnostic(text=""):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
+    _diagnostics.write(text)
+    if text and not text.endswith("\n"):
+        _diagnostics.write("\n")
+    _diagnostics.flush()
 
 
 class BartError(Exception):
@@ -217,7 +230,7 @@ def _bart(kind, fields):
 class Result:
     """A command result with a bounded, attributed display and complete stream accessors."""
 
-    def __init__(self, return_code, outcome, timed_out, cleanup_error, retained_job, stdout_file, stderr_file, output_file, reference):
+    def __init__(self, return_code, outcome, timed_out, cleanup_error, retained_job, stdout_file, stderr_file, output_file, reference, state):
         self.return_code = return_code
         self.stdout_file = SavedStream(**stdout_file, reference=reference.replace(".run[", ".stdout[") if reference.startswith("cell[") else f"{reference}.stdout_file.path")
         self.stderr_file = SavedStream(**stderr_file, reference=reference.replace(".run[", ".stderr[") if reference.startswith("cell[") else f"{reference}.stderr_file.path")
@@ -227,6 +240,7 @@ class Result:
         self.retained_job = retained_job
         self._output = output_file
         self._reference = reference
+        self._state = state
 
     def _snapshot(self):
         return self
@@ -271,7 +285,7 @@ class Result:
                 while data and data[0] & 0xC0 == 0x80:
                     data = data[1:]
             if size > len(data):
-                flags.append("truncated; output tail" if tail else "truncated")
+                flags.append(f"{'last' if tail else 'first'} {len(data)} of {size} bytes shown")
             text = data.decode("utf-8", errors="backslashreplace").rstrip("\n")
         except OSError as error:
             flags.append("output unavailable")
@@ -279,10 +293,8 @@ class Result:
         if (result._output["completeness"] != "complete"
                 or result.stdout_file.incomplete is not None or result.stderr_file.incomplete is not None):
             flags.append("incomplete capture")
-        status = ("running" if result.outcome is None else
-                  f"exit {result.return_code}" if isinstance(result.outcome, dict) and "exit" in result.outcome else str(result.outcome))
-        kind = "bg_run" if reference.startswith("job[") else "run"
-        heading = _bart(kind, "; ".join([*flags, status, reference]))
+        heading = _bart("job" if reference.startswith("job[") else "run",
+                        "; ".join([f"{reference} {result._state}", *flags]))
         return heading + ("\n" + text if text else "")
 
     def __bool__(self):
@@ -295,9 +307,7 @@ class Result:
 class RunError(BartError):
     def __init__(self, result):
         self.result = result
-        cause = "timed out" if result.timed_out else f"ended with {result.outcome}"
-        message = f"program {cause}; return code {result.return_code}; inspect error.result.stdout_file and error.result.stderr_file"
-        super().__init__(message + "\n" + result._view(_RUN_ERROR_VIEW_BYTES, tail=True))
+        super().__init__("\n" + result._view(_RUN_ERROR_VIEW_BYTES, tail=True))
 
 
 def _argv(argv):
@@ -343,7 +353,7 @@ class Job(Result):
         self.command = command
 
     def _snapshot(self):
-        return Result(**_call("job", id=self.id), reference=f"job[{self.id}]")
+        return Result(**_call("job", id=self.id))
 
     def __getattr__(self, name):
         if name in ("return_code", "outcome", "stdout_file", "stderr_file", "timed_out", "cleanup_error", "retained_job"):
@@ -476,7 +486,7 @@ def whoami():
 def _background(argv, notify, env, **options):
     result = Job(**_call("background", argv=_argv(argv), notify=notify,
                         env={} if env is None else dict(env), **options))
-    print(_bart("bg_run", f"job[{result.id}] started"))
+    _diagnostic(_bart("job", f"job[{result.id}] started"))
     return result
 
 
@@ -1122,7 +1132,7 @@ class Mcp:
         result = _call("mcp_call", server=server, tool=tool, arguments=arguments)
         _changed[f"called MCP tool {tool} on {server}"] = None
         for note in result["notes"]:
-            print(note)
+            _diagnostic(note)
         if result["error"] is not None:
             raise BartError(result["error"])
         value = result["value"]
@@ -1239,7 +1249,7 @@ def restore():
     if rebound := sorted(names & namespace.keys()):
         for name in rebound:
             del namespace[name]
-        sys.stderr.write("\n" + _bart("cell", f"{', '.join(rebound)} are built-ins; this cell's bindings of them were removed") + "\n")
+        _diagnostic("\n" + _bart("cell", f"cell[{_activity_cell}] helper bindings removed; {', '.join(rebound)} are built-ins"))
 
 
 def execute_cell(code, diffs, cell_number):
@@ -1298,17 +1308,22 @@ def execute_cell(code, diffs, cell_number):
             else:
                 linecache.cache[filename] = previous
         pending = [report]
+        attributed = False
         while pending:
             current = pending.pop()
             current.stack = traceback.StackSummary.from_list(
                 [f for f in current.stack if f.filename != "<bart-harness>"])
+            attributed |= (any(frame.filename == filename for frame in current.stack)
+                           or getattr(current, "filename", None) == filename)
             pending.extend(e for e in (current.__cause__, current.__context__) if e is not None)
             pending.extend(getattr(current, "exceptions", None) or [])
         text = "".join(report.format())
         if (sys.version_info < (3, 12) and isinstance(failure, NameError)
                 and failure.name in sys.stdlib_module_names):
             text = f"{text.rstrip()}. Did you forget to import '{failure.name}'?\n"
-        sys.stderr.write(text)
+        if not attributed:
+            _diagnostic(_bart("cell", f"cell[{cell_number}] failed"))
+        _diagnostic(text)
         return True
     finally:
         _in_cell = False
@@ -1328,10 +1343,10 @@ while line := _read_line():
             helpers.pop("web_search", None)
         failed = execute_cell(request["code"], request["diffs"], request["cell"])
     except KeyboardInterrupt:
+        _diagnostic(_bart("cell", f"cell[{request['cell']}] interrupted"))
         failed = True
     restore()
-    sys.stdout.flush()
-    sys.stderr.flush()
+    _diagnostic()
     with _channel:
         os.write(2, b"\n" + MARKER + b"\n")
         replies.write(_inventory_json_dumps({"done": {"failed": failed, "changed": list(_changed), "inventory": _safe_namespace_inventory()}}) + "\n")
