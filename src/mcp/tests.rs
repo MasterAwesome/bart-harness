@@ -349,14 +349,14 @@ async fn a_server_that_exits_becomes_failed_but_a_tool_error_does_not() {
 }
 
 #[tokio::test]
-async fn a_tool_past_the_listing_limit_is_found_by_its_input_description() {
+async fn tools_are_listed_in_full_and_found_by_their_input_description() {
     let dir = TempDir::new("mcp-many");
     let mcp = registry(
         dir.path(),
         &json!({ "FIXTURE_MANY_TOOLS": "1", "FIXTURE_GUIDANCE": "界".repeat(2000) }),
     );
     let all = mcp.tools(Some("fx"), None).await.unwrap();
-    assert!(all.contains("(500 more; narrow with `query`)") && !all.contains("tool650"));
+    assert!(all.contains("tool650") && all.lines().count() == 700);
     let found = mcp.tools(None, Some("quokka")).await.unwrap();
     assert_eq!(found, "server \"fx\", tool \"tool650\" — A numbered tool.");
     let description = mcp.describe("fx", "tool650").await.unwrap();
@@ -364,10 +364,7 @@ async fn a_tool_past_the_listing_limit_is_found_by_its_input_description() {
         .split_once("server-provided guidance:\n")
         .unwrap()
         .1;
-    let (kept, _) = guidance
-        .split_once("\n[Bart mcp: guidance truncated]")
-        .unwrap();
-    assert!(kept.len() <= 4096 && kept.chars().all(|c| c == '界'));
+    assert_eq!(guidance, "界".repeat(2000));
 }
 
 #[tokio::test]

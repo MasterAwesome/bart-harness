@@ -360,6 +360,7 @@ pub(crate) struct SavedArtifact {
     pub(crate) path: std::path::PathBuf,
     pub(crate) completeness: Completeness,
     pub(crate) chars: usize,
+    pub(crate) bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

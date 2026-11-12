@@ -7,10 +7,13 @@ async fn delivered_text_fits_the_budget_whatever_is_added_late() {
     let context = test_support::context(dir.path(), Confinement::Unrestricted, 1000);
     let mut output = Output::error("界".repeat(2000));
     output.images = vec![InlineImage::new(PNG.to_vec(), None, "plot".into()).unwrap(); 3];
+    let path = context.artifacts.dir().join("output-4.log");
+    std::fs::write(&path, &output.text).unwrap();
     output.saved = Some(SavedArtifact {
-        path: dir.path().join("cell.log"),
+        path,
         completeness: Completeness::Complete,
-        chars: 0,
+        chars: output.text.chars().count(),
+        bytes: output.text.len(),
     });
     output.cell = Some(4);
     let images = deliver(&mut output, &context, 0, false).await;
@@ -23,9 +26,9 @@ async fn delivered_text_fits_the_budget_whatever_is_added_late() {
     );
     assert_eq!(&output.text[..999], "界".repeat(333));
     assert!(output.text[999..].starts_with(output::HOST_METADATA_BOUNDARY));
-    assert!(output.notes.contains("first 999 of 6000 bytes shown"));
+    assert!(output.notes.contains("cell[4] 999 of 6000 bytes shown"));
     assert!(
-        output.text.contains("all of it: cell[4].output"),
+        output.text.contains("rest: cell[4].remaining()"),
         "the full output stays reachable"
     );
     assert!(

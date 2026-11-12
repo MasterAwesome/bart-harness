@@ -111,9 +111,10 @@ fn header(surface: &Surface<'_>) -> String {
          print(r.stdout) loses the exit code. Assign the call (text = read(p)) only to process \
          its value; that prints nothing. Other values show through print() or as the cell's \
          final expression.\n\n\
-         Size: a run view shows up to 8 KiB and a whole cell up to {output_kib} KiB. A longer \
-         result says how much was shown and where all of it is saved (cell[N].output, \
-         cell[N].run[M]); read a range of that file or search it instead of rerunning.\n\n\
+         Size: a cell shows up to {output_kib} KiB. A longer one ends with how much was \
+         shown and the call that shows the next part, cell[N].remaining().\n\n\
+         cell[N].output and cell[N].run[M] are the saved files, usable without printing: \
+         for line in open(cell[N].output) reads large JSONL; read(path, offset, limit) shows a slice.\n\n\
          ```python\n# builtins.pyi: Bart additions. @auto_display marks helpers that print a view when called bare.\n",
         python = surface.python,
         output_kib = super::OUTPUT_BUDGET_BYTES / 1024,
@@ -243,6 +244,11 @@ class Job(Result):
     command: str
     def wait(self) -> Job: ...   # block until it ends; a cell timeout leaves it running
     def kill(self) -> None: ...
+
+class Cell:
+    def remaining(self) -> Text:
+        """Call with no arguments when this cell's notice names it and you need the rest.
+        Each call shows the next part. To re-read, use read(cell[N].output); do not compute offsets."""
 
 class BartError(Exception): ...  # a helper refused or failed; the message says why
 class RunError(BartError):
@@ -393,7 +399,8 @@ async fn run(
             .map_err(|error| format!("cannot create the output file: {error}"))?;
     let path = collector.path().to_path_buf();
     live.progress().file(&path);
-    let mut capture = Capture::new(collector, Effects::default(), live);
+    let effects = Effects::new(&collector);
+    let mut capture = Capture::new(collector, effects, live);
     if let Some(earlier) = &prior {
         capture
             .collector
@@ -577,7 +584,7 @@ async fn collect_earlier(
         .map_err(|e| format!("cannot collect cell[{}]: {e}", busy.cell))?;
         let effects = Effects {
             processes: busy.processes,
-            ..Effects::default()
+            ..Effects::new(&collector)
         };
         (Capture::continuation(collector, effects, live), None)
     };

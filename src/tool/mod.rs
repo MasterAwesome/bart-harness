@@ -385,11 +385,9 @@ pub(crate) async fn deliver(
     let prefix = fit(
         prefix,
         context.output_budget,
-        output.cell.filter(|_| output.saved.is_some()),
-        output
-            .saved
-            .as_ref()
-            .is_some_and(|saved| saved.is_complete()),
+        output.cell,
+        output.saved.as_ref(),
+        &context.artifacts,
         &mut output.notes,
     );
     output.prefix_len = Some(prefix.len());
@@ -401,33 +399,22 @@ fn fit(
     mut text: String,
     budget: usize,
     cell: Option<u64>,
-    complete: bool,
+    saved: Option<&crate::history::SavedArtifact>,
+    storage: &output::Storage,
     notes: &mut String,
 ) -> String {
     if text.len() <= budget {
         return text;
     }
     let captured = text.len();
-    let mut end = budget;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    let reference = cell.map(|cell| output::Name::Output(cell).reference());
+    output::truncate_prefix(&mut text, budget);
+    let (shown, recovery) = saved.zip(cell).map_or(
+        (text.len(), output::Recovery::Unsaved(cell)),
+        |(saved, cell)| storage.remember(cell, saved, Some(text.len())),
+    );
     notes.insert_str(
         0,
-        &format!(
-            "{}\n",
-            output::truncation(
-                &text,
-                captured,
-                reference.as_deref(),
-                output::Truncation {
-                    complete,
-                    resumed: false
-                }
-            )
-        ),
+        &format!("{}\n", output::truncation(shown, captured, recovery)),
     );
     text
 }

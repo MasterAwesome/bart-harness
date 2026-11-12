@@ -77,6 +77,7 @@ fn result(id: &str, cell: Option<u64>, text: &str, saved: Completeness, chars: u
             path: "unused".into(),
             completeness: saved,
             chars,
+            bytes: text.len(),
         }),
         cell,
     })

@@ -329,7 +329,7 @@ async fn timeout_gracefully_interrupts_and_preserves_state() {
 async fn long_output_is_bounded_and_saved() {
     let dir = TempDir::new("python-shape");
     let context = session(dir.path(), Confinement::Unrestricted, 2000);
-    let long = cell(&context, "for n in range(1, 5001): print(n)").await;
+    let long = cell(&context, "for n in range(1, 25001): print(n)").await;
     assert!(long.text.len() < 2000 + 400, "{} bytes", long.text.len());
     assert!(
         long.text.contains("Bart output:") && long.text.starts_with("1\n2\n"),
@@ -338,25 +338,74 @@ async fn long_output_is_bounded_and_saved() {
     );
     let saved = long.saved.as_ref().unwrap();
     assert!(saved.is_complete());
-    let cell = long.cell.unwrap();
+    let number = long.cell.unwrap();
     assert!(
-        long.text
-            .contains(&format!("read(cell[{cell}].output, offset=")),
+        long.text.contains(&format!("cell[{number}].remaining()")),
         "{}",
         long.text
     );
     text(
         &context,
-        &format!("print(len(read(cell[{cell}].output).splitlines()))"),
-        "5000",
+        &format!("print(len(read(cell[{number}].output).splitlines()))"),
+        "25000",
     )
     .await;
     let path = &saved.path;
     assert_eq!(
         fs::read_to_string(path).unwrap().lines().count(),
-        5_000,
+        25_000,
         "the saved output is whole"
     );
+    let full = fs::read_to_string(path).unwrap();
+    assert!(full.len() > 100_000);
+    let mut combined = long
+        .text
+        .strip_suffix(long.notes.trim())
+        .unwrap()
+        .to_owned();
+    let mut pages = 0;
+    while combined.len() < full.len() {
+        let prefix = if pages == 0 {
+            "print('α😀before ' * 30, end='')\n"
+        } else {
+            ""
+        };
+        let display = if pages % 2 == 0 {
+            "part"
+        } else {
+            "print(part)"
+        };
+        let code = format!(
+            "{prefix}part = cell[{number}].remaining()\nwith open('part', 'wb') as file: size = file.write(part.encode())\n{display}"
+        );
+        let output = cell(&context, &code).await;
+        assert!(
+            !output.is_error() && output.notes.is_empty(),
+            "{}",
+            output.text
+        );
+        assert!(output.text.len() <= 2000);
+        assert_eq!(output.text.matches("[Bart output:").count(), 1);
+        let part = fs::read_to_string(dir.path().join("part")).unwrap();
+        assert!(!part.is_empty());
+        combined.push_str(&part);
+        assert!(full.starts_with(&combined));
+        pages += 1;
+    }
+    assert!(pages > 3);
+    assert_eq!(combined, full);
+    text(
+        &context,
+        &format!("cell[{number}].remaining()"),
+        &format!(
+            "[Bart output: cell[{number}] {} of {} bytes shown]",
+            full.len(),
+            full.len()
+        ),
+    )
+    .await;
+    let unknown = cell(&context, "cell[2].remaining()").await;
+    assert!(unknown.is_error() && unknown.text.contains("read(cell[2].output)"));
 }
 
 #[tokio::test]
@@ -1968,9 +2017,9 @@ run(["bash", "-c", "printf stderr-output >&2; exit 7"], check=False)
 }
 
 #[tokio::test]
-async fn run_views_bound_previews_and_distinguish_incomplete_capture_from_truncation() {
+async fn run_views_use_the_cell_budget_and_distinguish_incomplete_capture_from_truncation() {
     let dir = TempDir::new("run-view-bounds");
-    let context = session(dir.path(), Confinement::Unrestricted, 20_000);
+    let context = session(dir.path(), Confinement::Unrestricted, 32 * 1024);
     let output = cell(&context, r#"
 r=run([sys.executable, '-c', "import sys;sys.stdout.write('x'*20000+'END');sys.stderr.buffer.write(bytes([255]))"])
 r
@@ -1985,13 +2034,11 @@ else:
 "#).await;
     assert!(!output.is_error(), "{}", output.text);
     assert!(
-        output
-            .text
-            .contains("[Bart run: cell[1].run[1] exit 0; first 8192 of 20008 bytes shown]"),
+        output.text.contains("[Bart run: cell[1].run[1] exit 0]"),
         "{}",
         &output.text[..output.text.len().min(300)]
     );
-    assert!(!output.text.contains("END"));
+    assert!(output.text.contains("END"));
     let binary = cell(
         &context,
         "run([sys.executable, '-c', 'import sys;sys.stdout.buffer.write(bytes([255]))'])",
@@ -2005,7 +2052,7 @@ else:
             .text
             .contains(&context.spill_dir.to_string_lossy().to_string())
     );
-    assert!(output.text.len() < 12_000);
+    assert!(output.text.len() > 20_000 && output.text.len() < 32 * 1024);
     let partial = cell(
         &context,
         r#"
@@ -2331,8 +2378,10 @@ async fn oversized_bare_read_streams_a_prefix_and_saves_the_complete_numbered_vi
     assert!(!output.notes.is_empty());
     let saved = output.saved.unwrap();
     let full = fs::read_to_string(saved.path).unwrap();
-    assert_eq!(&full[..32768], &output.text[..32768]);
-    assert!(output.text[32768..].starts_with(crate::tool::output::HOST_METADATA_BOUNDARY));
+    let end = full[..32768].rfind('\n').unwrap() + 1;
+    assert_eq!(&full[..end], &output.text[..end]);
+    assert!(output.text[end..].starts_with("[Bart output:"));
+    assert!(output.notes.contains("rest: cell[1].remaining()"));
     assert!(full.ends_with("  5001\tLAST_SENTINEL\n"));
     text(&context, "data = read('many.txt')\nassert data.endswith('LAST_SENTINEL\\n')\nassert len(data.splitlines()) == 5001\nprint('raw intact')", "raw intact").await;
 }
@@ -2392,8 +2441,8 @@ async fn imported_project_and_chained_tracebacks_survive_without_harness_frames(
 #[tokio::test]
 async fn late_process_failures_survive_match_pressure_and_status_overflow_is_recoverable() {
     let dir = TempDir::new("late-process-status");
-    let context = session(dir.path(), Confinement::Unrestricted, 4000);
-    let arguments = json!({"code":"print('padding' * 2000); print('MATCH ' + 'x' * 1900)\nfor _ in range(70): r=run(['false'], check=False)\nrecords=[json.loads(line) for line in cell[1].status.read_text().splitlines()]\nassert len(records)==70 and records[-1]['process']==70 and records[-1]['return_code']==1"});
+    let context = session(dir.path(), Confinement::Unrestricted, 32 * 1024);
+    let arguments = json!({"code":"print('padding' * 6000); print('MATCH ' + 'x' * 1900)\nfor _ in range(70): r=run(['false'], check=False)\nrecords=[json.loads(line) for line in cell[1].status.read_text().splitlines()]\nassert len(records)==70 and records[-1]['process']==70 and records[-1]['return_code']==1"});
     let call = crate::history::ToolCall {
         id: "status-overflow".into(),
         name: "python".into(),
@@ -2586,13 +2635,13 @@ print(j)
     .await;
     assert!(!finished.is_error(), "{}", finished.text);
     assert!(
-        finished
-            .text
-            .contains("[Bart job: job[1] signal 15; first 8192 of "),
+        finished.text.contains("[Bart job: job[1] signal 15]"),
         "{}",
         &finished.text[..finished.text.len().min(300)]
     );
-    assert!(finished.text.len() < 12_000);
+    assert!(finished.text.len() < 12_400);
+    assert!(finished.text.bytes().filter(|&byte| byte == b'x').count() > 6000);
+    assert!(finished.notes.contains("cell[2].remaining()"));
     let stopped = cell(
         &context,
         "k=bg_run(['sleep', '30'])\nk.kill()\nassert k.outcome == 'killed' and not k",

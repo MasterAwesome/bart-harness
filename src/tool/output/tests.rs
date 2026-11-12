@@ -1,16 +1,13 @@
 use super::*;
 use crate::tool::test_support::TempDir;
 
-#[test]
-fn a_huge_unicode_line_shows_an_exact_prefix_and_saves_the_whole_capture() {
+#[tokio::test]
+async fn a_huge_unicode_line_shows_an_exact_prefix_and_saves_the_whole_capture() {
     let dir = TempDir::new("output-clip");
     let budget = 16 * 1024 + 3;
-    let mut collector = Collector::new(
-        budget,
-        &Storage::open(dir.path()).unwrap(),
-        crate::tool::output::Name::Output(2),
-    )
-    .unwrap();
+    let storage = Storage::open(dir.path()).unwrap();
+    let mut collector =
+        Collector::new(budget, &storage, crate::tool::output::Name::Output(2)).unwrap();
     let line = "😀".repeat(16 * 1024);
     collector.line(&line);
     let path = collector.path().to_path_buf();
@@ -24,18 +21,47 @@ fn a_huge_unicode_line_shows_an_exact_prefix_and_saves_the_whole_capture() {
     assert_eq!(text, line[..16 * 1024]);
     assert_eq!(
         notes,
-        "[Bart output: first 16384 of 65537 bytes shown; all of it: cell[2].output]\n"
+        "[Bart output: cell[2] 16384 of 65537 bytes shown; rest: cell[2].remaining()]\n"
     );
     assert!(!text.contains("Bart output:"));
     assert_eq!(
         render("output", "\nfirst note\n\nsecond note\n"),
         "output\n\nfirst note\n\nsecond note"
     );
-    assert_eq!(
-        fs::read_to_string(path).unwrap(),
-        format!("{line}\n"),
-        "the file keeps it whole"
+    let full = fs::read_to_string(path).unwrap();
+    assert_eq!(full, format!("{line}\n"), "the file keeps it whole");
+    let mut combined = text;
+    let mut pages = 0;
+    while combined.len() < full.len() {
+        let page = storage.remaining(2, budget).await.unwrap();
+        assert!(!page.text.is_empty());
+        assert!(page.text.len() + page.notice.len() + 2 <= budget);
+        combined.push_str(&page.text);
+        pages += 1;
+    }
+    assert!(pages >= 3);
+    assert_eq!(combined, full);
+    assert!(storage.remaining(2, budget).await.unwrap().text.is_empty());
+    assert!(
+        storage
+            .remaining(99, budget)
+            .await
+            .err()
+            .unwrap()
+            .contains("read(cell[99].output)")
     );
+    let mut collector = Collector::new(4096, &storage, Name::Output(3)).unwrap();
+    collector.line("heading");
+    collector.line(&"x".repeat(40 * 1024));
+    let (mut combined, _, saved) = collector.finish();
+    assert!(combined.len() >= 2048 && combined.starts_with("heading\nxxx"));
+    let full = fs::read_to_string(saved.path).unwrap();
+    while combined.len() < full.len() {
+        let page = storage.remaining(3, 4096).await.unwrap();
+        assert!(!page.text.is_empty());
+        combined.push_str(&page.text);
+    }
+    assert_eq!(combined, full);
 }
 
 #[test]
@@ -134,7 +160,8 @@ async fn reopening_an_incomplete_output_keeps_it_incomplete_and_counts_from_its_
     );
     assert_eq!(saved.chars, earlier.chars + 801);
     assert_eq!(text, "z".repeat(100));
-    assert!(notes.contains("first 100 of 801 new bytes shown"));
+    assert!(notes.contains("cell[1] 100 of 4308 bytes shown"));
+    assert_eq!(saved.bytes, earlier.bytes + 801);
     assert!(notes.contains("cell[1].output, incomplete"), "{notes}");
     assert!(
         !fs::read_to_string(dir.path().join("output-1.log"))
@@ -142,6 +169,33 @@ async fn reopening_an_incomplete_output_keeps_it_incomplete_and_counts_from_its_
             .contains('z'),
         "nothing is saved after the hole"
     );
+    let dir = TempDir::new("output-resume-sequence");
+    let storage = Storage::open(dir.path()).unwrap();
+    let mut first = Collector::new(128, &storage, Name::Output(1)).unwrap();
+    first.line(&"x".repeat(500));
+    let (mut combined, _, saved) = first.finish();
+    let mut short = Collector::reopen(128, &storage, Name::Output(1), saved)
+        .await
+        .unwrap();
+    short.line("middle");
+    let (_, notes, saved) = short.finish();
+    assert!(notes.is_empty());
+    assert_eq!(saved.bytes, 508);
+    let mut last = Collector::reopen(128, &storage, Name::Output(1), saved)
+        .await
+        .unwrap();
+    last.line(&"y".repeat(700));
+    last.line("SENTINEL");
+    let (_, _, saved) = last.finish();
+    let full = fs::read_to_string(saved.path).unwrap();
+    assert_eq!(saved.bytes, full.len());
+    while combined.len() < full.len() {
+        let page = storage.remaining(1, 128).await.unwrap();
+        assert!(!page.text.is_empty(), "{}", page.notice);
+        combined.push_str(&page.text);
+    }
+    assert_eq!(combined, full);
+    assert!(combined.ends_with("SENTINEL\n"));
 }
 
 #[tokio::test]
@@ -197,7 +251,7 @@ fn multiline_prefix_never_resumes_after_an_omitted_unicode_character() {
     collector.line("TAIL");
     let (text, notes, saved) = collector.finish();
     assert_eq!(text, "abc\n");
-    assert!(notes.contains("first 4 of 18 bytes shown"));
+    assert!(notes.contains("cell[1] 4 of 18 bytes shown"));
     assert!(saved.is_complete());
     assert_eq!(
         fs::read_to_string(saved.path).unwrap(),
@@ -219,8 +273,8 @@ fn display_omission_and_incomplete_capture_are_distinct_and_not_saved_as_source(
         let (text, notes, saved) = collector.finish();
         assert_eq!(text, "capt");
         assert!(!saved.is_complete());
-        assert!(notes.contains("first 4 of 9 bytes shown"));
-        assert!(notes.contains("saved copy (incomplete):"));
+        assert!(notes.contains("cell[1] 4 of 9 bytes shown"));
+        assert!(notes.contains("saved copy incomplete"));
         assert!(notes.contains("total output size unknown"));
         assert_eq!(fs::read_to_string(saved.path).unwrap(), "captured\n");
     }

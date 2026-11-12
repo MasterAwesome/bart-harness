@@ -25,6 +25,8 @@ pub(super) struct Channel {
 
 pub(super) struct CellOutput {
     pub(super) marker: Vec<u8>,
+    pub(super) barrier: Vec<u8>,
+    pub(super) synchronized: u64,
     pub(super) pending: Vec<u8>,
     pub(super) output: Vec<u8>,
     pub(super) ended: bool,
@@ -60,6 +62,14 @@ impl CellOutput {
             return;
         }
         let output = &mut self.output;
+        while let Some(at) = output
+            .windows(self.barrier.len())
+            .position(|window| window == self.barrier)
+        {
+            sink(&output[..at]);
+            output.drain(..at + self.barrier.len());
+            self.synchronized += 1;
+        }
         if let Some(at) = output
             .windows(self.marker.len())
             .position(|window| window == self.marker)
@@ -69,9 +79,15 @@ impl CellOutput {
             output.clear();
             self.ended = true;
         } else {
-            let kept = (1..self.marker.len().min(output.len() + 1))
-                .rev()
-                .find(|&n| output.ends_with(&self.marker[..n]))
+            let kept = [&self.marker, &self.barrier]
+                .into_iter()
+                .map(|marker| {
+                    (1..marker.len().min(output.len() + 1))
+                        .rev()
+                        .find(|&n| output.ends_with(&marker[..n]))
+                        .unwrap_or(0)
+                })
+                .max()
                 .unwrap_or(0);
             let rest = output.split_off(output.len() - kept);
             sink(output);

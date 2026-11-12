@@ -37,8 +37,7 @@ pub(super) struct Capture {
 }
 
 impl Capture {
-    pub(super) fn new(collector: Collector, mut effects: Effects, live: &Run) -> Self {
-        effects.process_summaries.record = Some(collector.status_writer());
+    pub(super) fn new(collector: Collector, effects: Effects, live: &Run) -> Self {
         Self {
             cell: collector.cell().expect("Python cell collector"),
             continued: false,
@@ -311,10 +310,12 @@ fn shown(text: &str, header: &str) -> bool {
     })
 }
 
-#[derive(Default)]
 pub(super) struct ProcessSummaries {
-    record: Option<crate::tool::output::StatusWriter>,
+    record: crate::tool::output::StatusWriter,
     lines: Vec<ProcessSummary>,
+    bytes: usize,
+    limit: usize,
+    omitted: u64,
 }
 
 struct ProcessSummary {
@@ -323,8 +324,29 @@ struct ProcessSummary {
     details: Option<String>,
 }
 
+impl ProcessSummary {
+    fn line(&self) -> String {
+        let reference = self.reference.reference();
+        let state = &self.state;
+        match &self.details {
+            Some(details) => bart!(Run, "{reference} {state}; {details}"),
+            None => bart!(Run, "{reference} {state}"),
+        }
+    }
+}
+
 impl ProcessSummaries {
     const OMISSION_RESERVE: usize = 80;
+
+    fn new(collector: &Collector) -> Self {
+        Self {
+            record: collector.status_writer(),
+            lines: Vec::new(),
+            bytes: 0,
+            limit: (collector.budget() / 2).saturating_sub(Self::OMISSION_RESERVE),
+            omitted: 0,
+        }
+    }
 
     pub(super) fn push(
         &mut self,
@@ -332,57 +354,43 @@ impl ProcessSummaries {
         reference: crate::tool::output::Name,
         result: &crate::tool::process::ProgramResult,
     ) {
-        if let Some(record) = &mut self.record {
-            record.write(&summary);
-        }
+        self.record.write(&summary);
         let details = result.details();
         if result.outcome != crate::history::JobOutcome::Exit(0)
             || result.timed_out
             || details.is_some()
         {
-            self.lines.push(ProcessSummary {
+            let summary = ProcessSummary {
                 reference,
                 state: result.state(),
                 details,
-            });
+            };
+            let bytes = summary.line().len() + 1;
+            if self.omitted > 0 || self.lines.len() == 64 || self.bytes + bytes > self.limit {
+                self.omitted += 1;
+            } else {
+                self.bytes += bytes;
+                self.lines.push(summary);
+            }
         }
     }
 
     fn finish(self, text: &str) -> (String, Vec<String>) {
         let mut lines = Vec::new();
-        let mut bytes = 0;
-        let mut omitted = 0;
-        let limit = crate::tool::OUTPUT_BUDGET_BYTES / 2 - Self::OMISSION_RESERVE;
-        for ProcessSummary {
-            reference,
-            state,
-            details,
-        } in self.lines
-        {
-            let reference = reference.reference();
-            let header = crate::marker::open(bart!(@name Run), &format!("{reference} {state}"));
-            if details.is_none() && shown(text, &header) {
+        for summary in self.lines {
+            let reference = summary.reference.reference();
+            let header =
+                crate::marker::open(bart!(@name Run), &format!("{reference} {}", summary.state));
+            if summary.details.is_none() && shown(text, &header) {
                 continue;
             }
-            let line = match details {
-                Some(details) => bart!(Run, "{reference} {state}; {details}"),
-                None => bart!(Run, "{reference} {state}"),
-            };
-            if omitted > 0 || lines.len() == 64 || bytes + line.len() + 1 > limit {
-                omitted += 1;
-            } else {
-                bytes += line.len() + 1;
-                lines.push(line);
-            }
+            lines.push(summary.line());
         }
-        let notice = self
-            .record
-            .map_or_else(String::new, |record| record.finish(omitted));
+        let notice = self.record.finish(self.omitted);
         (notice, lines)
     }
 }
 
-#[derive(Default)]
 pub(super) struct Effects {
     pub(super) process_summaries: ProcessSummaries,
     pub(super) processes: u32,
@@ -390,6 +398,19 @@ pub(super) struct Effects {
     pub(super) images: Vec<InlineImage>,
     pub(super) changed: Vec<String>,
     pub(super) diffs: Vec<Diff>,
+}
+
+impl Effects {
+    pub(super) fn new(collector: &Collector) -> Self {
+        Self {
+            process_summaries: ProcessSummaries::new(collector),
+            processes: 0,
+            jobs: Vec::new(),
+            images: Vec::new(),
+            changed: Vec::new(),
+            diffs: Vec::new(),
+        }
+    }
 }
 
 pub(super) fn diff(path: String, before: &str, after: &str) -> Option<Diff> {

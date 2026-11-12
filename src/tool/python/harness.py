@@ -3,6 +3,7 @@ import base64
 import builtins
 import collections
 import collections.abc
+import codecs
 import functools
 import itertools
 import io
@@ -45,6 +46,7 @@ if (sys.prefix == sys.base_prefix and not os.environ.get("PYTHONNOUSERSITE")
 sys.path[:] = _import_paths(sys.path, os.getcwd(), os.environ.get("PYTHONPATH", ""), _user_site)
 
 MARKER = sys.argv[1].encode()
+_remaining_barrier = 0
 
 requests = os.fdopen(os.dup(0), "rb")
 _CONFIG = json.loads(sys.argv[3])
@@ -63,7 +65,7 @@ def _diagnostic(text=""):
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
-        except (AttributeError, OSError, ValueError):
+        except BaseException:
             pass
     _diagnostics.write(text)
     if text and not text.endswith("\n"):
@@ -174,7 +176,7 @@ def _call(name, **arguments):
             raise BartError(reply["error"])
         return reply["result"]
     # Search and image delivery are reported by Rust. Job snapshots are internal accessors.
-    if name in ("web_search", "image", "job"):
+    if name in ("web_search", "image", "job", "remaining"):
         return invoke()
     if name in ("run", "background"):
         argv = arguments["argv"]
@@ -208,9 +210,14 @@ class Text(str):
         return str(self)
 
 
+class _SavedPath(type(pathlib.Path())):
+    reference: str
+
+
 class SavedStream:
     def __init__(self, path, incomplete, reference):
-        self.path = pathlib.Path(path)
+        self.path = _SavedPath(path)
+        self.path.reference = reference
         self.incomplete = incomplete
         self._reference = reference
 
@@ -218,7 +225,6 @@ class SavedStream:
         return f"SavedStream(path={self._reference}, incomplete={self.incomplete!r})"
 
 
-_RUN_VIEW_BYTES = 8 * 1024
 _RUN_ERROR_VIEW_BYTES = 2 * 1024
 
 
@@ -228,7 +234,7 @@ def _bart(kind, fields):
 
 
 class Result:
-    """A command result with a bounded, attributed display and complete stream accessors."""
+    """A command result with an attributed display and complete stream accessors."""
 
     def __init__(self, return_code, outcome, timed_out, cleanup_error, retained_job, stdout_file, stderr_file, output_file, reference, state):
         self.return_code = return_code
@@ -269,33 +275,60 @@ class Result:
         return self._complete_text(self._snapshot().stderr_file, "stderr")
 
     def __repr__(self):
-        return self._view(_RUN_VIEW_BYTES)
+        return "".join(self._view_parts())
 
-    def _view(self, limit, *, tail=False):
+    def _heading(self, flags=()):
+        if (self._output["completeness"] != "complete"
+                or self.stdout_file.incomplete is not None or self.stderr_file.incomplete is not None):
+            flags = [*flags, "incomplete capture"]
+        return _bart("job" if self._reference.startswith("job[") else "run",
+                     "; ".join([f"{self._reference} {self._state}", *flags]))
+
+    def _view_parts(self):
         result = self._snapshot()
-        reference = result._reference
+        try:
+            file = pathlib.Path(result._output["path"]).open("rb")
+        except OSError as error:
+            yield result._heading(["output unavailable"]) + "\n" + _reason(error)
+            return
+        with file:
+            yield result._heading()
+            remaining = os.fstat(file.fileno()).st_size
+            decoder = codecs.getincrementaldecoder("utf-8")(errors="backslashreplace")
+            if remaining:
+                yield "\n"
+            while remaining:
+                part = file.read(min(_CHUNK, remaining))
+                if not part:
+                    break
+                remaining -= len(part)
+                yield decoder.decode(part)
+            yield decoder.decode(b"", final=True)
+
+    def _display(self):
+        for part in self._view_parts():
+            sys.stdout.write(part)
+        sys.stdout.write("\n")
+
+    def _view(self):
+        result = self._snapshot()
         flags = []
         try:
             with pathlib.Path(result._output["path"]).open("rb") as file:
                 size = os.fstat(file.fileno()).st_size
-                start = max(0, size - limit) if tail else 0
+                start = max(0, size - _RUN_ERROR_VIEW_BYTES)
                 file.seek(start)
-                data = file.read(limit)
+                data = file.read(_RUN_ERROR_VIEW_BYTES)
             if start:
                 while data and data[0] & 0xC0 == 0x80:
                     data = data[1:]
             if size > len(data):
-                flags.append(f"{'last' if tail else 'first'} {len(data)} of {size} bytes shown")
+                flags.append(f"last {len(data)} of {size} bytes shown")
             text = data.decode("utf-8", errors="backslashreplace").rstrip("\n")
         except OSError as error:
             flags.append("output unavailable")
             text = _reason(error)
-        if (result._output["completeness"] != "complete"
-                or result.stdout_file.incomplete is not None or result.stderr_file.incomplete is not None):
-            flags.append("incomplete capture")
-        heading = _bart("job" if reference.startswith("job[") else "run",
-                        "; ".join([f"{reference} {result._state}", *flags]))
-        return heading + ("\n" + text if text else "")
+        return result._heading(flags) + ("\n" + text if text else "")
 
     def __bool__(self):
         code = self._snapshot().return_code
@@ -307,7 +340,7 @@ class Result:
 class RunError(BartError):
     def __init__(self, result):
         self.result = result
-        super().__init__("\n" + result._view(_RUN_ERROR_VIEW_BYTES, tail=True))
+        super().__init__("\n" + result._view())
 
 
 def _argv(argv):
@@ -352,6 +385,12 @@ class Job(Result):
         self.id = id
         self.command = command
 
+    def _saved_path(self):
+        return _saved(f"job-{self.id}.log", f"job[{self.id}]")
+
+    def __fspath__(self):
+        return os.fspath(self._saved_path())
+
     def _snapshot(self):
         return Result(**_call("job", id=self.id))
 
@@ -382,7 +421,8 @@ _SAVED = pathlib.Path(_CONFIG["saved_dir"])
 
 
 def _saved(name, label):
-    path = _SAVED / name
+    path = _SavedPath(_SAVED / name)
+    path.reference = label
     if not path.is_file():
         raise BartError(f"{label} does not exist in this session")
     return path
@@ -420,6 +460,17 @@ class _Numbered(collections.abc.Mapping):
         return f"{self._label}[{shown}]"
 
 
+class _Remaining(Text):
+    def __new__(cls, text, notice):
+        value = super().__new__(cls, text)
+        value.notice = notice
+        return value
+
+    def __str__(self):
+        text = str.__str__(self)
+        return text + ("\n" if text and not text.endswith("\n") else "") + self.notice
+
+
 class Cell:
     __slots__ = ("_number",)
 
@@ -428,6 +479,13 @@ class Cell:
 
     def __repr__(self):
         return f"cell[{self._number}]"
+
+    def remaining(self):
+        global _remaining_barrier
+        _diagnostic()
+        _remaining_barrier += 1
+        os.write(2, b"\0" + MARKER + b":remaining\0")
+        return _Remaining(**_call("remaining", cell=self._number, barrier=_remaining_barrier))
 
     @property
     def code(self):
@@ -608,7 +666,12 @@ class _ReadText(Text):
 
 def read(path, offset=1, limit=None):
     """Return complete requested UTF-8 text; bare views stream numbered lines."""
+    if isinstance(path, Job):
+        path = path._saved_path()
+    name = getattr(path, "reference", None)
     path = _path(path)
+    if name is None:
+        name = path
     first = max(1, _count(offset, "offset"))
     limit = None if limit is None else _count(limit, "limit")
     last = None if limit is None else first + limit - 1
@@ -653,7 +716,7 @@ def read(path, offset=1, limit=None):
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise BartError(f"{path} is not valid UTF-8 text") from None
-    name = "".join(c if c.isprintable() else ascii(c)[1:-1] for c in path)
+    name = "".join(c if c.isprintable() else ascii(c)[1:-1] for c in name)
     if len(name) > 56:
         name = name[:19] + "…" + name[-36:]
     return _ReadText(text, name, first, total, counted_all)
@@ -1203,8 +1266,7 @@ def _namespace_inventory():
 def _observe_file(function):
     @functools.wraps(function)
     def observed(path, *args, **kwargs):
-        path = _path(path)
-        return _activity(f"{function.__name__}({path!r})",
+        return _activity(f"{function.__name__}({_path(path)!r})",
                          lambda: function(path, *args, **kwargs))
     return observed
 
@@ -1218,9 +1280,9 @@ _DISPLAY_HOOK = "__bart_display__"
 
 
 def _display_value(value):
-    if isinstance(value, _ReadText):
+    if isinstance(value, (_ReadText, Result)) and not isinstance(value, Job):
         value._display()
-    elif isinstance(value, (Text, Result)) and not isinstance(value, Job):
+    elif isinstance(value, Text):
         print(repr(value))
 
 
@@ -1284,7 +1346,7 @@ def execute_cell(code, diffs, cell_number):
             value = eval(compile(ast.Expression(last.value), filename, "eval"), namespace)
             if _is_image(value):
                 _show_image(value)
-            elif isinstance(value, _ReadText):
+            elif isinstance(value, (_ReadText, Result)) and not isinstance(value, Job):
                 value._display()
             elif value is not None and not isinstance(value, Job):
                 print(repr(value))

@@ -1,7 +1,7 @@
 use std::{
     fmt::Write as _,
     fs::{self, File, OpenOptions},
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -105,6 +105,7 @@ fn next(counter: &std::sync::atomic::AtomicU64, kind: &str) -> io::Result<u64> {
 pub(in crate::tool) struct Storage {
     dir: PathBuf,
     usage: Mutex<(u64, usize)>,
+    outputs: Mutex<std::collections::BTreeMap<u64, SavedOutput>>,
     writer: std::sync::OnceLock<crate::record::WeakWriterHandle>,
     cells: std::sync::atomic::AtomicU64,
     images: std::sync::atomic::AtomicU64,
@@ -131,6 +132,7 @@ impl Storage {
         Ok(Arc::new(Self {
             dir: dir.to_owned(),
             usage: Mutex::new((bytes, files)),
+            outputs: Mutex::default(),
             writer: std::sync::OnceLock::new(),
             cells: highest.cell.into(),
             images: highest.image.into(),
@@ -482,6 +484,7 @@ pub(in crate::tool) struct Collector {
     bytes: usize,
     chars: usize,
     overflowed: bool,
+    previous_bytes: usize,
     resumed: bool,
     name: Name,
     output: Artifact,
@@ -507,6 +510,7 @@ impl Collector {
             bytes: 0,
             chars: 0,
             overflowed: false,
+            previous_bytes: 0,
             resumed: false,
             name,
             output,
@@ -547,6 +551,8 @@ impl Collector {
             let mut collector = Self::with(budget, name, output);
             collector.chars = earlier.chars;
             collector.resumed = true;
+            collector.previous_bytes = earlier.bytes;
+            collector.bytes = collector.previous_bytes;
             Ok(collector)
         })
         .await
@@ -651,11 +657,16 @@ impl Collector {
             }
             (_, completeness) => completeness,
         };
-        SavedArtifact {
+        let saved = SavedArtifact {
             path: self.output.path.clone(),
             completeness,
             chars: self.chars,
+            bytes: self.bytes,
+        };
+        if let Some(cell) = self.cell() {
+            self.output.storage.remember(cell, &saved, None);
         }
+        saved
     }
 
     pub(in crate::tool) fn status_writer(&self) -> StatusWriter {
@@ -665,6 +676,14 @@ impl Collector {
             resumed: self.resumed,
             artifact: None,
         }
+    }
+
+    pub(in crate::tool) fn budget(&self) -> usize {
+        self.budget
+    }
+
+    pub(in crate::tool) fn room(&self) -> usize {
+        self.budget.saturating_sub(self.bytes - self.previous_bytes)
     }
 
     pub(in crate::tool) fn cell(&self) -> Option<u64> {
@@ -698,16 +717,13 @@ impl Collector {
         self.output.write(line.as_bytes(), b"\n");
         if !self.overflowed {
             let room = self.budget.saturating_sub(self.head.len());
-            let mut end = room.min(line.len());
-            while !line.is_char_boundary(end) {
-                end -= 1;
-            }
+            let end = line.floor_char_boundary(room.min(line.len()));
             self.head.push_str(&line[..end]);
             if end == line.len() && self.head.len() < self.budget {
                 self.head.push('\n');
             } else {
-                // Once a byte is omitted, later lines can never join this prefix.
                 self.overflowed = true;
+                truncate_prefix(&mut self.head, self.budget);
             }
         }
     }
@@ -758,19 +774,12 @@ impl Collector {
         let saved = self.saved();
         let mut notes = String::new();
         if self.overflowed {
-            let _ = writeln!(
-                notes,
-                "{}",
-                truncation(
-                    &self.head,
-                    self.bytes,
-                    Some(&self.output.reference),
-                    Truncation {
-                        complete: saved.is_complete(),
-                        resumed: self.resumed
-                    },
-                )
-            );
+            let shown = self.previous_bytes + self.head.len();
+            let cell = self.cell();
+            let (shown, recovery) = cell.map_or((shown, Recovery::Unsaved(cell)), |cell| {
+                self.output.storage.remember(cell, &saved, Some(shown))
+            });
+            let _ = writeln!(notes, "{}", truncation(shown, self.bytes, recovery));
         }
         if !self.output.complete() {
             let _ = writeln!(
@@ -845,43 +854,141 @@ pub(crate) fn thousands(value: usize) -> String {
     grouped
 }
 
-pub(super) struct Truncation {
-    pub(super) complete: bool,
-    pub(super) resumed: bool,
+pub(super) fn truncate_prefix(text: &mut String, budget: usize) {
+    let allowed = budget.min(text.len());
+    let mut end = text.floor_char_boundary(allowed);
+    if let Some(newline) = text[..end].rfind('\n')
+        && newline + 1 >= allowed.div_ceil(2)
+    {
+        end = newline + 1;
+    }
+    text.truncate(end);
 }
 
-pub(super) fn truncation(
-    head: &str,
-    total: usize,
-    reference: Option<&str>,
-    Truncation { complete, resumed }: Truncation,
-) -> String {
-    let recovery = match reference {
-        Some(reference) if head.contains('\n') => {
-            let next = head.lines().count() + usize::from(head.ends_with('\n'));
-            let incomplete = if complete {
-                ""
+pub(super) enum Recovery {
+    Saved { cell: u64, complete: bool },
+    Unsaved(Option<u64>),
+}
+
+pub(super) fn truncation(shown: usize, total: usize, recovery: Recovery) -> String {
+    let (cell, rest) = match recovery {
+        Recovery::Saved { cell, complete } => {
+            let mut rest = if complete {
+                String::new()
             } else {
-                "; saved copy incomplete"
+                "; saved copy incomplete".into()
             };
-            format!("read({reference}, offset={next}){incomplete}")
+            if shown < total {
+                let _ = write!(rest, "; rest: cell[{cell}].remaining()");
+            }
+            (Some(cell), rest)
         }
-        Some(reference) => {
-            let label = if complete {
-                "all of it"
-            } else {
-                "saved copy (incomplete)"
-            };
-            format!("{label}: {reference}")
-        }
-        None => "the rest was not saved".into(),
+        Recovery::Unsaved(cell) => (cell, "; rest not saved".into()),
     };
-    let scope = if resumed { "new " } else { "" };
-    bart!(
-        Output,
-        "first {} of {total} {scope}bytes shown; {recovery}",
-        head.len()
-    )
+    let label = cell.map_or_else(String::new, |cell| format!("cell[{cell}] "));
+    bart!(Output, "{label}{shown} of {total} bytes shown{rest}")
+}
+
+struct SavedOutput {
+    artifact: SavedArtifact,
+    shown: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+pub(in crate::tool) struct Page {
+    text: String,
+    notice: String,
+}
+
+impl Page {
+    fn read(saved: &SavedArtifact, shown: usize, cell: u64, room: usize) -> io::Result<Self> {
+        let mut file = File::open(&saved.path)?;
+        let total = file.metadata()?.len() as usize;
+        let recovery = || Recovery::Saved {
+            cell,
+            complete: saved.is_complete(),
+        };
+        let reserve = truncation(total, total.saturating_add(1), recovery()).len() + 2;
+        file.seek(SeekFrom::Start(shown.min(total) as u64))?;
+        let limit = room.saturating_sub(reserve);
+        let mut bytes = Vec::new();
+        file.take(limit.min(total.saturating_sub(shown)) as u64)
+            .read_to_end(&mut bytes)?;
+        let valid = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        bytes.truncate(valid);
+        let mut text = String::from_utf8(bytes).map_err(io::Error::other)?;
+        if text.len() < total.saturating_sub(shown) {
+            truncate_prefix(&mut text, limit);
+        }
+        Ok(Self {
+            notice: truncation(shown + text.len(), total, recovery()),
+            text,
+        })
+    }
+}
+
+impl Storage {
+    pub(in crate::tool) fn remember(
+        &self,
+        cell: u64,
+        saved: &SavedArtifact,
+        shown: Option<usize>,
+    ) -> (usize, Recovery) {
+        let mut outputs = self.outputs.lock().expect(crate::NOT_POISONED);
+        if !outputs.contains_key(&cell) && outputs.len() == MAX_SESSION_FILES {
+            outputs.pop_first();
+        }
+        let output = outputs.entry(cell).or_insert_with(|| SavedOutput {
+            artifact: saved.clone(),
+            shown,
+        });
+        if shown.is_none() {
+            output.artifact = saved.clone();
+        }
+        if output.shown.is_none() {
+            output.shown = shown;
+        }
+        (
+            output.shown.unwrap_or_default(),
+            Recovery::Saved {
+                cell,
+                complete: output.artifact.is_complete(),
+            },
+        )
+    }
+
+    pub(in crate::tool) async fn remaining(&self, cell: u64, room: usize) -> Result<Page, String> {
+        let unknown =
+            || format!("cell[{cell}] has no continuation cursor; use read(cell[{cell}].output)");
+        loop {
+            let (saved, shown) = {
+                let outputs = self.outputs.lock().expect(crate::NOT_POISONED);
+                let output = outputs.get(&cell).ok_or_else(unknown)?;
+                (output.artifact.clone(), output.shown.ok_or_else(unknown)?)
+            };
+            let snapshot = saved.clone();
+            let page =
+                tokio::task::spawn_blocking(move || Page::read(&snapshot, shown, cell, room))
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| {
+                        format!(
+                            "cannot continue cell[{cell}]: {error}; use read(cell[{cell}].output)"
+                        )
+                    })?;
+            let mut outputs = self.outputs.lock().expect(crate::NOT_POISONED);
+            let output = outputs.get_mut(&cell).ok_or_else(unknown)?;
+            if output.shown != Some(shown) || output.artifact != saved {
+                continue;
+            }
+            output.shown = Some(shown + page.text.len());
+            return Ok(page);
+        }
+    }
 }
 
 #[cfg(test)]

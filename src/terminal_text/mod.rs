@@ -79,6 +79,10 @@ pub(crate) struct TerminalText {
 }
 
 impl TerminalText {
+    pub(crate) fn current_line_bytes(&self) -> usize {
+        self.line.iter().map(|character| character.len_utf8()).sum()
+    }
+
     pub(crate) fn current_line(&self) -> String {
         self.line.iter().collect()
     }

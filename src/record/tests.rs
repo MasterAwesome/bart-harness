@@ -81,6 +81,7 @@ async fn records_privately_and_resumes_the_same_history() {
                     crate::history::ArtifactOmission::FileLimit,
                 ),
                 chars: 0,
+                bytes: 0,
             }),
             cell: None,
         }),

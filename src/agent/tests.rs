@@ -530,6 +530,7 @@ async fn resuming_reports_jobs_that_died_with_the_previous_process() {
                 path: "job.log".into(),
                 completeness: crate::history::Completeness::Complete,
                 chars: 0,
+                bytes: 0,
             },
         },
     });
@@ -563,6 +564,7 @@ async fn resuming_reports_jobs_that_died_with_the_previous_process() {
                     path: "job.log".into(),
                     completeness: crate::history::Completeness::Complete,
                     chars: 0,
+                    bytes: 0,
                 },
             },
         }),

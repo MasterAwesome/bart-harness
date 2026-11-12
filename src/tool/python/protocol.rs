@@ -55,6 +55,10 @@ pub(super) enum ActivityOutcome {
 #[serde(rename_all = "lowercase", tag = "name", content = "arguments")]
 pub(super) enum Helper {
     Whoami {},
+    Remaining {
+        cell: u64,
+        barrier: u64,
+    },
     Background(Value),
     Run(Value),
     Kill {

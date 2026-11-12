@@ -389,6 +389,10 @@ pub(super) struct Stream {
 }
 
 impl Stream {
+    pub(super) fn pending_bytes(&self) -> usize {
+        self.terminal.current_line_bytes()
+    }
+
     pub(super) fn redirect(&mut self, live: &Progress) {
         self.live = live.clone();
     }

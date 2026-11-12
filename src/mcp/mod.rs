@@ -50,8 +50,6 @@ const MAX_REGISTRY_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MAX_STARTUPS: usize = 4;
 const MAX_LINE_BYTES: usize = rmcp::transport::async_rw::DEFAULT_MAX_LINE_LENGTH;
 const STDERR_TAIL_BYTES: usize = 4096;
-const MAX_LISTED: usize = 200;
-const MAX_GUIDANCE_BYTES: usize = 4096;
 const MAX_NOTE_FIELD_CHARS: usize = 200;
 const INHERITED: [&str; 10] = [
     "HOME", "LOGNAME", "PATH", "SHELL", "USER", "LANG", "LC_ALL", "TERM", "TMPDIR", "TZ",
@@ -473,11 +471,7 @@ impl Registry {
             }
         }
         lines.sort_by_key(|(rank, _)| std::cmp::Reverse(*rank));
-        let shown = lines.len().min(MAX_LISTED);
-        let mut text: Vec<String> = lines.drain(..shown).map(|(_, line)| line).collect();
-        if !lines.is_empty() {
-            text.push(format!("({} more; narrow with `query`)", lines.len()));
-        }
+        let mut text: Vec<String> = lines.into_iter().map(|(_, line)| line).collect();
         if text.is_empty() {
             text.push("no matching tools".to_owned());
         }
@@ -513,17 +507,7 @@ impl Registry {
             );
         }
         if let Some(guidance) = &connection.guidance {
-            let cut = guidance.floor_char_boundary(guidance.len().min(MAX_GUIDANCE_BYTES));
-            let more = if cut < guidance.len() {
-                concat!("\n", bart!(const Mcp, "guidance truncated"))
-            } else {
-                ""
-            };
-            let _ = write!(
-                text,
-                "\nserver-provided guidance:\n{}{more}",
-                &guidance[..cut]
-            );
+            let _ = write!(text, "\nserver-provided guidance:\n{guidance}");
         }
         Ok(text)
     }

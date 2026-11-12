@@ -259,6 +259,8 @@ impl Running {
             output,
             emission: CellOutput {
                 marker: [b"\n", marker.as_bytes(), b"\n"].concat(),
+                barrier: [b"\0", marker.as_bytes(), b":remaining\0"].concat(),
+                synchronized: 0,
                 pending: Vec::new(),
                 output: Vec::new(),
                 ended: false,
@@ -349,9 +351,23 @@ impl Running {
                     if self.channel.process.is_some() { Ok(1) }
                     else { self.channel.replies.read(MAX_FRAME_BYTES).await }
                 }, if self.channel.exchange.done.is_none() => {
+                    let room = if let Ok(super::protocol::PythonMessage::Call(super::protocol::Helper::Remaining { barrier, .. })) =
+                        serde_json::from_slice(&self.channel.replies.frame) {
+                        while self.emission.synchronized < barrier {
+                            let n = match time::timeout_at(deadline, self.output.read(&mut buffer)).await {
+                                Ok(Ok(n)) => n,
+                                Ok(Err(error)) => return End::Broken(error),
+                                Err(_) => return End::TimedOut,
+                            };
+                            if n == 0 { return End::Exited; }
+                            self.emission.output.extend_from_slice(&buffer[..n]);
+                            self.emission.capture(collector, stream);
+                        }
+                        collector.room().saturating_sub(stream.pending_bytes())
+                    } else { 0 };
                     let helper_live = stream.progress();
                     {
-                        let mut answering = Box::pin(answer(read, &mut self.channel, effects, cell, review, &helper_live));
+                        let mut answering = Box::pin(answer(read, &mut self.channel, effects, cell, review, &helper_live, room));
                         loop {
                             tokio::select! {
                                 result = &mut answering => break result,

@@ -35,6 +35,7 @@ pub(super) async fn answer(
     cell: u64,
     review: &mut CellReview<'_, '_>,
     live: &Progress,
+    room: usize,
 ) -> std::io::Result<Option<End>> {
     let call = if channel.process.is_some() {
         None
@@ -110,6 +111,14 @@ pub(super) async fn answer(
                 return Ok(None);
             }
         },
+        Some(Helper::Remaining { cell, .. }) => {
+            match review.context.artifacts.remaining(cell, room).await {
+                Ok(page) => exchange.queue(&HostMessage::Result(json!(page))),
+                Err(error) => exchange.queue(&HostMessage::Error(&error)),
+            }
+            requests.write_all_buf(&mut exchange.unsent).await?;
+            return Ok(None);
+        }
         Some(Helper::Background(arguments)) => Work::Background(arguments),
         Some(call) => Work::Other(call),
     };
@@ -381,7 +390,7 @@ pub(super) async fn helper(
                 serde_json::to_value(current).expect("identity serializes"),
             ))
         }
-        Helper::Run(_) | Helper::Background(_) => {
+        Helper::Run(_) | Helper::Background(_) | Helper::Remaining { .. } => {
             Err("commands require the interpreter exchange".into())
         }
         Helper::Job { id } => context.jobs.snapshot(id, context).await.map(Helped::Value),
