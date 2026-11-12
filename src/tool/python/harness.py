@@ -19,6 +19,7 @@ import site
 import stat
 import sys
 import threading
+import textwrap
 import time
 import traceback
 import types
@@ -1314,6 +1315,34 @@ def restore():
         _diagnostic("\n" + _bart("cell", f"cell[{_activity_cell}] helper bindings removed; {', '.join(rebound)} are built-ins"))
 
 
+class _CellStackSummary(traceback.StackSummary):
+    def __init__(self, frames, filename, source):
+        super().__init__(frames)
+        self.filename = filename
+        self.source = source
+
+    def format_frame_summary(self, frame, **kwargs):
+        if (frame.filename != self.filename or any(
+                getattr(frame, field, None) is None
+                for field in ("colno", "end_colno", "end_lineno"))):
+            return super().format_frame_summary(frame, **kwargs)
+        position = types.SimpleNamespace(
+            lineno=frame.lineno, end_lineno=frame.end_lineno,
+            col_offset=frame.colno, end_col_offset=frame.end_colno)
+        try:
+            segment = ast.get_source_segment(self.source, position, padded=True)
+        except (IndexError, ValueError):
+            segment = None
+        if segment is None:
+            return super().format_frame_summary(frame, **kwargs)
+        lines = textwrap.dedent(segment).lstrip().split("\n")
+        if len(lines) > 6:
+            lines = [*lines[:3], "...", *lines[-3:]]
+        header = super().format_frame_summary(traceback.FrameSummary(
+            frame.filename, frame.lineno, frame.name, lookup_line=False, line=""), **kwargs)
+        return header + textwrap.indent("\n".join(lines), "    ") + "\n"
+
+
 def execute_cell(code, diffs, cell_number):
     filename = f"cell[{cell_number}].code"
     global _in_cell, _interrupted, _original_bytes, _tracking_full, _diffs, _activity_cell
@@ -1373,8 +1402,8 @@ def execute_cell(code, diffs, cell_number):
         attributed = False
         while pending:
             current = pending.pop()
-            current.stack = traceback.StackSummary.from_list(
-                [f for f in current.stack if f.filename != "<bart-harness>"])
+            current.stack = _CellStackSummary(
+                [f for f in current.stack if f.filename != "<bart-harness>"], filename, source)
             attributed |= (any(frame.filename == filename for frame in current.stack)
                            or getattr(current, "filename", None) == filename)
             pending.extend(e for e in (current.__cause__, current.__context__) if e is not None)

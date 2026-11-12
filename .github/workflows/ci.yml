@@ -25,6 +25,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - if: runner.os == 'Linux'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.10'
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -34,6 +38,12 @@ jobs:
       - if: runner.os == 'macOS'
         run: brew install tmux
       - run: cargo test --locked --test terminal -- --ignored
+      - if: runner.os == 'Linux'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - if: runner.os == 'Linux'
+        run: cargo test --locked --test unit traceback
 
   deny:
     runs-on: ubuntu-22.04

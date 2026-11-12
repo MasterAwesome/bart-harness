@@ -35,6 +35,15 @@ async fn text(context: &Arc<Context>, code: &str, expected: &str) {
     assert_eq!(output.text, expected, "{code}");
 }
 
+fn python_has_expression_positions() -> bool {
+    let output = std::process::Command::new("python3")
+        .args(["-c", "import sys; print(sys.version_info >= (3, 11))"])
+        .output()
+        .expect("python3 must be available");
+    assert!(output.status.success());
+    output.stdout == b"True\n"
+}
+
 async fn refused(context: &Arc<Context>, code: &str) {
     let output = cell(context, code).await;
     assert!(output.is_error(), "{code}: {}", output.text);
@@ -83,7 +92,10 @@ async fn cells_keep_state_and_show_output_values_and_failures() {
     .await;
     let missing = cell(&context, "textwrap.dedent('')").await;
     assert!(
-        missing.text.ends_with("forget to import 'textwrap'?"),
+        missing
+            .text
+            .trim_end_matches('?')
+            .ends_with("forget to import 'textwrap'"),
         "a missing standard module names its import: {}",
         missing.text
     );
@@ -2405,6 +2417,92 @@ async fn cell_traceback_source_uses_python_newlines_and_does_not_leak_cache() {
             );
         }
     }
+    let has_expression_positions = python_has_expression_positions();
+    for (code, excerpt, legacy_excerpt) in [
+        (
+            "x = 'é'; int('bad'); x = 'unrelated'",
+            "    int('bad')\n",
+            "    x = 'é'; int('bad'); x = 'unrelated'\n",
+        ),
+        (
+            "x = 1; int(\n    'bad'\n); x = 2",
+            "    int(\n        'bad'\n    )\n",
+            "    x = 1; int(\n",
+        ),
+        (
+            "def fail():\n    x = 'é'; return 1 / 0\nfail()",
+            "    1 / 0\n",
+            "    x = 'é'; return 1 / 0\n",
+        ),
+        (
+            "int(\n    '0'\n    '1'\n    '2'\n    '3'\n    '4'\n    '5'\n    'bad'\n)",
+            "    int(\n        '0'\n        '1'\n    ...\n        '5'\n        'bad'\n    )\n",
+            "    int(\n",
+        ),
+        (
+            "try: int('bad')\nexcept ValueError as error: raise ExceptionGroup('group', [error])",
+            "    int('bad')\n",
+            "    try: int('bad')\n",
+        ),
+    ] {
+        if !has_expression_positions && code.contains("ExceptionGroup") {
+            continue;
+        }
+        let output = cell(&context, code).await;
+        assert!(output.is_error(), "{}", output.text);
+        let expected = if has_expression_positions {
+            excerpt
+        } else {
+            legacy_excerpt
+        };
+        assert!(output.text.contains(expected), "{}", output.text);
+        if has_expression_positions {
+            for unwanted in ["x =", "return 1 / 0", "^", "    '2'", "    '3'", "    '4'"] {
+                assert!(!output.text.contains(unwanted), "{}", output.text);
+            }
+        }
+        if code.contains("ExceptionGroup") {
+            assert!(
+                output.text.contains("ExceptionGroup: group"),
+                "{}",
+                output.text
+            );
+            assert!(
+                output
+                    .text
+                    .contains("During handling of the above exception"),
+                "{}",
+                output.text
+            );
+            assert_eq!(
+                output.text.matches("int('bad')").count(),
+                2,
+                "{}",
+                output.text
+            );
+        }
+    }
+    let foreign = cell(
+        &context,
+        "exec(compile('\\n' * 10 + '1/0', sys._getframe().f_code.co_filename, 'exec'))",
+    )
+    .await;
+    assert!(
+        foreign
+            .text
+            .ends_with("ZeroDivisionError: division by zero"),
+        "{}",
+        foreign.text
+    );
+    let syntax = cell(&context, "if True print('bad')").await;
+    assert!(syntax.is_error(), "{}", syntax.text);
+    assert!(syntax.text.contains("SyntaxError"), "{}", syntax.text);
+    assert!(
+        syntax.text.contains("if True print('bad')"),
+        "{}",
+        syntax.text
+    );
+    assert!(syntax.text.contains('^'), "{}", syntax.text);
     text(
         &context,
         "import linecache\nassert not any(k.startswith('cell[') for k in linecache.cache)\nprint('cache clean')",
@@ -2427,12 +2525,25 @@ async fn imported_project_and_chained_tracebacks_survive_without_harness_frames(
     for location in [
         "scoring.py",
         "cell[1].code",
-        "try: scoring.score()",
-        "except ValueError as error: raise RuntimeError('wrapper') from error",
+        "The above exception was the direct cause",
         "ValueError: project failure",
         "RuntimeError: wrapper",
     ] {
         assert!(output.text.contains(location), "{}", output.text);
+    }
+    let expected = if python_has_expression_positions() {
+        [
+            "    scoring.score()\n",
+            "    raise RuntimeError('wrapper') from error\n",
+        ]
+    } else {
+        [
+            "    try: scoring.score()\n",
+            "    except ValueError as error: raise RuntimeError('wrapper') from error\n",
+        ]
+    };
+    for excerpt in expected {
+        assert!(output.text.contains(excerpt), "{}", output.text);
     }
     assert!(!output.text.contains("<bart-harness>"), "{}", output.text);
     text(&context, "6 * 7", "42").await;
