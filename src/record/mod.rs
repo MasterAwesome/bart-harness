@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::history::Message;
+pub(crate) use format::RecordedPrompt;
 use format::{Entries, Entry, Header, Timed};
 
 const RECORD: &str = "session.jsonl";
@@ -50,6 +51,7 @@ pub(crate) struct Resumed {
     pub(crate) record: Recorder,
     pub(crate) previous: Meta,
     pub(crate) name: Option<String>,
+    pub(crate) prompt: Option<RecordedPrompt>,
     pub(crate) conversation: Conversation,
 }
 
@@ -132,6 +134,7 @@ impl Sessions {
             project,
             conversation,
             name,
+            prompt,
             complete,
             retained,
         } = parse(Entries::new(&record.file))?;
@@ -148,6 +151,7 @@ impl Sessions {
             record: Recorder::from_writer(record, project, initial_cwd),
             previous,
             name,
+            prompt,
             conversation,
         })
     }
@@ -444,7 +448,11 @@ impl Retained {
                     target.bytes = target.bytes.saturating_add(bytes);
                 }
             }
-            Entry::Session(_) | Entry::Metadata(_) | Entry::Name(_) | Entry::Review(_) => {}
+            Entry::Session(_)
+            | Entry::Metadata(_)
+            | Entry::Name(_)
+            | Entry::Prompt(_)
+            | Entry::Review(_) => {}
         }
         if self
             .bytes
@@ -471,6 +479,7 @@ struct Parsed {
     retained: Retained,
     complete: u64,
     name: Option<String>,
+    prompt: Option<RecordedPrompt>,
     meta: Option<Meta>,
     project: Option<String>,
     conversation: Conversation,
@@ -478,6 +487,7 @@ struct Parsed {
 
 fn parse(mut entries: Entries<'_>) -> io::Result<Parsed> {
     let mut name = None;
+    let mut prompt = None;
     let mut meta = None;
     let mut project = None;
     let mut initial_cwd = None;
@@ -488,6 +498,7 @@ fn parse(mut entries: Entries<'_>) -> io::Result<Parsed> {
         retained.apply(&entry)?;
         match entry {
             Entry::Name(latest) => name = Some(latest),
+            Entry::Prompt(latest) => prompt = Some(latest),
             Entry::Session(header) => {
                 initial_cwd = Some(header.meta.cwd.clone());
                 meta = Some(header.meta);
@@ -508,6 +519,7 @@ fn parse(mut entries: Entries<'_>) -> io::Result<Parsed> {
         initial_cwd,
         retained,
         name,
+        prompt,
         complete: entries.complete,
         meta,
         project,
@@ -590,7 +602,7 @@ fn outline(file: &File) -> io::Result<Outline> {
                     outline.messages += 1;
                 }
             }
-            Entry::Compact { .. } | Entry::Review(_) => {}
+            Entry::Compact { .. } | Entry::Prompt(_) | Entry::Review(_) => {}
         }
     }
     Ok(outline)
@@ -766,6 +778,9 @@ impl Recorder {
 
     pub(crate) fn rename(&self, name: &str) -> PendingWrite {
         self.line(Entry::Name(name.to_owned()))
+    }
+    pub(crate) fn prompt(&self, prompt: &RecordedPrompt) -> PendingWrite {
+        self.line(Entry::Prompt(prompt.clone()))
     }
     pub(crate) fn describe(&self, meta: &Meta) -> PendingWrite {
         self.line(Entry::Metadata(meta.clone()))

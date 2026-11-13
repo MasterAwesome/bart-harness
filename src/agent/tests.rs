@@ -573,8 +573,10 @@ async fn resuming_reports_jobs_that_died_with_the_previous_process() {
     session
         .resume(
             None,
-            None,
-            crate::conversation::Conversation::of(history.clone()),
+            journal::Restored {
+                conversation: crate::conversation::Conversation::of(history.clone()),
+                ..Default::default()
+            },
         )
         .await;
     let notified: Vec<_> = session
@@ -598,7 +600,13 @@ async fn resuming_reports_jobs_that_died_with_the_previous_process() {
     assert_eq!(session.journal().resume_notifications().count(), 2);
     let retained = session.journal().history().to_vec();
     session
-        .resume(None, None, crate::conversation::Conversation::of(retained))
+        .resume(
+            None,
+            journal::Restored {
+                conversation: crate::conversation::Conversation::of(retained),
+                ..Default::default()
+            },
+        )
         .await;
     assert!(
         session
@@ -637,8 +645,10 @@ async fn orphaned_calls_get_results_right_after_their_message() {
         session
             .resume(
                 None,
-                None,
-                crate::conversation::Conversation::of(history.clone()),
+                journal::Restored {
+                    conversation: crate::conversation::Conversation::of(history.clone()),
+                    ..Default::default()
+                },
             )
             .await;
         let mut results = Vec::new();
@@ -662,8 +672,10 @@ async fn orphaned_calls_get_results_right_after_their_message() {
         session
             .resume(
                 None,
-                None,
-                crate::conversation::Conversation::of(repaired.clone()),
+                journal::Restored {
+                    conversation: crate::conversation::Conversation::of(repaired.clone()),
+                    ..Default::default()
+                },
             )
             .await;
         let repaired_results = repaired
@@ -734,7 +746,16 @@ async fn completed_results_survive_cancellation_of_a_later_cell() {
     let resumed = sessions.resume(&id).unwrap();
     let mut session = session_on(provider, dir.path());
     session.journal = Journal::new(Some(resumed.record));
-    session.resume(None, None, resumed.conversation).await;
+    session
+        .resume(
+            None,
+            journal::Restored {
+                conversation: resumed.conversation,
+                name: resumed.name,
+                prompt: resumed.prompt,
+            },
+        )
+        .await;
     turn(&mut session, "recover").await;
     let results = session
         .journal()
@@ -1172,7 +1193,16 @@ async fn main_requests_keep_affinity_and_prefixes_across_turns_resume_and_compac
     let mut session = session_on(provider, dir.path());
     session.cache_key = format!("bart-{id}");
     session.journal = Journal::new(Some(resumed.record));
-    session.resume(None, None, resumed.conversation).await;
+    session
+        .resume(
+            None,
+            journal::Restored {
+                conversation: resumed.conversation,
+                name: resumed.name,
+                prompt: resumed.prompt,
+            },
+        )
+        .await;
     turn(&mut session, "third").await;
     session.routing.assume(Some(model(64_000)));
     session
@@ -1343,8 +1373,11 @@ async fn a_resumed_session_keeps_the_prompt_it_was_created_with() {
     let dir = TempDir::new("pinned-project");
     let agents = dir.path().join("AGENTS.md");
     std::fs::write(&agents, "Indent with tabs.").unwrap();
-    let (provider, requests) =
-        serve(dir.path(), vec![Reply::text("one"), Reply::text("two")]).await;
+    let (provider, requests) = serve(
+        dir.path(),
+        vec![Reply::text("one"), Reply::text("two"), Reply::text("three")],
+    )
+    .await;
     let settings = || Settings {
         provider: provider.clone(),
         model: "m".into(),
@@ -1361,17 +1394,32 @@ async fn a_resumed_session_keeps_the_prompt_it_was_created_with() {
         .open(settings(), known_window(provider.name()), None)
         .await
         .unwrap();
+    let session_path = opener.sessions.dir(&id).join("session.jsonl");
+    let prompt_entries = || -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&session_path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| entry["event"] == "prompt")
+            .collect()
+    };
     turn(&mut session, "first").await;
+    session.journal.settle_recording().await;
+    assert_eq!(prompt_entries().len(), 1);
+    turn(&mut session, "second").await;
     assert!(session.finish().await.is_none());
     drop(session);
+    assert_eq!(prompt_entries().len(), 1);
     std::fs::write(&agents, "Indent with spaces.").unwrap();
     let resumed = opener.sessions.resume(&id).unwrap();
     let (mut session, _) = opener
         .open(settings(), known_window(provider.name()), Some(resumed))
         .await
         .unwrap();
-    turn(&mut session, "second").await;
+    turn(&mut session, "third").await;
     assert!(session.finish().await.is_none());
+    let recorded = prompt_entries();
+    assert_eq!(recorded.len(), 1);
     let requests = requests.lock().unwrap();
     let system = |request: &serde_json::Value| request["messages"][0]["content"].clone();
     assert!(
@@ -1380,8 +1428,12 @@ async fn a_resumed_session_keeps_the_prompt_it_was_created_with() {
             .unwrap()
             .contains("Indent with tabs.")
     );
+    assert_eq!(recorded[0]["data"]["instructions"], system(&requests[0]));
+    assert_eq!(recorded[0]["data"]["tools"][0]["name"], "python");
     assert_eq!(system(&requests[1]), system(&requests[0]));
+    assert_eq!(system(&requests[2]), system(&requests[0]));
     assert_eq!(requests[1]["tools"], requests[0]["tools"]);
+    assert_eq!(requests[2]["tools"], requests[0]["tools"]);
 }
 
 #[tokio::test]

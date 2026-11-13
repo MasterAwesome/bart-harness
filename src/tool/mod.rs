@@ -1,9 +1,10 @@
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 mod jobs;
@@ -27,9 +28,9 @@ pub(crate) const EMPTY_CELL_REFUSAL: &str = "No code was sent; nothing ran.";
 
 pub(crate) const OUTPUT_BUDGET_BYTES: usize = 32 * 1024;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Definition {
-    pub(crate) name: &'static str,
+    pub(crate) name: Cow<'static, str>,
     pub(crate) description: String,
     pub(crate) parameters: Value,
 }

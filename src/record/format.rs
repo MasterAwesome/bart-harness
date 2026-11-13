@@ -29,12 +29,19 @@ impl Header {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecordedPrompt {
+    pub(crate) instructions: String,
+    pub(crate) tools: Vec<crate::tool::Definition>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub(super) enum Entry {
     Session(Header),
     Metadata(Meta),
     Name(String),
+    Prompt(RecordedPrompt),
     Messages(Vec<Message>),
     Rewind(usize),
     Compact {

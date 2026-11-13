@@ -553,3 +553,39 @@ async fn automatic_names_use_the_highest_project_suffix() {
         "review-fold"
     );
 }
+
+#[tokio::test]
+async fn prompt_survives_resume_and_replaces_with_latest() {
+    use crate::{record::RecordedPrompt, tool::Definition};
+    let dir = TempDir::new("prompt-resume");
+    let sessions = Sessions::new(dir.path(), Path::new("/work"));
+    let (id, record) = sessions.create(&meta("/work", "m"), "").unwrap();
+    let first = RecordedPrompt {
+        instructions: "first instructions".into(),
+        tools: vec![Definition {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }],
+    };
+    record.prompt(&first).await.unwrap();
+    let second = RecordedPrompt {
+        instructions: "updated instructions".into(),
+        tools: vec![
+            Definition {
+                name: "read".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            Definition {
+                name: "shell".into(),
+                description: "Run a command".into(),
+                parameters: serde_json::json!({"type": "object", "required": ["command"]}),
+            },
+        ],
+    };
+    record.prompt(&second).await.unwrap();
+    drop(record);
+    let resumed = sessions.resume(&id).unwrap();
+    assert_eq!(resumed.prompt, Some(second));
+}

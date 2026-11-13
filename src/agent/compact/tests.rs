@@ -413,7 +413,16 @@ async fn recovery_insertions_charge_content_and_never_revalidate_stale_usage() {
                 "repair accounting must replay identically"
             );
             let mut journal = Journal::new(Some(resumed.record));
-            journal.resume(None, None, resumed.conversation).await;
+            journal
+                .resume(
+                    None,
+                    crate::agent::journal::Restored {
+                        conversation: resumed.conversation,
+                        name: resumed.name,
+                        prompt: resumed.prompt,
+                    },
+                )
+                .await;
             journal.append(vec![response("new", 12_000, false)]).await;
             journal.recover("unused").await;
             assert_eq!(tokens(journal.model_context(), "instructions"), 12_010);

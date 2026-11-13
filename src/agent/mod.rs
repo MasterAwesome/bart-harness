@@ -286,13 +286,8 @@ impl Session {
         Ok(title.to_owned())
     }
 
-    async fn resume(
-        &mut self,
-        meta: Option<&Meta>,
-        name: Option<String>,
-        conversation: crate::conversation::Conversation,
-    ) {
-        self.journal.resume(meta, name, conversation).await;
+    async fn resume(&mut self, meta: Option<&Meta>, restored: journal::Restored) {
+        self.journal.resume(meta, restored).await;
         self.rebase_context();
         self.journal.settle_recording().await;
     }
@@ -726,6 +721,9 @@ impl Session {
             if accounting.context_tokens >= self.compaction_threshold()? && !continuing {
                 self.compact_with(on_event, 0).await?;
             }
+            self.journal
+                .record_prompt(self.instructions.as_str(), &definitions)
+                .await;
             let request = self.routing.request(
                 self.journal.model_context().messages(),
                 &definitions,

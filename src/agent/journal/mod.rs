@@ -4,15 +4,24 @@ use crate::{
     approval::Review,
     conversation::{Conversation, Estimate, ModelContext},
     history::{Message, Notification},
-    record::{Meta, PendingWrite, Recorder},
+    record::{Meta, PendingWrite, RecordedPrompt, Recorder},
+    tool::Definition,
 };
 
 pub(super) const MAX_HISTORY_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct Restored {
+    pub(super) conversation: Conversation,
+    pub(super) name: Option<String>,
+    pub(super) prompt: Option<RecordedPrompt>,
+}
 
 pub(crate) struct Journal {
     conversation: Conversation,
     bytes: usize,
     name: Option<String>,
+    recorded_prompt: Option<RecordedPrompt>,
     resume_notices: Range<usize>,
     unanswered: bool,
     pending: Option<PendingWrite>,
@@ -35,6 +44,7 @@ impl Journal {
             conversation: Conversation::default(),
             bytes: 0,
             name: None,
+            recorded_prompt: None,
             resume_notices: 0..0,
             unanswered: false,
             pending: None,
@@ -201,6 +211,24 @@ impl Journal {
         self.pending = self.recorder().map(|recorder| recorder.describe(meta));
     }
 
+    pub(super) async fn record_prompt(&mut self, instructions: &str, definitions: &[Definition]) {
+        if self.recorder().is_none()
+            || self.recorded_prompt.as_ref().is_some_and(|recorded| {
+                recorded.instructions == instructions && recorded.tools == definitions
+            })
+        {
+            return;
+        }
+        self.settle_recording().await;
+        let prompt = RecordedPrompt {
+            instructions: instructions.to_owned(),
+            tools: definitions.to_vec(),
+        };
+        let pending = self.recorder().map(|recorder| recorder.prompt(&prompt));
+        self.recorded_prompt = Some(prompt);
+        self.pending = pending;
+    }
+
     pub(crate) async fn review(&mut self, review: &Review) {
         self.settle_recording().await;
         let pending = self.recorder().map(|recorder| recorder.review(review));
@@ -248,17 +276,18 @@ impl Journal {
         false
     }
 
-    pub(super) async fn resume(
-        &mut self,
-        meta: Option<&Meta>,
-        name: Option<String>,
-        mut conversation: Conversation,
-    ) {
+    pub(super) async fn resume(&mut self, meta: Option<&Meta>, restored: Restored) {
+        let Restored {
+            mut conversation,
+            name,
+            prompt,
+        } = restored;
         self.settle_recording().await;
         let recovered = conversation.resumed();
         self.bytes = total_bytes(conversation.history());
         self.conversation = conversation;
         self.name = name;
+        self.recorded_prompt = prompt;
         let start = self.history().len();
         let pending = self.recorder().map(|recorder| {
             recorder.opening(

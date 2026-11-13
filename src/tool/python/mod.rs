@@ -329,7 +329,7 @@ class _Mcp:
 #[must_use]
 pub(super) fn definition(surface: &Surface<'_>) -> Definition {
     Definition {
-        name: "python",
+        name: "python".into(),
         description: description(surface),
         parameters: json!({
             "type": "object",
