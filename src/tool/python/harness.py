@@ -401,9 +401,10 @@ def run_escaping(argv, *, timeout=_CONFIG["process_default_seconds"], check=True
 
 
 class Job(Result):
-    def __init__(self, id, command):
+    def __init__(self, id, command, launch_cell=None):
         self.id = id
         self.command = command
+        self._launch_cell = launch_cell
 
     def _saved_path(self):
         return _saved(f"job-{self.id}.log", f"job[{self.id}]")
@@ -421,9 +422,9 @@ class Job(Result):
 
     if _CONFIG["one_turn"]:
         def wait(self):
-            while self._snapshot().outcome is None:
+            while (result := self._snapshot()).outcome is None:
                 time.sleep(0.2)
-            return self
+            return result
 
     def kill(self):
         """Stop this job; completed effects are not rolled back."""
@@ -564,7 +565,7 @@ def whoami():
 
 def _background(argv, notify, env, **options):
     result = Job(**_call("background", argv=_argv(argv), notify=notify,
-                        env={} if env is None else dict(env), **options))
+                        env={} if env is None else dict(env), **options), launch_cell=_activity_cell)
     _diagnostic(_bart("job", f"job[{result.id}] started"))
     return result
 
@@ -1302,8 +1303,14 @@ bart_builtins = dict(whoami=whoami, run=run, RunError=RunError, bg_run=bg_run, j
 _DISPLAY_HOOK = "__bart_display__"
 
 
+def _displayable(value):
+    return isinstance(value, (_ReadText, Result)) and (
+        not isinstance(value, Job) or value._launch_cell != _activity_cell
+    )
+
+
 def _display_value(value):
-    if isinstance(value, (_ReadText, Result)) and not isinstance(value, Job):
+    if _displayable(value):
         value._display()
     elif isinstance(value, Text):
         print(repr(value))
@@ -1397,7 +1404,7 @@ def execute_cell(code, diffs, cell_number):
             value = eval(compile(ast.Expression(last.value), filename, "eval"), namespace)
             if _is_image(value):
                 _show_image(value)
-            elif isinstance(value, (_ReadText, Result)) and not isinstance(value, Job):
+            elif _displayable(value):
                 value._display()
             elif value is not None and not isinstance(value, Job):
                 print(repr(value))

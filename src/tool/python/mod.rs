@@ -214,7 +214,7 @@ def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True,
 def bg_run(argv: Sequence[str], *, notify: str | None = None,
            cwd: str | PathLike[str] | None = None, env: Mapping[str, str] | None = None{bg_escape}) -> Job:
     """Start a long-running program without waiting; prints [Bart job: job[ID] started].
-    print(build) shows [Bart job: job[ID] running] (or exit E), then its output so far.
+    build or print(build) shows [Bart job: job[ID] running] (or exit E), then its output so far.
     Completion shows [Bart job: job[ID] exit 0 after 0.3s; make test].
     Use it, not subprocess, for servers, watchers and slow builds or tests.
 
@@ -237,7 +237,7 @@ def bg_run(argv: Sequence[str], *, notify: str | None = None,
 
 fn types(one_turn: bool) -> String {
     let wait = if one_turn {
-        "    def wait(self) -> Job: ...\n"
+        "    def wait(self) -> Result: ...\n"
     } else {
         ""
     };

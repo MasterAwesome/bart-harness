@@ -1398,12 +1398,18 @@ async fn job_wait_exists_only_in_one_turn_sessions() {
             crate::tool::TurnMode::Session
         });
         let code = if one_turn {
-            "j = bg_run(['true'])\nassert hasattr(j, 'wait')\nassert j.wait().return_code == 0"
+            "j = bg_run(['echo', 'waited'])\nassert hasattr(j, 'wait')\nr = j.wait()\nassert type(r) is Result and r.return_code == 0 and r.stdout == 'waited\\n'\nj.wait()"
         } else {
             "j = bg_run(['true'])\nassert not hasattr(j, 'wait')"
         };
         let output = cell(&context, code).await;
         assert!(!output.is_error(), "{}", output.text);
+        if one_turn {
+            assert_eq!(
+                output.text,
+                "[Bart job: job[1] started]\n[Bart job: job[1] exit 0]\nwaited"
+            );
+        }
     }
 }
 
@@ -2778,7 +2784,8 @@ async fn background_launches_report_their_handles_once_even_when_assigned() {
     let context = session(dir.path(), Confinement::Unrestricted, 1000);
     for code in [
         "for _ in range(1): bg_run(['true'])",
-        "j = bg_run(['true'])",
+        "j = bg_run(['echo', 'hello'])",
+        "j2 = bg_run(['true'])\nj2",
     ] {
         let output = cell(&context, code).await;
         assert!(!output.is_error(), "{}", output.text);
@@ -2792,7 +2799,13 @@ async fn background_launches_report_their_handles_once_even_when_assigned() {
         context.jobs.take_notifications();
     }
     let printed = cell(&context, "print(j)").await;
-    assert_eq!(printed.text, "[Bart job: job[2] exit 0]");
+    assert_eq!(printed.text, "[Bart job: job[2] exit 0]\nhello");
+    let bare = cell(&context, "j").await;
+    assert_eq!(bare.text, "[Bart job: job[2] exit 0]\nhello");
+    let indexed = cell(&context, "job[2]").await;
+    assert_eq!(indexed.text, "[Bart job: job[2] exit 0]\nhello");
+    let looped = cell(&context, "for _ in range(1): job[3]").await;
+    assert_eq!(looped.text, "[Bart job: job[3] exit 0]");
     let refused = cell(&context, "bg_run(['true'], cwd='no-such-cwd')").await;
     assert!(
         refused.is_error() && !refused.text.contains("started]"),
