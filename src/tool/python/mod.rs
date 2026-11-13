@@ -191,15 +191,17 @@ def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True,
         cwd: str | PathLike[str] | None = None, env: Mapping[str, str] | None = None{run_escape}) -> Result:
     """Run one program and wait for it. argv is passed literally: no shell, no globbing.
 
-        run(["rg", "-n", r"TODO|FIXME", "src"])                         # raw strings for regexes
+        run(["rg", "-n", r"TODO|FIXME", "src"], check=False)            # raw strings; check=False for probes with expected nonzero exits (rg, grep, diff)
         run(["bash", "-o", "pipefail", "-c", "make 2>&1 | tail -20"])   # pipes and redirects need a shell
         data = json.loads(run(["cargo", "metadata", "--format-version=1"]).stdout)   # assigned: silent
 
     The view is [Bart run: cell[N].run[M] exit E], then combined stdout and stderr.
     A nonzero exit or signal raises RunError and stops the cell unless caught; its .result
-    holds the outcome and captured output; the error message is its view. Pass check=False
-    to inspect an expected nonzero result. Like a shell, a program that cannot start exits
-    127 (not found) or 126 (cannot execute). Timeouts and unknown outcomes always raise.
+    holds the outcome and captured output; the error message is its view (long failures show
+    head + [Bart run: cell[N].run[M] N bytes omitted] + tail; read(cell[N].run[M]) inspects
+    the rest). Pass check=False to inspect an expected nonzero result. Like a shell, a
+    program that cannot start exits 127 (not found) or 126 (cannot execute). Timeouts and
+    unknown outcomes always raise.
     bool(r) is true for exit 0.
     A failing run whose view is not shown is reported after the cell's output.
     The program starts in the session's working directory with the session's environment;
@@ -274,7 +276,7 @@ class Edit(TypedDict, total=False):
 
 # Saved artifacts by the number shown for them; the paths work with read() and run().
 job: Mapping[int, Job]
-cell: Mapping[int, Cell]     # .code, .output, .status (JSONL process outcomes) and, per run number M,
+cell: Mapping[int, Cell]     # Path objects: .code, .output, .status (JSONL process outcomes) and, per run number M,
                              # .run[M] (combined log), .stdout[M], .stderr[M] (raw bytes)
 image: Mapping[int, Path]    # images by the N in "image[N]"
 paste: Mapping[int, Path]    # text the user attached, by the N in "paste[N]"
