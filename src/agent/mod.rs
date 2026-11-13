@@ -759,7 +759,12 @@ impl Session {
             let continues = assistant.continues;
             let refused = assistant.refused;
             self.push(Message::Assistant(assistant), on_event).await;
-            if refused || (calls.is_empty() && !continues && self.inbox.is_empty()) {
+            if refused
+                || (calls.is_empty()
+                    && !continues
+                    && self.inbox.is_empty()
+                    && !self.context.jobs.has_notifications())
+            {
                 return Ok(());
             }
             Self::check_history_size(self.journal.bytes())?;

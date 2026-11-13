@@ -89,13 +89,25 @@ pub(crate) async fn serve(
     config_dir: &Path,
     replies: Vec<Reply>,
 ) -> (Provider, Arc<Mutex<Vec<Value>>>) {
-    let (provider, requests, _, _) =
-        serve_catalog(
-            config_dir,
-            replies,
-            serde_json::json!({"data": [{"id": "m", "context_window": 1_000_000, "max_tokens": 32_000}]}),
-        )
-        .await;
+    serve_with(config_dir, replies, |_| std::future::ready(())).await
+}
+
+pub(crate) async fn serve_with<F, Fut>(
+    config_dir: &Path,
+    replies: Vec<Reply>,
+    on_request: F,
+) -> (Provider, Arc<Mutex<Vec<Value>>>)
+where
+    F: FnMut(usize) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    let (provider, requests, _, _) = serve_catalog_with(
+        config_dir,
+        replies,
+        serde_json::json!({"data": [{"id": "m", "context_window": 1_000_000, "max_tokens": 32_000}]}),
+        on_request,
+    )
+    .await;
     (provider, requests)
 }
 
@@ -127,6 +139,24 @@ pub(crate) async fn serve_catalog(
     Arc<Mutex<Vec<Vec<u8>>>>,
     Arc<Mutex<Vec<String>>>,
 ) {
+    serve_catalog_with(config_dir, replies, catalog, |_| std::future::ready(())).await
+}
+
+async fn serve_catalog_with<F, Fut>(
+    config_dir: &Path,
+    replies: Vec<Reply>,
+    catalog: Value,
+    mut on_request: F,
+) -> (
+    Provider,
+    Arc<Mutex<Vec<Value>>>,
+    Arc<Mutex<Vec<Vec<u8>>>>,
+    Arc<Mutex<Vec<String>>>,
+)
+where
+    F: FnMut(usize) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     let headers = Arc::new(Mutex::new(Vec::new()));
     let heads_seen = Arc::clone(&headers);
     let raw = Arc::new(Mutex::new(Vec::new()));
@@ -137,6 +167,7 @@ pub(crate) async fn serve_catalog(
     let seen = Arc::clone(&requests);
     tokio::spawn(async move {
         let mut replies = std::collections::VecDeque::from(replies);
+        let mut post_index = 0usize;
         while !replies.is_empty() {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
@@ -183,6 +214,8 @@ pub(crate) async fn serve_catalog(
             seen.lock()
                 .unwrap()
                 .push(serde_json::from_slice(&request[body_start..]).unwrap());
+            on_request(post_index).await;
+            post_index += 1;
             tokio::time::sleep(reply.delay).await;
             let status = if reply.authorization.is_some_and(|value| {
                 !head

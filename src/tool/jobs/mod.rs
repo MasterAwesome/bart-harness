@@ -465,6 +465,11 @@ impl Jobs {
         !state.running.is_empty() || !state.notifications.is_empty()
     }
 
+    #[must_use]
+    pub(crate) fn has_notifications(&self) -> bool {
+        !self.state().notifications.is_empty()
+    }
+
     pub(crate) async fn wake_ready(&self) {
         loop {
             let changed = self.changed.notified();

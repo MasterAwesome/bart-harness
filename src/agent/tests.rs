@@ -2775,3 +2775,105 @@ async fn native_pauses_cross_the_proactive_threshold_and_refusals_are_retained_n
         }
     }
 }
+
+async fn assert_in_flight_job_notification(refusal: bool) {
+    use crate::provider::mock::{Reply, serve_with};
+    use crate::provider::{Custom, Protocol};
+    fn text_reply(reason: &str, text: &str) -> Reply {
+        Reply {
+            status: 200,
+            authorization: None,
+            delay: Duration::ZERO,
+            ends: false,
+            chunks: vec![
+                json!({"type":"message_start","message":{"id":"m","model":"m","usage":{"input_tokens":50,"output_tokens":1}}}),
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":text}}),
+                json!({"type":"content_block_stop","index":0}),
+                json!({"type":"message_delta","delta":{"stop_reason":reason},"usage":{"output_tokens":5}}),
+                json!({"type":"message_stop"}),
+            ],
+        }
+    }
+    let dir = TempDir::new("turn-in-flight-job-notification");
+    let release = dir.path().join("release");
+    let jobs_slot = Arc::new(std::sync::OnceLock::<Arc<crate::tool::Jobs>>::new());
+    let hook_jobs = Arc::clone(&jobs_slot);
+    let responses = if refusal {
+        vec![text_reply("refusal", "I cannot continue.")]
+    } else {
+        vec![
+            text_reply("end_turn", "Initial response."),
+            text_reply("end_turn", "Handled job notification."),
+        ]
+    };
+    let expected_requests = responses.len();
+    let (server, seen) = serve_with(dir.path(), responses, move |index| {
+        let release = release.clone();
+        let hook_jobs = Arc::clone(&hook_jobs);
+        async move {
+            if index == 0 {
+                std::fs::write(&release, b"").unwrap();
+                let jobs = hook_jobs.get().expect("jobs slot initialized");
+                tokio::time::timeout(Duration::from_secs(5), jobs.wake_ready())
+                    .await
+                    .unwrap();
+            }
+        }
+    })
+    .await;
+    let custom = Custom {
+        protocol: Protocol::Messages,
+        url: server.endpoint().unwrap().to_string(),
+        key: false,
+    };
+    let mut session = session_on(Provider::custom("mock", &custom).unwrap(), dir.path());
+    session.routing.assume(Some(model(32_000)));
+    assert!(jobs_slot.set(Arc::clone(&session.context.jobs)).is_ok());
+    let started = python(
+        &session,
+        r"bg_run(['sh', '-c', 'while [ ! -e release ]; do sleep .01; done; printf IN_FLIGHT_JOB'])",
+    )
+    .await;
+    assert!(!started.is_error(), "{}", started.text);
+    let (mut responded, mut notifications) = (0, 0);
+    let run = session.turn("Finish up.".to_owned().into(), |event: Event<'_>| {
+        responded += usize::from(matches!(event, Event::Responded(_)));
+        notifications += usize::from(matches!(event, Event::Notification(_)));
+    });
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap()
+        .unwrap();
+    let captured = seen.lock().unwrap().clone();
+    assert_eq!(
+        (captured.len(), responded),
+        (expected_requests, expected_requests)
+    );
+    if refusal {
+        assert_eq!(notifications, 0);
+        assert!(session.context.jobs.has_notifications());
+    } else {
+        assert_eq!(notifications, 1);
+        assert!(!session.context.jobs.has_notifications());
+        assert!(captured[1].to_string().contains("IN_FLIGHT_JOB"));
+        let history = session.journal().history();
+        assert!(matches!(
+            &history[history.len() - 2],
+            Message::Notification(note) if matches!(note.kind, NotificationKind::JobFinished { .. })
+        ));
+        let Message::Assistant(final_reply) = history.last().unwrap() else {
+            panic!()
+        };
+        assert!(final_reply.parts.iter().any(|part| matches!(
+            &part.content,
+            crate::history::Content::Text(text) if text.as_ref() == "Handled job notification."
+        )));
+    }
+    let _ = session.finish().await;
+}
+
+#[tokio::test]
+async fn turn_delivers_job_notifications_arriving_during_final_reply_unless_refused() {
+    assert_in_flight_job_notification(false).await;
+    assert_in_flight_job_notification(true).await;
+}
