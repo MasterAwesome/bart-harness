@@ -303,10 +303,7 @@ impl Scope {
                 }
                 self.reap()?;
                 self.tracker.refresh()?;
-                if self.target.is_none() && !self.tracker.live()? {
-                    return Ok(true);
-                }
-                io::Result::Ok(false)
+                io::Result::Ok(self.target.is_none() && !self.tracker.live()?)
             })();
             match attempt {
                 Ok(true) => return Ok(()),
