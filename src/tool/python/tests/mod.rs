@@ -1240,6 +1240,7 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
                 );
                 assert_eq!(text.contains("sandbox: bool"), escape, "{case}");
                 assert_eq!(text.contains("build.wait() instead"), one_turn, "{case}");
+                assert_eq!(text.contains("def wait(self)"), one_turn, "{case}");
                 assert_eq!(
                     text.contains("the message resumes you"),
                     !one_turn,
@@ -1269,6 +1270,24 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn job_wait_exists_only_in_one_turn_sessions() {
+    for one_turn in [false, true] {
+        let dir = TempDir::new("python-job-wait");
+        let context = session(dir.path(), Confinement::Unrestricted, 10_000);
+        context
+            .one_turn
+            .store(one_turn, std::sync::atomic::Ordering::Relaxed);
+        let code = if one_turn {
+            "j = bg_run(['true'])\nassert hasattr(j, 'wait')\nassert j.wait().return_code == 0"
+        } else {
+            "j = bg_run(['true'])\nassert not hasattr(j, 'wait')"
+        };
+        let output = cell(&context, code).await;
+        assert!(!output.is_error(), "{}", output.text);
     }
 }
 
@@ -2169,9 +2188,6 @@ os.chdir(child)
 assert pathlib.Path(run(probe).stdout.strip()) == base
 assert pathlib.Path(run(probe, cwd='directory with spaces').stdout.strip()) == child
 j = bg_run(['python3', '-c', "from pathlib import Path; Path('result').write_text('done')"], cwd=child)
-j.wait()
-assert (child / 'result').read_text() == 'done'
-assert not (base / 'result').exists()
 for invalid in ('', '\0', b'.'):
     for command in (run, bg_run):
         try:
@@ -2191,6 +2207,14 @@ assert not (base / 'must-not-run').exists()
 assert not (child / 'must-not-run').exists()
 "#).await;
     assert!(!output.is_error(), "{}", output.text);
+    time::timeout(Duration::from_secs(5), context.jobs.wake_ready())
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("directory with spaces/result")).unwrap(),
+        "done"
+    );
+    assert!(!dir.path().join("result").exists());
 }
 
 #[tokio::test]

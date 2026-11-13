@@ -400,10 +400,11 @@ class Job(Result):
             return getattr(self._snapshot(), name)
         raise AttributeError(name)
 
-    def wait(self):
-        while self._snapshot().outcome is None:
-            time.sleep(0.2)
-        return self
+    if _CONFIG["one_turn"]:
+        def wait(self):
+            while self._snapshot().outcome is None:
+                time.sleep(0.2)
+            return self
 
     def kill(self):
         """Stop this job; completed effects are not rolled back."""

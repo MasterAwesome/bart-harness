@@ -79,7 +79,7 @@ fn description(surface: &Surface<'_>) -> String {
     let mut text = header(surface);
     text.push_str(&files());
     text.push_str(&commands(surface.escape, surface.one_turn));
-    text.push_str(&types());
+    text.push_str(&types(surface.one_turn));
     if surface.web_search {
         text.push_str(WEB_SEARCH);
     }
@@ -225,7 +225,12 @@ def bg_run(argv: Sequence[str], *, notify: str | None = None,
     )
 }
 
-fn types() -> String {
+fn types(one_turn: bool) -> String {
+    let wait = if one_turn {
+        "    def wait(self) -> Job: ...\n"
+    } else {
+        ""
+    };
     format!(
         r#"class Result:
     return_code: int | None      # negative for a signal; None while a Job is running
@@ -242,8 +247,7 @@ fn types() -> String {
 class Job(Result):
     id: int
     command: str
-    def wait(self) -> Job: ...   # block until it ends; a cell timeout leaves it running
-    def kill(self) -> None: ...
+{wait}    def kill(self) -> None: ...
 
 class Cell:
     def remaining(self) -> Text:
@@ -333,6 +337,7 @@ pub(super) fn definition(surface: &Surface<'_>) -> Definition {
 fn helper_configuration(context: &Context) -> Value {
     json!({
         "escape": context.confinement().escape() == super::Escape::Offered,
+        "one_turn": context.one_turn.load(std::sync::atomic::Ordering::Relaxed),
         "saved_dir": context.spill_dir,
         "request_bytes": MAX_FRAME_BYTES,
         "process_default_seconds": super::execution::DEFAULT_SECONDS,

@@ -115,14 +115,19 @@ base = pathlib.Path.cwd()
 program = 'from pathlib import Path; import os; assert os.getcwd() == "/etc"; Path(' + repr(str(base/'allowed')) + ').write_text("ok")'
 run(['python3', '-c', program], cwd='/etc')
 j = bg_run(['python3', '-c', program], cwd='/etc')
-j.wait()
-assert j.return_code == 0
-assert (base/'allowed').read_text() == 'ok'
 r = run(['python3', '-c', 'from pathlib import Path; Path("config").write_text("bad")'], cwd=base/'.git', check=False)
 assert r.return_code != 0
 assert (base/'.git/config').read_text() == 'protected'
 "#).await;
     assert!(!output.is_error(), "{}", output.text);
+    time::timeout(Duration::from_secs(5), context.jobs.wake_ready())
+        .await
+        .unwrap();
+    text(&context, "assert j.return_code == 0", "").await;
+    assert_eq!(
+        fs::read_to_string(dir.path().join("allowed")).unwrap(),
+        "ok"
+    );
 }
 
 #[tokio::test]
