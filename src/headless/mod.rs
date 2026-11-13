@@ -11,9 +11,14 @@ use crate::{
 };
 
 pub(crate) enum Mode {
-    Prompt(String),
+    Prompt {
+        prompt: String,
+        jobs: crate::tool::BackgroundJobs,
+    },
     Stdin,
-    Json { id: String },
+    Json {
+        id: String,
+    },
 }
 
 pub(crate) async fn run(
@@ -25,9 +30,19 @@ pub(crate) async fn run(
     let result = {
         let running = async {
             match mode {
-                Mode::Prompt(prompt) => one_turn(&mut session, prompt, &mut terminations).await,
+                Mode::Prompt { prompt, jobs } => {
+                    one_turn(&mut session, prompt, jobs, &mut terminations).await
+                }
                 Mode::Stdin => match stdin_prompt(&mut terminations).await? {
-                    Some(prompt) => one_turn(&mut session, prompt, &mut terminations).await,
+                    Some(prompt) => {
+                        one_turn(
+                            &mut session,
+                            prompt,
+                            crate::tool::BackgroundJobs::Stop,
+                            &mut terminations,
+                        )
+                        .await
+                    }
                     None => Ok(()),
                 },
                 Mode::Json { id } => json::session(&mut session, &id, &mut terminations).await,
@@ -48,19 +63,23 @@ pub(crate) async fn run(
 async fn one_turn(
     session: &mut Session,
     prompt: String,
+    jobs: crate::tool::BackgroundJobs,
     terminations: &mut Terminations,
 ) -> Result<(), String> {
     session
         .tool_context()
-        .one_turn
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+        .set_turn_mode(crate::tool::TurnMode::Prompt(jobs));
     session.prewarm().await;
     let output = Output::default();
     let mut display = HeadlessDisplay::new(&output);
     let turn = session.turn(prompt.into(), |event: crate::agent::Event<'_>| {
         display.event(event);
     });
-    cancellable(turn, terminations, &output).await.map(|_| ())
+    let completed = cancellable(turn, terminations, &output).await?;
+    if completed && jobs == crate::tool::BackgroundJobs::Keep {
+        session.jobs().keep_background().await?;
+    }
+    Ok(())
 }
 
 async fn stdin_prompt(terminations: &mut Terminations) -> Result<Option<String>, String> {

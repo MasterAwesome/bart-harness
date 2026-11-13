@@ -437,3 +437,27 @@ with tempfile.TemporaryDirectory(prefix="bart-mcp-diagnostic-") as root:
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn inherited_jail_rejects_background_survival_before_opening_a_session() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("config/bart")).unwrap();
+    fs::write(
+        dir.path().join("config/bart/settings.json"),
+        r#"{"permissions":{"sandbox":{"enabled":true}}}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_bart"))
+        .args(["--prompt", "test", "--keep-background-jobs"])
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--keep-background-jobs cannot be used in a jail")
+    );
+    assert!(!dir.path().join("state/bart/sessions").exists());
+}

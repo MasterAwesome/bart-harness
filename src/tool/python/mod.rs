@@ -71,15 +71,15 @@ pub(super) struct Surface<'a> {
     pub(super) python: &'a str,
     pub(super) escape: bool,
     pub(super) web_search: bool,
-    pub(super) one_turn: bool,
+    pub(super) mode: super::TurnMode,
     pub(super) mcp_servers: &'a [String],
 }
 
 fn description(surface: &Surface<'_>) -> String {
     let mut text = header(surface);
     text.push_str(&files());
-    text.push_str(&commands(surface.escape, surface.one_turn));
-    text.push_str(&types(surface.one_turn));
+    text.push_str(&commands(surface.escape, surface.mode));
+    text.push_str(&types(surface.mode.one_turn()));
     if surface.web_search {
         text.push_str(WEB_SEARCH);
     }
@@ -161,11 +161,18 @@ def write(path: str | PathLike[str], content: str) -> None:
     )
 }
 
-fn commands(escape: bool, one_turn: bool) -> String {
-    let ending = if one_turn {
-        "This session ends with your turn and stops its jobs: when you need a job's result, call\n    build.wait() instead of ending the turn."
-    } else {
-        "When only the job remains, end the turn with a one-line status; the message resumes you."
+fn commands(escape: bool, mode: super::TurnMode) -> String {
+    use super::{BackgroundJobs, TurnMode};
+    let ending = match mode {
+        TurnMode::Prompt(BackgroundJobs::Stop) => {
+            "This session ends with your turn and stops its jobs: when you need a job's result, call\n    build.wait() instead of ending the turn."
+        }
+        TurnMode::Prompt(BackgroundJobs::Keep) => {
+            "This session ends with your turn. Background jobs survive successful completion; the caller owns cleanup.\n    When you need a job's result, call build.wait() instead of ending the turn."
+        }
+        TurnMode::Session => {
+            "When only the job remains, end the turn with a one-line status; the message resumes you."
+        }
     };
     let default = super::execution::DEFAULT_SECONDS;
     let (run_escape, run_doc, bg_escape, bg_doc) = if escape {
@@ -337,7 +344,7 @@ pub(super) fn definition(surface: &Surface<'_>) -> Definition {
 fn helper_configuration(context: &Context) -> Value {
     json!({
         "escape": context.confinement().escape() == super::Escape::Offered,
-        "one_turn": context.one_turn.load(std::sync::atomic::Ordering::Relaxed),
+        "one_turn": context.turn_mode().one_turn(),
         "saved_dir": context.spill_dir,
         "request_bytes": MAX_FRAME_BYTES,
         "process_default_seconds": super::execution::DEFAULT_SECONDS,

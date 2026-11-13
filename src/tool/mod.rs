@@ -34,6 +34,25 @@ pub(crate) struct Definition {
     pub(crate) parameters: Value,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BackgroundJobs {
+    Stop,
+    Keep,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TurnMode {
+    #[default]
+    Session,
+    Prompt(BackgroundJobs),
+}
+
+impl TurnMode {
+    pub(crate) fn one_turn(self) -> bool {
+        matches!(self, Self::Prompt(_))
+    }
+}
+
 pub(crate) struct Context {
     pub(crate) cwd: PathBuf,
     pub(crate) executable: PathBuf,
@@ -41,7 +60,7 @@ pub(crate) struct Context {
     artifacts: Arc<output::Storage>,
     output_budget: usize,
     pub(crate) diffs: std::sync::atomic::AtomicBool,
-    pub(crate) one_turn: std::sync::atomic::AtomicBool,
+    turn_mode: std::sync::Mutex<TurnMode>,
     environment: std::sync::Mutex<(Confinement, Arc<crate::mcp::Registry>)>,
     pub(crate) jobs: Arc<Jobs>,
     pub(crate) live: Arc<Live>,
@@ -60,6 +79,14 @@ struct Identity {
 }
 
 impl Context {
+    pub(crate) fn turn_mode(&self) -> TurnMode {
+        *self.turn_mode.lock().expect(crate::NOT_POISONED)
+    }
+
+    pub(crate) fn set_turn_mode(&self, mode: TurnMode) {
+        *self.turn_mode.lock().expect(crate::NOT_POISONED) = mode;
+    }
+
     pub(crate) fn identify(&self, provider: &str, model: &str, reasoning_effort: Option<&str>) {
         *self.identity.lock().expect(crate::NOT_POISONED) = Some(Identity {
             provider: provider.into(),
@@ -92,7 +119,7 @@ impl Context {
             spill_dir,
             output_budget,
             diffs: std::sync::atomic::AtomicBool::new(true),
-            one_turn: std::sync::atomic::AtomicBool::new(false),
+            turn_mode: std::sync::Mutex::default(),
             environment: std::sync::Mutex::new((confinement, mcp)),
             jobs: Arc::new(Jobs::after(highest_job)),
             live: Arc::default(),
@@ -312,7 +339,7 @@ pub(crate) async fn definitions(context: &Context) -> Vec<Definition> {
         python: &python,
         escape: context.confinement().escape() == Escape::Offered,
         web_search: context.searches(),
-        one_turn: context.one_turn.load(std::sync::atomic::Ordering::Relaxed),
+        mode: context.turn_mode(),
         mcp_servers: &mcp_servers,
     })]
 }

@@ -108,3 +108,20 @@ fn the_command_line_refuses_ambiguity_and_keeps_prompts_verbatim() {
         })
     );
 }
+
+#[test]
+fn keeping_background_jobs_requires_a_persistent_unsandboxed_prompt() {
+    for args in [
+        vec!["--keep-background-jobs"],
+        vec!["--json", "--keep-background-jobs"],
+        vec!["-p", "test", "--keep-background-jobs", "--temporary"],
+        vec!["-p", "test", "--keep-background-jobs", "--jail"],
+    ] {
+        assert!(parsed(&args).is_err(), "{args:?}");
+    }
+    let Invocation::Chat(chat) = parsed(&["-p", "test", "--keep-background-jobs"]).unwrap() else {
+        panic!()
+    };
+    assert!(chat.keep_background_jobs);
+    assert_eq!(chat.prompt.as_deref(), Some("test"));
+}

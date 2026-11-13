@@ -67,3 +67,21 @@ for request in [b'{"Unknown":{}}\n', b'x' * 4097]:
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn keeping_jobs_survives_the_actual_cli_exit_but_not_cancellation() {
+    let result = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/keep_background.py"
+        ))
+        .arg(env!("CARGO_BIN_EXE_bart"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

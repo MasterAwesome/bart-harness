@@ -20,6 +20,8 @@ use macos as sys;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("process supervision supports only Linux and macOS");
 
+pub(crate) mod handoff;
+
 pub(crate) const MODE: &str = "--bart-process-supervisor";
 pub(crate) const DETACHED_MODE: &str = "--bart-detached";
 
@@ -57,11 +59,14 @@ pub(crate) enum Request {
     Start {},
     Interrupt {},
     Kill {},
+    Detach {},
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum Event {
     Started {},
+    Detaching {},
+    Detached {},
     TargetExited { status: i32, survivors: bool },
     Empty {},
     Failed { reason: String },
@@ -198,17 +203,24 @@ impl Wake {
             }
         }
     }
-    fn wait(&self, control: Option<BorrowedFd<'_>>, timeout: Option<Duration>) -> io::Result<()> {
+    fn wait(
+        &self,
+        inputs: [Option<BorrowedFd<'_>>; 2],
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        let mut fds = vec![PollFd::new(&self.signals, PollFlags::IN)];
-        if let Some(control) = &control {
-            fds.push(PollFd::new(control, PollFlags::IN));
+        let mut fds = std::array::from_fn::<_, 3, _>(|_| PollFd::new(&self.signals, PollFlags::IN));
+        for (slot, input) in fds[1..].iter_mut().zip(inputs.iter().flatten()) {
+            *slot = PollFd::new(input, PollFlags::IN);
         }
         let timeout = timeout
             .map(Timespec::try_from)
             .transpose()
             .map_err(io::Error::other)?;
-        match poll(&mut fds, timeout.as_ref()) {
+        match poll(
+            &mut fds[..=inputs.iter().flatten().count()],
+            timeout.as_ref(),
+        ) {
             Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
             Err(error) => Err(error.into()),
         }
@@ -271,11 +283,32 @@ impl Scope {
                 .tracker
                 .timeout()
                 .map_or(left, |timeout| timeout.min(left));
-            if let Err(error) = self.wake.wait(None, Some(timeout)) {
+            if let Err(error) = self.wake.wait([None, None], Some(timeout)) {
                 failure = Some(error);
             }
         }
     }
+    fn detached(&mut self, mut streams: [Option<std::os::fd::OwnedFd>; 2]) -> io::Result<()> {
+        loop {
+            self.wake.drain()?;
+            self.reap()?;
+            self.tracker.refresh()?;
+            for stream in &mut streams {
+                handoff::drain(stream)?;
+            }
+            if self.target.is_none() && !self.tracker.live()? && streams.iter().all(Option::is_none)
+            {
+                return self.tracker.release();
+            }
+            self.wake.wait(
+                streams
+                    .each_ref()
+                    .map(|stream| stream.as_ref().map(AsFd::as_fd)),
+                self.tracker.timeout(),
+            )?;
+        }
+    }
+
     fn run(&mut self, control: &mut UnixStream, adopt: bool) -> io::Result<()> {
         let mut reported = false;
         let mut pending = Vec::new();
@@ -299,6 +332,17 @@ impl Scope {
                             if byte == b'\n' {
                                 match serde_json::from_slice::<Request>(&pending)? {
                                     Request::Kill {} => kill = true,
+                                    Request::Detach {} => {
+                                        if kill || !adopt {
+                                            return Err(io::Error::other(
+                                                "cannot detach this scope",
+                                            ));
+                                        }
+                                        report(control, Event::Detaching {})?;
+                                        let streams = handoff::receive(control)?;
+                                        report(control, Event::Detached {})?;
+                                        return self.detached(streams);
+                                    }
                                     Request::Interrupt {} => {
                                         // Only signal the still-unreaped target, in this namespace.
                                         if let Some(target) = self.target {
@@ -341,7 +385,7 @@ impl Scope {
                 return Ok(());
             }
             self.wake
-                .wait(Some(control.as_fd()), self.tracker.timeout())?;
+                .wait([Some(control.as_fd()), None], self.tracker.timeout())?;
         }
     }
 }

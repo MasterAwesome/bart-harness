@@ -46,12 +46,15 @@ struct ChatArgs {
     effort: Option<String>,
     #[arg(
         long,
+        short = 'p',
         value_name = "TEXT",
         allow_hyphen_values = true,
         value_parser = nonblank,
         help = "Run headless with this prompt, taken verbatim even when it starts with a dash",
     )]
     prompt: Option<String>,
+    #[arg(long, requires = "prompt", conflicts_with_all = ["temporary", "jail", "json"], help = "Keep background jobs after successful -p completion; caller must clean them up")]
+    keep_background_jobs: bool,
     #[arg(
         long,
         conflicts_with = "prompt",
@@ -156,6 +159,7 @@ pub(crate) struct Chat {
     pub(crate) model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) prompt: Option<String>,
+    pub(crate) keep_background_jobs: bool,
     pub(crate) json: bool,
     pub(crate) jail: Option<Network>,
     pub(crate) approval: Option<Mode>,
@@ -201,6 +205,7 @@ pub(crate) fn parse(
                 model: chat.model,
                 reasoning_effort: chat.effort,
                 prompt: chat.prompt,
+                keep_background_jobs: chat.keep_background_jobs,
                 json: chat.json,
                 jail: chat.jail.then_some(network),
                 approval: chat

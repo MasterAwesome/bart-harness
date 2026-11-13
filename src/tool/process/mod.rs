@@ -139,19 +139,30 @@ impl Process {
 
     pub(super) async fn finish_watched(
         self,
+        handoff: tokio::sync::oneshot::Receiver<super::jobs::Handoff>,
         collector: Collector,
         live: &mut Run,
         observe: impl FnMut(&str),
         on_exit: impl FnMut(JobOutcome),
         cancel: tokio_util::sync::CancellationToken,
-    ) -> (String, ProgramResult, Completion) {
+    ) -> Option<(String, ProgramResult, Completion)> {
         let progress = live.progress().clone();
         let observation = std::sync::Arc::clone(&self.observation);
-        let Collected::Done(mut text, saved, outcome, completion, streams) = self
-            .collect(collector, &progress, None, observe, on_exit, cancel)
+        let (mut text, saved, outcome, completion, streams) = match self
+            .collect(
+                collector,
+                &progress,
+                Collection::Background { handoff, cancel },
+                observe,
+                on_exit,
+            )
             .await
-        else {
-            unreachable!("background collections never adopt")
+        {
+            Collected::Done(text, saved, outcome, completion, streams) => {
+                (text, saved, outcome, completion, streams)
+            }
+            Collected::Detached => return None,
+            Collected::Adopt(_) => unreachable!("background collections never adopt"),
         };
         text.truncate(text.trim_end_matches('\n').len());
         let result = ProgramResult::new(
@@ -169,7 +180,7 @@ impl Process {
                 super::Status::Failed
             });
         }
-        (text, result, completion)
+        Some((text, result, completion))
     }
 
     pub(super) async fn finish_result(
@@ -185,15 +196,15 @@ impl Process {
             .collect(
                 collector,
                 live,
-                Some(timeout),
+                Collection::Foreground(timeout),
                 |_| {},
                 |_| {},
-                tokio_util::sync::CancellationToken::new(),
             )
             .await;
         let mut adopted = None;
         let (outcome, output_file, [stdout_file, stderr_file]) = loop {
             match result {
+                Collected::Detached => unreachable!("foreground commands cannot detach"),
                 Collected::Done(_, saved, outcome, _, streams) => {
                     break (
                         outcome,
@@ -226,10 +237,9 @@ impl Process {
                                 .collect(
                                     collector,
                                     live,
-                                    Some(timeout),
+                                    Collection::Foreground(timeout),
                                     |_| {},
                                     |_| {},
-                                    tokio_util::sync::CancellationToken::new(),
                                 )
                                 .await;
                         }
@@ -250,11 +260,18 @@ impl Process {
         mut self,
         mut collector: Collector,
         live: &Progress,
-        timeout: Option<Duration>,
+        mode: Collection,
         mut observe: impl FnMut(&str),
         mut on_exit: impl FnMut(JobOutcome),
-        cancel: tokio_util::sync::CancellationToken,
     ) -> Collected {
+        let (timeout, mut handoff, cancel) = match mode {
+            Collection::Foreground(timeout) => (
+                Some(timeout),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            ),
+            Collection::Background { handoff, cancel } => (None, Some(handoff), cancel),
+        };
         let cancel = self
             .reservation
             .as_ref()
@@ -279,6 +296,43 @@ impl Process {
         let mut lines = Vec::new();
         while !(end_stdout && end_stderr && scope.is_some()) {
             tokio::select! {
+                request = async {
+                    match &mut handoff {
+                        Some(receive) => receive.await.ok(),
+                        None => std::future::pending().await,
+                    }
+                }, if !cancelled && !timed_out => {
+                    handoff = None;
+                    if let Some(reply) = request {
+                        let result = async {
+                            use std::os::fd::AsFd;
+                            if !collector.persist_until(time::Instant::now() + DRAIN).await {
+                                return Err(io::Error::other("cannot flush job output"));
+                            }
+                            self.child.detach(crate::supervise::handoff::Streams {
+                                stdout: self.pipe.as_fd(),
+                                stderr: self.stderr.as_fd(),
+                            }).await
+                        }.await.map_err(|error| error.to_string());
+                        match result {
+                            Ok(crate::child::DetachOutcome::Detached) => {
+                                let _ = reply.send(super::jobs::HandoffResult::Detached);
+                                return Collected::Detached;
+                            }
+                            Ok(crate::child::DetachOutcome::Finished) => {
+                                let _ = reply.send(super::jobs::HandoffResult::Finished);
+                                scope = Some(Ok(crate::child::Empty));
+                                drain.as_mut().reset(time::Instant::now() + DRAIN);
+                            }
+                            Err(error) => {
+                                let _ = reply.send(super::jobs::HandoffResult::Failed(error));
+                                self.child.kill();
+                                cancelled = true;
+                                drain.as_mut().reset(time::Instant::now() + DRAIN);
+                            }
+                        }
+                    }
+                },
                 (source, read) = async {
                     tokio::select! {
                         read = self.pipe.read(&mut buffer), if !end_stdout => (0, read),
@@ -358,6 +412,11 @@ impl Process {
                     drain.as_mut().reset(time::Instant::now() + DRAIN);
                 },
             }
+        }
+        if let Some(mut receive) = handoff.take()
+            && let Ok(reply) = receive.try_recv()
+        {
+            let _ = reply.send(super::jobs::HandoffResult::Finished);
         }
         if adopt {
             for source in 0..2 {
@@ -506,7 +565,16 @@ impl ProgramResult {
     }
 }
 
+enum Collection {
+    Foreground(Duration),
+    Background {
+        handoff: tokio::sync::oneshot::Receiver<super::jobs::Handoff>,
+        cancel: tokio_util::sync::CancellationToken,
+    },
+}
+
 enum Collected {
+    Detached,
     Done(
         String,
         SavedArtifact,

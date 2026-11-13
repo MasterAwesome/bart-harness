@@ -13,6 +13,11 @@ use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
 };
 
+pub(crate) enum DetachOutcome {
+    Detached,
+    Finished,
+}
+
 pub(crate) struct Prepared {
     command: Command,
     listener: UnixListener,
@@ -176,6 +181,47 @@ impl Owner {
             Err(error) => Err(error),
         }
     }
+    pub(crate) async fn detach(
+        &mut self,
+        streams: crate::supervise::handoff::Streams<'_>,
+    ) -> io::Result<DetachOutcome> {
+        if self.empty {
+            return Ok(DetachOutcome::Finished);
+        }
+        if self.request(Request::Detach {}).is_err() {
+            self.empty().await?;
+            return Ok(DetachOutcome::Finished);
+        }
+        loop {
+            match self.read_event().await? {
+                Event::Detaching {} => break,
+                event @ Event::TargetExited { .. } => self.accept_event(event)?,
+                event @ Event::Empty {} => {
+                    self.accept_event(event)?;
+                    self.reap().await?;
+                    return Ok(DetachOutcome::Finished);
+                }
+                _ => return Err(io::Error::other("supervisor refused job handoff")),
+            }
+        }
+        crate::supervise::handoff::send(
+            self.control.as_ref().expect("connected").get_ref(),
+            streams,
+        )?;
+        if !matches!(self.read_event().await?, Event::Detached {}) {
+            return Err(io::Error::other(
+                "supervisor did not acknowledge job handoff",
+            ));
+        }
+        self.control = None;
+        if let Some(mut child) = self.child.take() {
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+        Ok(DetachOutcome::Detached)
+    }
+
     pub(crate) fn interrupt(&self) -> io::Result<()> {
         self.request(Request::Interrupt {})
     }
@@ -211,41 +257,47 @@ impl Owner {
             }
         }
     }
-    async fn event(&mut self) -> io::Result<()> {
+    fn accept_event(&mut self, event: Event) -> io::Result<()> {
         use std::os::unix::process::ExitStatusExt;
+        match event {
+            Event::Started {} if !self.started && self.target.is_none() && !self.empty => {
+                self.started = true;
+            }
+            Event::TargetExited { status, survivors }
+                if self.started && self.target.is_none() && !self.empty =>
+            {
+                let exit = ExitStatus::from_raw(status);
+                let valid = (status & !0xff00 == 0)
+                    || (status & !0xff == 0 && status & 0x7f > 0 && status & 0x7f < 0x7f);
+                if !valid || (exit.code().is_none() && exit.signal().is_none()) {
+                    return Err(io::Error::other("invalid target exit status"));
+                }
+                self.target = Some(TargetExit {
+                    status: exit,
+                    survivors,
+                });
+            }
+            Event::Empty {} if self.target.is_some() && !self.empty => self.empty = true,
+            Event::Failed { reason } => {
+                let phase = if self.started {
+                    "supervisor cleanup failed"
+                } else {
+                    "supervisor failed before program start"
+                };
+                return Err(io::Error::other(format!("{phase}: {reason}")));
+            }
+            _ => return Err(io::Error::other("invalid supervisor event ordering")),
+        }
+        Ok(())
+    }
+
+    async fn event(&mut self) -> io::Result<()> {
         let result = async {
             if let Some(error) = &self.failure {
                 return Err(io::Error::other(error.clone()));
             }
-            match self.read_event().await? {
-                Event::Started {} if !self.started && self.target.is_none() && !self.empty => {
-                    self.started = true
-                }
-                Event::TargetExited { status, survivors }
-                    if self.started && self.target.is_none() && !self.empty =>
-                {
-                    let exit = ExitStatus::from_raw(status);
-                    let valid = (status & !0xff00 == 0)
-                        || (status & !0xff == 0 && status & 0x7f > 0 && status & 0x7f < 0x7f);
-                    if !valid || (exit.code().is_none() && exit.signal().is_none()) {
-                        return Err(io::Error::other("invalid target exit status"));
-                    }
-                    self.target = Some(TargetExit {
-                        status: exit,
-                        survivors,
-                    });
-                }
-                Event::Empty {} if self.target.is_some() && !self.empty => self.empty = true,
-                Event::Failed { reason } => {
-                    let phase = if self.started {
-                        "supervisor cleanup failed"
-                    } else {
-                        "supervisor failed before program start"
-                    };
-                    return Err(io::Error::other(format!("{phase}: {reason}")));
-                }
-                _ => return Err(io::Error::other("invalid supervisor event ordering")),
-            }
+            let event = self.read_event().await?;
+            self.accept_event(event)?;
             Ok(())
         }
         .await;

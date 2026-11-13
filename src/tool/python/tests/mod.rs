@@ -1230,7 +1230,11 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
                     python: "Python 3.12.3 (/usr/bin/python3)",
                     escape,
                     web_search,
-                    one_turn,
+                    mode: if one_turn {
+                        crate::tool::TurnMode::Prompt(crate::tool::BackgroundJobs::Stop)
+                    } else {
+                        crate::tool::TurnMode::Session
+                    },
                     mcp_servers,
                 })
                 .description;
@@ -1278,9 +1282,11 @@ async fn job_wait_exists_only_in_one_turn_sessions() {
     for one_turn in [false, true] {
         let dir = TempDir::new("python-job-wait");
         let context = session(dir.path(), Confinement::Unrestricted, 10_000);
-        context
-            .one_turn
-            .store(one_turn, std::sync::atomic::Ordering::Relaxed);
+        context.set_turn_mode(if one_turn {
+            crate::tool::TurnMode::Prompt(crate::tool::BackgroundJobs::Stop)
+        } else {
+            crate::tool::TurnMode::Session
+        });
         let code = if one_turn {
             "j = bg_run(['true'])\nassert hasattr(j, 'wait')\nassert j.wait().return_code == 0"
         } else {
@@ -1589,7 +1595,7 @@ async fn every_name_the_stub_defines_exists_in_cells_with_its_parameters() {
         python: "Python 3",
         escape: false,
         web_search: false,
-        one_turn: false,
+        mode: crate::tool::TurnMode::Session,
         mcp_servers: &["fx".to_owned()],
     })
     .description;
@@ -2783,4 +2789,29 @@ print(j)
     )
     .await;
     assert!(!stopped.is_error(), "{}", stopped.text);
+}
+
+#[test]
+fn prompt_description_states_the_selected_background_job_lifetime() {
+    use crate::tool::{BackgroundJobs, TurnMode};
+    for jobs in [BackgroundJobs::Stop, BackgroundJobs::Keep] {
+        let text = super::definition(&super::Surface {
+            python: "Python 3",
+            escape: false,
+            web_search: false,
+            mode: TurnMode::Prompt(jobs),
+            mcp_servers: &[],
+        })
+        .description;
+        assert_eq!(
+            text.contains("stops its jobs"),
+            jobs == BackgroundJobs::Stop
+        );
+        assert_eq!(
+            text.contains("survive successful completion"),
+            jobs == BackgroundJobs::Keep
+        );
+        assert!(text.contains("build.wait() instead"));
+        assert!(text.contains("def wait(self)"));
+    }
 }

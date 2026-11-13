@@ -179,6 +179,9 @@ pub(crate) enum NotificationKind {
     JobLost {
         id: u32,
     },
+    JobDetached {
+        id: u32,
+    },
     JobFinished {
         id: u32,
         outcome: JobOutcome,
@@ -221,7 +224,9 @@ impl Notification {
             NotificationKind::Recovery
             | NotificationKind::JobMatched { .. }
             | NotificationKind::JobCommandExited { .. } => None,
-            NotificationKind::JobLost { id } | NotificationKind::JobFinished { id, .. } => Some(id),
+            NotificationKind::JobLost { id }
+            | NotificationKind::JobFinished { id, .. }
+            | NotificationKind::JobDetached { id } => Some(id),
         }
     }
 }

@@ -309,6 +309,7 @@ async fn chat(
         model,
         reasoning_effort,
         prompt,
+        keep_background_jobs,
         json,
         jail,
         approval,
@@ -329,6 +330,9 @@ async fn chat(
     let terminations = signals::Terminations::listen()
         .map_err(|error| format!("cannot listen for signals: {error}"))?;
     let confinement = preferences.effective.permissions.confinement()?;
+    if keep_background_jobs && !matches!(confinement, tool::Confinement::Unrestricted) {
+        return Err("--keep-background-jobs cannot be used in a jail".into());
+    }
     let interactive =
         prompt.is_none() && !json && io::stdin().is_terminal() && io::stdout().is_terminal();
     if !interactive && preferences.effective.permissions.approval.mode() == Mode::Manual {
@@ -398,7 +402,14 @@ async fn chat(
     crate::terminal_text::stderr_line(format_args!("{}", settings.describe(confinement)));
     let (session, id) = opener.open(settings, preferences, resumed).await?;
     let mode = match prompt {
-        Some(prompt) => headless::Mode::Prompt(prompt),
+        Some(prompt) => headless::Mode::Prompt {
+            prompt,
+            jobs: if keep_background_jobs {
+                tool::BackgroundJobs::Keep
+            } else {
+                tool::BackgroundJobs::Stop
+            },
+        },
         None if json => headless::Mode::Json { id },
         None => headless::Mode::Stdin,
     };

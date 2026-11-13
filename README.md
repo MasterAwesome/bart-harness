@@ -106,6 +106,20 @@ are used by starting a message with `/<name>`.
 piped to `bart` does the same. Background jobs stop when that turn ends. Continue the
 session later with `--resume` or `--session ID`.
 
+For externally managed environments, `bart -p "…" --keep-background-jobs` keeps
+background commands and their descendants alive after successful completion. The
+caller must clean them up (for example, by stopping their container). Cancellation
+and errors still stop jobs. The Python interpreter always exits. Finite work must
+still be awaited with `job.wait()`; this method is only available in one-turn mode.
+The flag cannot be combined with `--jail` or `--temporary`. Output captured before
+handoff remains available; subsequent stdout/stderr are drained and discarded so retained jobs can continue writing without
+broken pipes. Bart and Python exit; the existing native supervisors remain only to
+drain pipes and reap descendants. No further model turns or completion notifications
+occur, and resuming the session does not reconnect to retained jobs.
+If handing off several jobs fails partway through,
+Bart reports an error and cleans up jobs it still owns; already detached jobs remain
+the caller's responsibility.
+
 `bart --json` runs a whole session over JSON lines. Write `{"type":"user","text":"…"}`
 to stdin to start a turn (or to steer a running one), `{"type":"interrupt"}` to stop
 it and `{"type":"compact"}` to compact; closing stdin ends the session and stops its
@@ -113,13 +127,7 @@ jobs. Events arrive on stdout, one object per line, each with a `type`: `session
 `turn_started`, `text`, `reasoning`, `tool_started`, `tool_finished`, `job_finished`,
 `job_matched`, `usage` and `turn_done`. `turn_done` carries the final message and
 `jobs_running`; when a job ends, a turn with cause `job` starts by itself.
-To keep jobs alive without automatic model turns, send
-`{"type":"set_auto_wake","enabled":false}` while idle, before starting work.
-`auto_wake_changed` acknowledges the setting; `turn_done.auto_wake` confirms it.
-Jobs continue running, but their notifications cannot start another turn until
-auto-wake is re-enabled. Explicit user and compact requests still work. Closing
-stdin still stops the session and its jobs.
-A compact or auto-wake setting request during a turn, or a user message exceeding the pending-input budget,
+A compact request during a turn, or a user message exceeding the pending-input budget,
 produces `request_rejected` with `request` and `error` fields. Retry after `turn_done`.
 A `retrying` event with `discarded: true` replaces the failed attempt's displayed text
 with its `message` field. Closing stdin also interrupts an active turn.

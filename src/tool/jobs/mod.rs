@@ -6,6 +6,7 @@ use std::{
     },
 };
 
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -110,11 +111,21 @@ impl Request {
     }
 }
 
+pub(super) enum HandoffResult {
+    Detached,
+    Finished,
+    Failed(String),
+}
+
+pub(super) type Handoff = tokio::sync::oneshot::Sender<HandoffResult>;
+const HANDOFF_TIMEOUT: std::time::Duration = crate::supervise::CLEANUP.saturating_mul(2);
+
 struct Running {
     background: bool,
     cancel: CancellationToken,
     command: super::execution::Argv,
     capture: Option<Value>,
+    handoff: Option<tokio::sync::oneshot::Sender<Handoff>>,
 }
 
 const MATCHED_LINE_BYTES: usize = 200;
@@ -191,6 +202,7 @@ impl Jobs {
                 cancel: cancel.clone(),
                 command: command.clone(),
                 capture: None,
+                handoff: None,
             },
         );
         Ok(Reservation {
@@ -240,7 +252,9 @@ impl Jobs {
             .expect("reserved job slot")
             .command
             .clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
         let job = state.running.get_mut(&id).expect("reserved job slot");
+        job.handoff = Some(send);
         job.background = true;
         let [stdout_file, stderr_file] = collector.saved_streams([false; 2]);
         job.capture = Some(serde_json::json!({
@@ -256,8 +270,9 @@ impl Jobs {
         let cancel = reservation.cancel.clone();
         let artifacts_storage = Arc::clone(collector.storage());
         tokio::spawn(async move {
-            let (mut output, result, completion) = process
+            let Some((mut output, result, completion)) = process
                 .finish_watched(
+                    receive,
                     collector,
                     &mut run,
                     |line| {
@@ -286,7 +301,10 @@ impl Jobs {
                     },
                     cancel,
                 )
-                .await;
+                .await
+            else {
+                return;
+            };
             let (result, saved) = tokio::task::spawn_blocking(move || {
                 let saved = super::output::save(
                     &artifacts_storage,
@@ -461,6 +479,51 @@ impl Jobs {
 
     pub(crate) fn take_notifications(&self) -> Vec<Notification> {
         std::mem::take(&mut self.state().notifications)
+    }
+
+    pub(crate) async fn keep_background(&self) -> Result<(), String> {
+        let pending: Vec<_> = self
+            .state()
+            .running
+            .iter_mut()
+            .filter_map(|(&id, job)| job.handoff.take().map(|send| (id, send)))
+            .collect();
+        let deadline = tokio::time::Instant::now() + HANDOFF_TIMEOUT;
+        let mut replies = FuturesUnordered::new();
+        for (id, send) in pending {
+            let (reply, received) = tokio::sync::oneshot::channel();
+            if send.send(reply).is_ok() {
+                replies
+                    .push(async move { (id, tokio::time::timeout_at(deadline, received).await) });
+            }
+        }
+        let mut failure = None;
+        while let Some((id, result)) = replies.next().await {
+            let result = match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => {
+                    HandoffResult::Failed("collector closed without a handoff result".into())
+                }
+                Err(_) => HandoffResult::Failed("handoff timed out".into()),
+            };
+            match result {
+                HandoffResult::Detached => {
+                    self.state().notifications.push(Notification {
+                        text: bart!(Job, "job[{id}] kept running after session exit; caller owns cleanup; subsequent stdout/stderr are discarded").into(),
+                        kind: NotificationKind::JobDetached { id },
+                    });
+                }
+                HandoffResult::Finished => {}
+                HandoffResult::Failed(reason) => {
+                    failure.get_or_insert_with(|| format!("cannot keep job[{id}]: {reason}"));
+                }
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        self.settled().await;
+        Ok(())
     }
 
     pub(crate) fn stop_all(&self) {
