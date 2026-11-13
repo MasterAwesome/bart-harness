@@ -198,7 +198,8 @@ def run(argv: Sequence[str], *, timeout: float = {default}, check: bool = True,
     The view is [Bart run: cell[N].run[M] exit E], then combined stdout and stderr.
     A nonzero exit or signal raises RunError and stops the cell unless caught; its .result
     holds the outcome and captured output; the error message is its view. Pass check=False
-    to inspect an expected nonzero result. Timeouts and unknown outcomes always raise.
+    to inspect an expected nonzero result. Like a shell, a program that cannot start exits
+    127 (not found) or 126 (cannot execute). Timeouts and unknown outcomes always raise.
     bool(r) is true for exit 0.
     A failing run whose view is not shown is reported after the cell's output.
     The program starts in the session's working directory with the session's environment;

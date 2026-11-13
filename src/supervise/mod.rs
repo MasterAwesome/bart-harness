@@ -52,11 +52,12 @@ pub(crate) fn detached_main() -> ExitCode {
 }
 pub(crate) const FRAME_BYTES: usize = 4096;
 pub(crate) const CLEANUP: Duration = Duration::from_secs(5);
+const EXEC_DIAGNOSTIC_NAME_BYTES: usize = 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) enum Request {
-    Start {},
+    Start { exit_on_exec: bool },
     Interrupt {},
     Kill {},
     Detach {},
@@ -74,10 +75,52 @@ pub(crate) enum Event {
 fn report(control: &mut UnixStream, event: Event) -> io::Result<()> {
     let mut bytes = serde_json::to_vec(&event)?;
     if bytes.len() >= FRAME_BYTES {
-        return Err(io::Error::other("supervisor event exceeds limit"));
+        return Err(io::Error::other("process monitor event exceeds limit"));
     }
     bytes.push(b'\n');
     control.write_all(&bytes)
+}
+
+fn exec_failure(
+    control: &mut UnixStream,
+    null: &std::fs::File,
+    program: &std::ffi::OsStr,
+    error: &io::Error,
+) -> io::Result<()> {
+    let name = program.to_string_lossy();
+    let (code, reason) = if error.kind() == io::ErrorKind::NotFound {
+        let detail = if !program.as_encoded_bytes().contains(&b'/') {
+            "command not found".to_owned()
+        } else if std::fs::metadata(program).is_ok() {
+            "No such file or directory (missing interpreter)".to_owned()
+        } else {
+            crate::terminal_text::io_reason(error)
+        };
+        (127, detail)
+    } else if error.kind() == io::ErrorKind::PermissionDenied
+        && std::fs::metadata(program).is_ok_and(|meta| meta.is_dir())
+    {
+        (126, "Is a directory".to_owned())
+    } else {
+        (126, crate::terminal_text::io_reason(error))
+    };
+    control.set_nonblocking(false)?;
+    report(control, Event::Started {})?;
+    let shown = crate::detail_excerpt::head(&name, EXEC_DIAGNOSTIC_NAME_BYTES);
+    let ellipsis = if shown.len() < name.len() { "..." } else { "" };
+    let _ = writeln!(io::stderr(), "{shown}{ellipsis}: {reason}");
+    let _ = io::stderr().flush();
+    rustix::stdio::dup2_stdin(null)?;
+    rustix::stdio::dup2_stdout(null)?;
+    rustix::stdio::dup2_stderr(null)?;
+    report(
+        control,
+        Event::TargetExited {
+            status: code << 8,
+            survivors: false,
+        },
+    )?;
+    report(control, Event::Empty {})
 }
 
 pub(crate) fn main() -> ExitCode {
@@ -101,21 +144,18 @@ fn run() -> io::Result<()> {
         control.read_exact(&mut byte)?;
         frame.push(byte[0]);
         if frame.len() > FRAME_BYTES {
-            return Err(io::Error::other("supervisor request exceeds limit"));
+            return Err(io::Error::other("process monitor request exceeds limit"));
         }
         if byte[0] == b'\n' {
             break;
         }
     }
-    if !matches!(
-        serde_json::from_slice::<Request>(&frame)?,
-        Request::Start {}
-    ) {
-        return Err(io::Error::other("expected supervisor Start"));
-    }
+    let Request::Start { exit_on_exec } = serde_json::from_slice::<Request>(&frame)? else {
+        return Err(io::Error::other("expected process monitor Start"));
+    };
     control.set_read_timeout(None)?;
     control.set_nonblocking(true)?;
-    let tracker = sys::Tracker::new()?;
+    let mut tracker = sys::Tracker::new()?;
     let wake = Wake::new()?;
     let null = std::fs::OpenOptions::new()
         .read(true)
@@ -126,7 +166,7 @@ fn run() -> io::Result<()> {
         .next()
         .ok_or_else(|| io::Error::other("missing target"))?;
     let adopt = std::env::var_os("BART_SUPERVISOR_ADOPT").is_some_and(|value| value == "1");
-    let target = std::process::Command::new(program)
+    let target = std::process::Command::new(&program)
         .args(args)
         .env_remove("BART_SUPERVISOR_SOCKET")
         .env_remove("BART_SUPERVISOR_ADOPT")
@@ -137,11 +177,15 @@ fn run() -> io::Result<()> {
         .spawn();
     let target = match target {
         Ok(child) => Pid::from_raw(child.id().cast_signed()).expect("positive child pid"),
+        Err(error) if exit_on_exec => {
+            exec_failure(&mut control, &null, &program, &error)?;
+            return tracker.release();
+        }
         Err(error) => {
             let _ = report(
                 &mut control,
                 Event::Failed {
-                    reason: error.to_string(),
+                    reason: crate::terminal_text::io_reason(&error),
                 },
             );
             return Err(error);
@@ -327,7 +371,9 @@ impl Scope {
                         for &byte in &input[..n] {
                             pending.push(byte);
                             if pending.len() > FRAME_BYTES {
-                                return Err(io::Error::other("supervisor request exceeds limit"));
+                                return Err(io::Error::other(
+                                    "process monitor request exceeds limit",
+                                ));
                             }
                             if byte == b'\n' {
                                 match serde_json::from_slice::<Request>(&pending)? {
@@ -349,8 +395,10 @@ impl Scope {
                                             let _ = kill_process(target, Signal::INT);
                                         }
                                     }
-                                    Request::Start {} => {
-                                        return Err(io::Error::other("duplicate supervisor Start"));
+                                    Request::Start { .. } => {
+                                        return Err(io::Error::other(
+                                            "duplicate process monitor Start",
+                                        ));
                                     }
                                 }
                                 pending.clear();

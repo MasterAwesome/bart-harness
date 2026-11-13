@@ -834,7 +834,12 @@ async fn stdio(
         .stderr(Stdio::piped());
     let mut child = crate::child::Owner::spawn(&mut program)
         .await
-        .map_err(|error| format!("cannot run {command}: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "cannot run {command}: {}",
+                crate::terminal_text::io_reason(&error)
+            )
+        })?;
     let (Some(stdin), Some(stdout), Some(mut stderr)) = child.pipes() else {
         unreachable!("all three were piped");
     };

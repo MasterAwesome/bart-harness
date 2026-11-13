@@ -259,6 +259,94 @@ assert run(['python3', '-c', 'pass'], check=True).return_code == 0
 }
 
 #[tokio::test]
+async fn exec_failures_report_posix_exit_codes_and_clean_cwd_errors() {
+    let dir = TempDir::new("python-exec-posix");
+    let context = files(dir.path());
+    fs::write(dir.path().join("plain.txt"), "not executable\n").unwrap();
+    fs::create_dir(dir.path().join("subdir")).unwrap();
+    let script = dir.path().join("bad-shebang.sh");
+    fs::write(&script, "#!/no/such/bart/interpreter\necho hi\n").unwrap();
+    fs::set_permissions(
+        &script,
+        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let output = cell(
+        &context,
+        r"
+try:
+    run(['no-such-bart-program'])
+except RunError as error:
+    assert error.result.return_code == 127
+    assert error.result.outcome == {'exit': 127}
+    assert error.result.stderr.strip()
+    assert 'supervisor' not in str(error).lower()
+    assert 'os error' not in str(error).lower()
+else:
+    raise AssertionError('missing executable did not raise RunError')
+
+missing = run(['no-such-bart-program'], check=False)
+assert missing.return_code == 127
+assert missing.stderr.strip()
+assert 'supervisor' not in repr(missing).lower()
+assert 'os error' not in repr(missing).lower()
+
+bad_interp = run(['./bad-shebang.sh'], check=False)
+assert bad_interp.return_code == 127
+assert 'interpreter' in bad_interp.stderr.lower()
+
+oversize = run(['/' + 'a' * 5_000], check=False)
+assert oversize.return_code == 126
+assert 0 < len(oversize.stderr) < 4096
+assert '...' in oversize.stderr
+assert 'supervisor' not in oversize.stderr.lower()
+assert 'os error' not in oversize.stderr.lower()
+
+for unexec in ('./plain.txt', './subdir', './plain.txt/nested'):
+    try:
+        run([unexec])
+    except RunError as error:
+        assert error.result.return_code == 126, (unexec, error.result.return_code)
+    else:
+        raise AssertionError(f'{unexec} did not raise RunError')
+    probe = run([unexec], check=False)
+    assert probe.return_code == 126, (unexec, probe.return_code)
+    assert probe.stderr.strip()
+    assert 'supervisor' not in repr(probe).lower()
+    assert 'os error' not in repr(probe).lower()
+
+for bad_cwd in ('no-such-cwd', 'plain.txt'):
+    try:
+        run(['true'], cwd=bad_cwd)
+    except BartError as error:
+        assert not isinstance(error, RunError)
+        assert 'supervisor' not in str(error).lower()
+        assert 'os error' not in str(error).lower()
+    else:
+        raise AssertionError(f'{bad_cwd} was accepted as cwd')
+
+bg_missing = bg_run(['no-such-bart-program'])
+",
+    )
+    .await;
+    assert!(!output.is_error(), "{}", output.text);
+    time::timeout(Duration::from_secs(5), context.jobs.wake_ready())
+        .await
+        .unwrap();
+    let settled = cell(
+        &context,
+        r"
+assert bg_missing.return_code == 127
+assert bg_missing.stderr.strip()
+assert 'supervisor' not in bg_missing.stderr.lower()
+assert 'os error' not in bg_missing.stderr.lower()
+",
+    )
+    .await;
+    assert!(!settled.is_error(), "{}", settled.text);
+}
+
+#[tokio::test]
 async fn run_preserves_failure_adopts_survivors_and_kills_on_timeout() {
     let dir = TempDir::new("python-sh");
     let context = session(dir.path(), Confinement::Unrestricted, 10_000);
@@ -2172,12 +2260,9 @@ async fn missing_program_names_the_executable_and_does_not_claim_cleanup_failed(
         "{}",
         output.text
     );
-    assert!(
-        output.text.contains("before program start"),
-        "{}",
-        output.text
-    );
+    assert!(output.text.contains("exit 127"), "{}", output.text);
     assert!(!output.text.contains("cleanup failed"), "{}", output.text);
+    assert!(!output.text.contains("supervisor"), "{}", output.text);
 }
 
 #[tokio::test]
@@ -2686,8 +2771,17 @@ async fn background_launches_report_their_handles_once_even_when_assigned() {
     }
     let printed = cell(&context, "print(j)").await;
     assert_eq!(printed.text, "[Bart job: job[2] exit 0]");
-    let refused = cell(&context, "bg_run(['bart-no-such-launch-program'])").await;
-    assert!(refused.is_error() && !refused.text.contains("started]"));
+    let refused = cell(&context, "bg_run(['true'], cwd='no-such-cwd')").await;
+    assert!(
+        refused.is_error() && !refused.text.contains("started]"),
+        "{}",
+        refused.text
+    );
+    assert!(
+        refused.text.contains("no-such-cwd") && !refused.text.contains("supervisor"),
+        "{}",
+        refused.text
+    );
 }
 
 #[tokio::test]

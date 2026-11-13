@@ -93,8 +93,13 @@ impl Process {
             Launch::Outside(_) => Confinement::Unrestricted,
         };
         let started = Instant::now();
-        let failed =
-            |error: io::Error| format!("cannot start program {:?}: {error}", command.args()[0]);
+        let failed = |error: io::Error| {
+            format!(
+                "cannot start program {:?}: {}",
+                command.args()[0],
+                crate::terminal_text::io_reason(&error)
+            )
+        };
         let (reader, writer) = io::pipe().map_err(failed)?;
         let (err_reader, err_writer) = io::pipe().map_err(failed)?;
         let mut program = launch_in(
@@ -107,6 +112,7 @@ impl Process {
             &command.cwd(&context.cwd),
         )?;
         program.retain_descendants();
+        program.exit_on_exec();
         program
             .args(&command.args()[1..])
             .stdin(std::process::Stdio::null())
@@ -469,7 +475,7 @@ impl Process {
                 {
                     Ok(Ok(empty)) => Ok(empty),
                     Ok(Err(error)) => Err(error.to_string()),
-                    Err(_) => Err("supervisor cleanup deadline exceeded".to_owned()),
+                    Err(_) => Err("process monitor cleanup deadline exceeded".to_owned()),
                 },
             );
         }
@@ -702,7 +708,9 @@ use linux::command as jailed_command;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn check_jail(project: &std::path::Path) -> Result<(), String> {
-    let project = project.canonicalize().map_err(|error| error.to_string())?;
+    let project = project
+        .canonicalize()
+        .map_err(|error| crate::terminal_text::io_reason(&error))?;
     for (path, _) in linux::protected_paths()? {
         if path.starts_with(&project) || project.starts_with(&path) {
             return Err("sandbox working directory overlaps a protected path: Bart's settings or session records, or cargo credentials".into());
@@ -743,10 +751,26 @@ fn launch_in(
     env: &std::collections::BTreeMap<String, String>,
     cwd: &std::path::Path,
 ) -> Result<Command, String> {
+    match std::fs::metadata(cwd) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(format!(
+                "cannot enter working directory {}: Not a directory",
+                cwd.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot enter working directory {}: {}",
+                cwd.display(),
+                crate::terminal_text::io_reason(&error)
+            ));
+        }
+    }
     let mut command = match place.confinement {
         Confinement::Unrestricted => {
-            let mut command =
-                Command::new(&place.executable, program).map_err(|error| error.to_string())?;
+            let mut command = Command::new(&place.executable, program)
+                .map_err(|error| crate::terminal_text::io_reason(&error))?;
             command.envs(ENVIRONMENT).envs(env);
             command
         }

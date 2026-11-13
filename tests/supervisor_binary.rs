@@ -41,7 +41,7 @@ for request in [b'{"Unknown":{}}\n', b'x' * 4097]:
             env=dict(os.environ, BART_SUPERVISOR_SOCKET=str(root/'control'), BART_SUPERVISOR_ADOPT='1'), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         stream, _ = listener.accept(); stream.settimeout(7); reader = stream.makefile('rb')
         try:
-            stream.sendall(b'{"Start":{}}\n')
+            stream.sendall(b'{"Start":{"exit_on_exec":false}}\n')
             assert json.loads(reader.readline()) == {'Started': {}}
             deadline = time.monotonic() + 5
             while not (root/'pid').exists() or not (root/'pid').read_text().strip():

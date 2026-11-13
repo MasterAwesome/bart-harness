@@ -217,7 +217,12 @@ pub(super) async fn start_cell(
 
 impl Running {
     pub(super) async fn start(context: &Context) -> Result<Self, String> {
-        let failed = |error: std::io::Error| format!("cannot start python3: {error}");
+        let failed = |error: std::io::Error| {
+            format!(
+                "cannot start python3: {}",
+                crate::terminal_text::io_reason(&error)
+            )
+        };
         let random = crate::random::bytes::<16>().map_err(failed)?;
         let marker = format!("bart-cell-end-{:032x}", u128::from_ne_bytes(random));
         let pycache = context.pycache_dir();

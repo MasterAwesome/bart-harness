@@ -102,7 +102,7 @@ pub(super) fn command(
     let mut command = Command::from_command(tokio::process::Command::from(host_command(
         &tools.systemd_run,
     )))
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| crate::terminal_text::io_reason(&error))?;
     let socket = command.socket();
     let executable = &place.executable;
     command.args(RESOURCE_LIMITS);
@@ -222,11 +222,11 @@ fn environment_file(
         }
     }
     let fd = rustix::fs::memfd_create("bart-mcp-env", rustix::fs::MemfdFlags::CLOEXEC)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| crate::terminal_text::io_reason(&error.into()))?;
     let mut file = std::fs::File::from(fd);
     file.write_all(&bytes)
         .and_then(|()| file.rewind())
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| crate::terminal_text::io_reason(&error))?;
     Ok(file)
 }
 

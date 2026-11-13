@@ -442,3 +442,39 @@ async fn adopted_partial_output_continues_once_in_the_same_file_and_job_output()
         notes[0].text
     );
 }
+
+#[tokio::test]
+async fn oversize_exec_failure_diagnostic_never_blocks_startup() {
+    use tokio::io::AsyncReadExt as _;
+
+    let executable = crate::tool::test_support::executable();
+    let mut command = crate::child::Prepared::new(&executable, "a".repeat(100_000)).unwrap();
+    command.exit_on_exec();
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut owner = time::timeout(
+        Duration::from_secs(5),
+        crate::child::Owner::spawn(&mut command),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (_, _, Some(mut stderr)) = owner.pipes() else {
+        panic!("missing piped stderr");
+    };
+    let status = time::timeout(Duration::from_secs(5), owner.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(126));
+    let mut diagnostic = String::new();
+    stderr.read_to_string(&mut diagnostic).await.unwrap();
+    assert!(
+        diagnostic.contains("...") && diagnostic.len() < 4096,
+        "{diagnostic}"
+    );
+    assert!(!diagnostic.contains("supervisor"), "{diagnostic}");
+    assert!(!diagnostic.contains("os error"), "{diagnostic}");
+}

@@ -43,6 +43,17 @@ pub(crate) fn safe_text(text: &str, mode: TextMode) -> String {
     output
 }
 
+pub(crate) fn io_reason(error: &io::Error) -> String {
+    let mut text = error.to_string();
+    if let Some(code) = error.raw_os_error() {
+        let suffix = format!(" (os error {code})");
+        if let Some(stripped) = text.strip_suffix(&suffix) {
+            text.truncate(stripped.len());
+        }
+    }
+    text
+}
+
 const WRAP_COLUMNS: usize = 16 * 1024;
 const MAX_CSI_PARAM_BYTES: usize = 32;
 

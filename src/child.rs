@@ -23,6 +23,7 @@ pub(crate) struct Prepared {
     listener: UnixListener,
     directory: PathBuf,
     retain_descendants: bool,
+    exit_on_exec: bool,
     #[cfg(target_os = "linux")]
     argument_file: Option<std::fs::File>,
 }
@@ -51,12 +52,17 @@ impl Prepared {
             listener,
             directory,
             retain_descendants: false,
+            exit_on_exec: false,
             #[cfg(target_os = "linux")]
             argument_file: None,
         })
     }
     pub(crate) fn retain_descendants(&mut self) {
         self.retain_descendants = true;
+    }
+
+    pub(crate) fn exit_on_exec(&mut self) {
+        self.exit_on_exec = true;
     }
 
     #[cfg(target_os = "linux")]
@@ -107,6 +113,7 @@ impl Owner {
     pub(crate) async fn spawn(command: &mut Prepared) -> io::Result<Self> {
         let socket = command.socket();
         let retain = if command.retain_descendants { "1" } else { "0" };
+        let exit_on_exec = command.exit_on_exec;
         command
             .env("BART_SUPERVISOR_SOCKET", socket)
             .env("BART_SUPERVISOR_ADOPT", retain);
@@ -122,7 +129,7 @@ impl Owner {
             failure: None,
         };
         let start = async {
-            let child = owner.child.as_mut().expect("starting supervisor");
+            let child = owner.child.as_mut().expect("starting process monitor");
             let (socket, _) = tokio::select! {
                 connected = listener.accept() => connected?,
                 exited = async {
@@ -138,14 +145,14 @@ impl Owner {
                         let _ = tokio::time::timeout(Duration::from_millis(100), stderr.take(FRAME_BYTES as u64).read_to_end(&mut diagnostic)).await;
                     }
                     owner.child = None;
-                    return Err(io::Error::other(format!("supervisor launch exited: {status}: {}", crate::terminal_text::safe_text(&String::from_utf8_lossy(&diagnostic), crate::terminal_text::TextMode::Diagnostic))));
+                    return Err(io::Error::other(format!("process monitor exited: {status}: {}", crate::terminal_text::safe_text(&String::from_utf8_lossy(&diagnostic), crate::terminal_text::TextMode::Diagnostic))));
                 }
             };
             owner.control = Some(BufReader::new(socket));
-            owner.request(Request::Start {})?;
+            owner.request(Request::Start { exit_on_exec })?;
             owner.event().await?;
             if !owner.started {
-                return Err(io::Error::other("supervisor did not start target"));
+                return Err(io::Error::other("process monitor did not start target"));
             }
             io::Result::Ok(())
         };
@@ -154,7 +161,7 @@ impl Owner {
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "supervisor startup deadline exceeded",
+                    "process monitor startup deadline exceeded",
                 )
             })??;
         Ok(owner)
@@ -162,7 +169,7 @@ impl Owner {
     pub(crate) fn pipes(
         &mut self,
     ) -> (Option<ChildStdin>, Option<ChildStdout>, Option<ChildStderr>) {
-        let child = self.child.as_mut().expect("owned supervisor");
+        let child = self.child.as_mut().expect("owned process monitor");
         (child.stdin.take(), child.stdout.take(), child.stderr.take())
     }
     pub(crate) fn task(&mut self, task: tokio::task::JoinHandle<()>) {
@@ -174,10 +181,10 @@ impl Owner {
         let control = self
             .control
             .as_ref()
-            .ok_or_else(|| io::Error::other("supervisor not connected"))?;
+            .ok_or_else(|| io::Error::other("process monitor not connected"))?;
         match control.get_ref().try_write(&bytes) {
             Ok(n) if n == bytes.len() => Ok(()),
-            Ok(_) => Err(io::Error::other("incomplete supervisor request")),
+            Ok(_) => Err(io::Error::other("incomplete process monitor request")),
             Err(error) => Err(error),
         }
     }
@@ -201,7 +208,7 @@ impl Owner {
                     self.reap().await?;
                     return Ok(DetachOutcome::Finished);
                 }
-                _ => return Err(io::Error::other("supervisor refused job handoff")),
+                _ => return Err(io::Error::other("process monitor refused job handoff")),
             }
         }
         crate::supervise::handoff::send(
@@ -210,7 +217,7 @@ impl Owner {
         )?;
         if !matches!(self.read_event().await?, Event::Detached {}) {
             return Err(io::Error::other(
-                "supervisor did not acknowledge job handoff",
+                "process monitor did not acknowledge job handoff",
             ));
         }
         self.control = None;
@@ -232,13 +239,13 @@ impl Owner {
         }
     }
     async fn read_event(&mut self) -> io::Result<Event> {
-        let control = self.control.as_mut().expect("connected supervisor");
+        let control = self.control.as_mut().expect("connected process monitor");
         loop {
             let available = control.fill_buf().await?;
             if available.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "supervisor disconnected",
+                    "process monitor disconnected",
                 ));
             }
             let n = available
@@ -246,7 +253,7 @@ impl Owner {
                 .position(|&byte| byte == b'\n')
                 .map_or(available.len(), |n| n + 1);
             if self.frame.len() + n > FRAME_BYTES {
-                return Err(io::Error::other("supervisor frame exceeds limit"));
+                return Err(io::Error::other("process monitor frame exceeds limit"));
             }
             self.frame.extend_from_slice(&available[..n]);
             control.consume(n);
@@ -279,14 +286,13 @@ impl Owner {
             }
             Event::Empty {} if self.target.is_some() && !self.empty => self.empty = true,
             Event::Failed { reason } => {
-                let phase = if self.started {
-                    "supervisor cleanup failed"
+                return Err(io::Error::other(if self.started {
+                    format!("process monitor cleanup failed: {reason}")
                 } else {
-                    "supervisor failed before program start"
-                };
-                return Err(io::Error::other(format!("{phase}: {reason}")));
+                    reason
+                }));
             }
-            _ => return Err(io::Error::other("invalid supervisor event ordering")),
+            _ => return Err(io::Error::other("invalid process monitor event ordering")),
         }
         Ok(())
     }
@@ -326,12 +332,14 @@ impl Owner {
                 .map_err(|_| {
                     io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "supervisor cleanup deadline exceeded",
+                        "process monitor cleanup deadline exceeded",
                     )
                 })??;
             self.child = None;
             if !status.success() {
-                return Err(io::Error::other(format!("supervisor exited: {status}")));
+                return Err(io::Error::other(format!(
+                    "process monitor exited: {status}"
+                )));
             }
         }
         self.child = None;
