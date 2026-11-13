@@ -1052,11 +1052,11 @@ def write(path, content):
 def _edit_entry(entry):
     if isinstance(entry, dict):
         if not {"old", "new"} <= entry.keys() or entry.keys() - {"old", "new", "replace_all", "within"}:
-            raise BartError("Use edit(path, edits=[{\"old\": old, \"new\": new}]); entries may also have replace_all and within. No changes from this edit call")
+            raise BartError("Use edit(path, [{\"old\": old, \"new\": new}]); entries may also have replace_all and within. No changes from this edit call")
         return entry["old"], entry["new"], entry.get("replace_all", False), entry.get("within")
     if isinstance(entry, (list, tuple)) and len(entry) in (2, 3):
         return entry[0], entry[1], False, entry[2] if len(entry) == 3 else None
-    raise BartError("Use edit(path, edits=[(old, new), ...]) with (old, new), (old, new, within) or dictionaries with old and new. No changes from this edit call")
+    raise BartError("Use edit(path, [(old, new), ...]) with (old, new), (old, new, within) or dictionaries with old and new. No changes from this edit call")
 
 
 def _valid(old, new, replace_all, within):
@@ -1110,17 +1110,19 @@ def edit(path, old=None, new=None, replace_all=None, within=None, *, edits=None)
     If any edit does not match, the file is left unchanged. The file is rewritten in place, so a
     failed write can leave it partly written."""
     path = _path(path)
+    if edits is None and isinstance(old, (list, tuple)) and new is None:
+        edits, old = old, None
     if edits is None:
         if old is None or new is None:
-            raise BartError("Use edit(path, old, new) or edit(path, edits=[(old, new), ...]). No changes from this edit call")
+            raise BartError("Use edit(path, old, new) or edit(path, [(old, new), ...]). No changes from this edit call")
         items = [(old, new, bool(replace_all) if replace_all is not None else False, within)]
         if replace_all is not None and not isinstance(replace_all, bool):
             raise BartError("Call edit with replace_all=True or False. No changes from this edit call")
     else:
         if old is not None or new is not None or replace_all is not None or within is not None:
-            raise BartError("Call edit(path, edits=[...]) with old, new, replace_all and within inside each entry, not at the top level. No changes from this edit call")
+            raise BartError("Call edit(path, [(old, new), ...]) with old, new, replace_all and within inside each entry, not at the top level. No changes from this edit call")
         if not isinstance(edits, (list, tuple)):
-            raise BartError("Call edit(path, edits=[(old, new), ...]). No changes from this edit call")
+            raise BartError("Call edit(path, [(old, new), ...]). No changes from this edit call")
         items = [_edit_entry(entry) for entry in edits]
     if not 1 <= len(items) <= MAX_EDITS:
         raise BartError(f"Call edit with 1–{MAX_EDITS} entries. No changes from this edit call")
@@ -1159,7 +1161,7 @@ def edit(path, old=None, new=None, replace_all=None, within=None, *, edits=None)
         regions.sort()
         for (_, end, a), (begin, _, b) in zip(regions, regions[1:]):
             if end > begin:
-                raise BartError(f"edits #{min(a, b) + 1} and #{max(a, b) + 1} overlap in {path}; combine them into one replacement in edit(path, edits=[...]). No changes from this edit call")
+                raise BartError(f"edits #{min(a, b) + 1} and #{max(a, b) + 1} overlap in {path}; combine them into one replacement in edit(path, [...]). No changes from this edit call")
         parts, previous = [], 0
         for begin, end, index in regions:
             parts += (text[previous:begin], items[index][1])

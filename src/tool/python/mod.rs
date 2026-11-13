@@ -138,12 +138,12 @@ def read(path: str | PathLike[str], offset: int = 1, limit: int | None = None) -
 def edit(path: str | PathLike[str], old: str, new: str, replace_all: bool = False,
          within: tuple[int, int] | None = None) -> None: ...
 @overload
-def edit(path: str | PathLike[str], *,
+def edit(path: str | PathLike[str],
          edits: list[tuple[str, str] | tuple[str, str, tuple[int, int]] | Edit]) -> None:
     """Replace exact text in an existing UTF-8 file. Silent on success.
 
         edit("settings.py", "RETRIES = 2", "RETRIES = 3")
-        edit("settings.py", edits=[("RETRIES = 2", "RETRIES = 3"), ("TIMEOUT = 10", "TIMEOUT = 20")])
+        edit("settings.py", [("RETRIES = 2", "RETRIES = 3"), ("TIMEOUT = 10", "TIMEOUT = 20")])
 
     old is matched literally, whitespace included and without read()'s line-number prefixes.
     It must occur exactly once: narrow it with within=(first_line, last_line), or pass

@@ -1182,6 +1182,11 @@ async fn edit_batches_match_the_original_and_report_where_they_fail() {
         "edit('f', 'α', 'b', within=(4, 4))",
         "edit('f', 'α', 'b', within=(0, 1))",
         "edit('f', edits=[])",
+        "edit('f', [])",
+        "edit('f', [('x', 'y')], 'z')",
+        "edit('f', [('x', 'y')], replace_all=True)",
+        "edit('f', [('x', 'y')], edits=[('a', 'b')])",
+        "edit('f', [('x', 'y')] * 1025)",
         "edit('f', edits=[('x', 'y')] * 1025)",
         "edit('missing/parent/f', 'x', 'y')",
     ] {
@@ -1214,6 +1219,23 @@ async fn edit_batches_match_the_original_and_report_where_they_fail() {
         .unwrap()
         .1;
     assert_eq!(effects.matches("edited ").count(), 1, "{effects}");
+    fs::write(dir.path().join("batch"), "one\ntwo\n").unwrap();
+    let positional = cell(
+        &context,
+        "edit('batch', [('one', 'TWO'), {'old': 'two', 'new': 'THREE'}])",
+    )
+    .await;
+    assert!(!positional.is_error(), "{}", positional.text);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("batch")).unwrap(),
+        "TWO\nTHREE\n"
+    );
+    let keyword = cell(&context, "edit('batch', edits=(('TWO', 'ten'),))").await;
+    assert!(!keyword.is_error(), "{}", keyword.text);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("batch")).unwrap(),
+        "ten\nTHREE\n"
+    );
 }
 
 #[tokio::test]
