@@ -226,7 +226,8 @@ class SavedStream:
         return f"SavedStream(path={self._reference}, incomplete={self.incomplete!r})"
 
 
-_RUN_ERROR_VIEW_BYTES = 2 * 1024
+_RUN_ERROR_HEAD_BYTES = 2 * 1024
+_RUN_ERROR_TAIL_BYTES = 2 * 1024
 
 
 def _bart(kind, fields):
@@ -278,12 +279,14 @@ class Result:
     def __repr__(self):
         return "".join(self._view_parts())
 
+    def _kind(self):
+        return "job" if self._reference.startswith("job[") else "run"
+
     def _heading(self, flags=()):
         if (self._output["completeness"] != "complete"
                 or self.stdout_file.incomplete is not None or self.stderr_file.incomplete is not None):
             flags = [*flags, "incomplete capture"]
-        return _bart("job" if self._reference.startswith("job[") else "run",
-                     "; ".join([f"{self._reference} {self._state}", *flags]))
+        return _bart(self._kind(), "; ".join([f"{self._reference} {self._state}", *flags]))
 
     def _view_parts(self):
         result = self._snapshot()
@@ -317,15 +320,31 @@ class Result:
         try:
             with pathlib.Path(result._output["path"]).open("rb") as file:
                 size = os.fstat(file.fileno()).st_size
-                start = max(0, size - _RUN_ERROR_VIEW_BYTES)
-                file.seek(start)
-                data = file.read(_RUN_ERROR_VIEW_BYTES)
-            if start:
-                while data and data[0] & 0xC0 == 0x80:
-                    data = data[1:]
-            if size > len(data):
-                flags.append(f"last {len(data)} of {size} bytes shown")
-            text = data.decode("utf-8", errors="backslashreplace").rstrip("\n")
+                if size <= _RUN_ERROR_HEAD_BYTES + _RUN_ERROR_TAIL_BYTES:
+                    text = file.read(size).decode("utf-8", errors="backslashreplace").rstrip("\n")
+                else:
+                    head_raw = file.read(_RUN_ERROR_HEAD_BYTES)
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="backslashreplace")
+                    head_txt = decoder.decode(head_raw)
+                    head_end = len(head_raw) - len(decoder.getstate()[0])
+                    if (nl := head_raw.rfind(b"\n", 0, head_end)) != -1 and nl + 1 >= (len(head_raw) + 1) // 2:
+                        head_end = nl + 1
+                        head_txt = head_txt[:head_txt.rfind("\n") + 1]
+
+                    tail_start = size - _RUN_ERROR_TAIL_BYTES
+                    file.seek(tail_start)
+                    tail_raw = file.read(_RUN_ERROR_TAIL_BYTES)
+                    while tail_raw and tail_raw[0] & 0xC0 == 0x80:
+                        tail_raw = tail_raw[1:]
+                        tail_start += 1
+                    if (nl := tail_raw.find(b"\n")) != -1 and nl + 1 <= len(tail_raw) // 2:
+                        tail_raw = tail_raw[nl + 1:]
+                        tail_start += nl + 1
+
+                    head_txt = head_txt.rstrip("\r\n")
+                    tail_txt = tail_raw.decode("utf-8", errors="backslashreplace").strip("\n")
+                    marker = _bart(result._kind(), f"{result._reference} {tail_start - head_end} bytes omitted")
+                    text = "\n".join(part for part in (head_txt, marker, tail_txt) if part)
         except OSError as error:
             flags.append("output unavailable")
             text = _reason(error)

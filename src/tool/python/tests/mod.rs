@@ -2909,3 +2909,66 @@ fn prompt_description_states_the_selected_background_job_lifetime() {
         assert!(text.contains("def wait(self)"));
     }
 }
+
+#[tokio::test]
+async fn run_error_shows_head_and_tail_for_oversized_failures() {
+    let dir = TempDir::new("run-error-head-tail");
+    let context = files(dir.path());
+    let failed = cell(
+        &context,
+        r#"run(['python3', '-c', 'import sys\nprint("HEAD_FAIL: line 1")\nfor i in range(400): print(f"noise {i:03} " + "x" * 40)\nprint("TAIL_SUMMARY: done")\nsys.exit(2)'])"#,
+    )
+    .await;
+    assert!(failed.is_error());
+    assert!(failed.text.contains("HEAD_FAIL: line 1"), "{}", failed.text);
+    assert!(
+        failed.text.contains("TAIL_SUMMARY: done"),
+        "{}",
+        failed.text
+    );
+    assert!(!failed.text.contains("first "), "{}", failed.text);
+    assert!(
+        failed.text.contains("[Bart run: cell[1].run[1] ")
+            && failed.text.contains("bytes omitted]"),
+        "{}",
+        failed.text
+    );
+    assert!(failed.text.len() < 8192);
+
+    let utf8_boundary = cell(
+        &context,
+        r#"run(['python3', '-c', 'import sys; sys.stdout.buffer.write("€".encode() * 3000); sys.exit(1)'])"#,
+    )
+    .await;
+    assert!(utf8_boundary.is_error());
+    assert!(
+        utf8_boundary.text.contains("[Bart run: cell[2].run[1] ")
+            && !utf8_boundary.text.contains("\\x"),
+        "{}",
+        utf8_boundary.text
+    );
+
+    let head_at_half = cell(
+        &context,
+        r#"run(['python3', '-c', 'import sys; sys.stdout.write("a" * 1023 + chr(10) + chr(66) * 2500 + "Z" * 2500); sys.exit(1)'])"#,
+    )
+    .await;
+    assert!(head_at_half.is_error());
+    assert!(
+        !head_at_half.text.contains("BBBB") && head_at_half.text.contains("bytes omitted]"),
+        "{}",
+        head_at_half.text
+    );
+
+    let head_below_half = cell(
+        &context,
+        r#"run(['python3', '-c', 'import sys; sys.stdout.write("a" * 1022 + chr(10) + chr(66) * 2500 + "Z" * 2500); sys.exit(1)'])"#,
+    )
+    .await;
+    assert!(head_below_half.is_error());
+    assert!(
+        head_below_half.text.contains("BBBB"),
+        "{}",
+        head_below_half.text
+    );
+}
