@@ -39,6 +39,15 @@ pub(super) struct Request {
     pub(super) outside: Option<String>,
 }
 
+pub(super) fn parse_timeout(timeout: f64) -> Result<Duration, String> {
+    if !timeout.is_finite() || !(MIN_SECONDS..=MAX_SECONDS).contains(&timeout) {
+        return Err(format!(
+            "timeout must be a finite number from {MIN_SECONDS} to {MAX_SECONDS} seconds"
+        ));
+    }
+    Duration::try_from_secs_f64(timeout).map_err(|e| e.to_string())
+}
+
 impl Request {
     pub(super) fn parse(arguments: Value, escape: Escape) -> Result<Self, String> {
         let invalid = |e: serde_json::Error| format!("invalid run request: {e}");
@@ -54,12 +63,7 @@ impl Request {
             }
         };
         let command = Argv::parse(command)?.with_env(env)?.with_cwd(cwd)?;
-        if !timeout.is_finite() || !(MIN_SECONDS..=MAX_SECONDS).contains(&timeout) {
-            return Err(format!(
-                "timeout must be a finite number from {MIN_SECONDS} to {MAX_SECONDS} seconds"
-            ));
-        }
-        let timeout = Duration::try_from_secs_f64(timeout).map_err(|e| e.to_string())?;
+        let timeout = parse_timeout(timeout)?;
         Ok(Self {
             command,
             timeout,

@@ -67,6 +67,11 @@ pub(super) enum Helper {
     Job {
         id: u32,
     },
+    #[serde(rename = "job_wait")]
+    JobWait {
+        id: u32,
+        timeout: f64,
+    },
     Image {
         label: String,
         data: String,

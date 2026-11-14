@@ -66,7 +66,7 @@ for mode in ['keep', 'cancel']:
             out, err = process.communicate(timeout=15)
             assert process.returncode == (143 if mode == 'cancel' else 0), (out, err)
             assert len(requests) == 2
-            assert 'def wait(self)' in json.dumps(requests[0]['tools'])
+            assert 'def wait(self' in json.dumps(requests[0]['tools'])
             client = socket.socket(socket.AF_UNIX)
             try:
                 client.connect(str(root/'python.sock'))

@@ -27,9 +27,7 @@ struct CellReview<'a, 'b> {
     gate: Option<&'a mut crate::approval::Gate<'b>>,
 }
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
-const MIN_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const CELL_TIMEOUT: Duration = Duration::from_secs(120);
 const PROGRAM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const FILE_BYTES: usize = 16 * 1024 * 1024;
@@ -42,28 +40,17 @@ const INTERRUPTED: &str =
 #[serde(deny_unknown_fields)]
 struct Arguments {
     code: String,
-    timeout: Option<u64>,
     #[serde(default)]
     restart: bool,
 }
 
 impl Arguments {
-    fn validated(arguments: &Value) -> Result<(Self, Duration), String> {
+    fn parse(arguments: &Value) -> Result<Self, String> {
         let arguments: Self = parse_arguments(arguments)?;
         if arguments.code.trim().is_empty() && !arguments.restart {
             return Err(super::EMPTY_CELL_REFUSAL.into());
         }
-        let timeout = arguments
-            .timeout
-            .map_or(DEFAULT_TIMEOUT, Duration::from_secs);
-        if !(MIN_TIMEOUT..=MAX_TIMEOUT).contains(&timeout) {
-            return Err(format!(
-                "timeout must be from {} to {} seconds",
-                MIN_TIMEOUT.as_secs(),
-                MAX_TIMEOUT.as_secs()
-            ));
-        }
-        Ok((arguments, timeout))
+        Ok(arguments)
     }
 }
 
@@ -96,6 +83,11 @@ fn description(surface: &Surface<'_>) -> String {
 }
 
 fn header(surface: &Surface<'_>) -> String {
+    let wait_note = if surface.mode.one_turn() {
+        " or job.wait()"
+    } else {
+        ""
+    };
     format!(
         "{python}. Cells run in one persistent interpreter that starts in the working directory; \
          variables and imports last until it restarts. The standard library and user-installed \
@@ -113,11 +105,16 @@ fn header(surface: &Surface<'_>) -> String {
          final expression.\n\n\
          Size: a cell shows up to {output_kib} KiB. A longer one ends with how much was \
          shown and the call that shows the next part, cell[N].remaining().\n\n\
+         Timeout: {cell_secs}s of Python execution per cell; waiting inside run(){wait_note} \
+         pauses this timer up to that call's timeout (use bg_run for unbounded work). The result \
+         says whether a timed-out cell stopped; a cell that is still running makes the next call \
+         wait for it unless restart is true.\n\n\
          cell[N].output and cell[N].run[M] are the saved files, usable without printing: \
          for line in open(cell[N].output) reads large JSONL; read(path, offset, limit) shows a slice.\n\n\
          ```python\n# builtins.pyi: Bart additions. @auto_display marks helpers that print a view when called bare.\n",
         python = surface.python,
         output_kib = super::OUTPUT_BUDGET_BYTES / 1024,
+        cell_secs = CELL_TIMEOUT.as_secs(),
     )
 }
 
@@ -237,9 +234,12 @@ def bg_run(argv: Sequence[str], *, notify: str | None = None,
 
 fn types(one_turn: bool) -> String {
     let wait = if one_turn {
-        "    def wait(self) -> Result: ...\n"
+        format!(
+            "    def wait(self, *, timeout: float = {}) -> Result: ...\n",
+            super::execution::MAX_SECONDS
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         r#"class Result:
@@ -335,7 +335,6 @@ pub(super) fn definition(surface: &Surface<'_>) -> Definition {
             "type": "object",
             "properties": {
                 "code": { "type": "string", "description": "Python source for one cell. May be empty only with restart. Several cells in one response run in order, and a later one still runs if an earlier one failed" },
-                "timeout": { "type": "integer", "minimum": MIN_TIMEOUT.as_secs(), "maximum": MAX_TIMEOUT.as_secs(), "description": format!("Seconds before the cell is interrupted, default {}. The result says whether it stopped; a cell that is still running makes the next call wait for it", DEFAULT_TIMEOUT.as_secs()) },
                 "restart": { "type": "boolean", "description": "Start a fresh interpreter before running code, discarding variables and imports. For a cell that will not stop or a broken interpreter" }
             },
             "required": ["code"],
@@ -351,6 +350,7 @@ fn helper_configuration(context: &Context) -> Value {
         "saved_dir": context.spill_dir,
         "request_bytes": MAX_FRAME_BYTES,
         "process_default_seconds": super::execution::DEFAULT_SECONDS,
+        "wait_default_seconds": super::execution::MAX_SECONDS,
         "file_bytes": FILE_BYTES,
         "diff_bytes": 4 * 1024 * 1024,
         "scan_bytes": READ_SCAN_BYTES,
@@ -389,25 +389,18 @@ async fn run(
     live: &Run,
     gate: Option<&mut crate::approval::Gate<'_>>,
 ) -> Result<Output, String> {
-    let (arguments, timeout) = Arguments::validated(arguments)?;
+    let arguments = Arguments::parse(arguments)?;
+    let cell_timeout = context.cell_timeout;
     let execution_deadline = gate
         .as_ref()
         .is_none_or(|g| g.approval.mode() == crate::approval::Mode::None)
-        .then(|| time::Instant::now() + timeout);
+        .then(|| time::Instant::now() + cell_timeout);
     let mut review = CellReview { id, context, gate };
-    let (mut slot, prior) = match prepared_slot(
-        &arguments,
-        id,
-        context,
-        live,
-        review.gate.as_deref_mut(),
-        timeout,
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(refusal) => return Ok(denied_prior(refusal)),
-    };
+    let (mut slot, prior) =
+        match prepared_slot(&arguments, id, context, live, review.gate.as_deref_mut()).await {
+            Ok(prepared) => prepared,
+            Err(refusal) => return Ok(denied_prior(refusal)),
+        };
     let collector =
         Collector::open_cell(context.output_budget, &context.artifacts, &arguments.code)
             .await
@@ -450,7 +443,7 @@ async fn run(
     let started = time::Instant::now();
     let deadline = execution_deadline
         .filter(|_| !arguments.restart)
-        .unwrap_or(started + timeout);
+        .unwrap_or(started + cell_timeout);
     let end = lease
         .running
         .as_mut()
@@ -466,7 +459,7 @@ async fn run(
     Ok(capture
         .finish(
             end,
-            timeout,
+            cell_timeout,
             Participation::Started,
             note.map(str::to_owned),
             prior,
@@ -480,7 +473,6 @@ async fn prepared_slot(
     context: &Arc<Context>,
     live: &Run,
     mut gate: Option<&mut crate::approval::Gate<'_>>,
-    timeout: Duration,
 ) -> Result<(OwnedMutexGuard<Slot>, Option<Earlier>), Refusal> {
     let mut prior = None;
     let mut slot = Arc::clone(&context.interpreter.slot).lock_owned().await;
@@ -502,7 +494,7 @@ async fn prepared_slot(
             continued: capture.continued,
             output: Box::new(
                 capture
-                    .finish(end, timeout, Participation::Waited, None, None)
+                    .finish(end, context.cell_timeout, Participation::Waited, None, None)
                     .await,
             ),
         });
@@ -511,7 +503,7 @@ async fn prepared_slot(
         && (slot.cancelled.is_some() || slot.running.as_ref().is_some_and(|r| r.busy.is_some()))
     {
         let (collected_slot, earlier, settled) =
-            collect_earlier(slot, id, context, live, gate.as_deref_mut(), timeout)
+            collect_earlier(slot, id, context, live, gate.as_deref_mut())
                 .await
                 .map_err(|reason| Refusal::Denied {
                     earlier: None,
@@ -549,7 +541,6 @@ async fn prepared_slot(
         );
         if let Err(reason) = gate.check(id, json!({
             "code": arguments.code, "restart": arguments.restart,
-            "timeout": timeout.as_secs(),
             "cwd": context.cwd, "confinement": format!("{:?}", context.confinement()),
             "active_jobs": context.live.jobs().iter().filter(|job| job.state == super::LiveState::Running).map(|job| json!({"id": job.job, "command": job.title})).collect::<Vec<_>>(),
             "untrusted_earlier_cell_result": prior.as_ref().map_or("", |earlier| earlier.output.text.as_str()),
@@ -577,7 +568,6 @@ async fn collect_earlier(
     context: &Arc<Context>,
     live: &Run,
     gate: Option<&mut crate::approval::Gate<'_>>,
-    timeout: Duration,
 ) -> Result<(OwnedMutexGuard<Slot>, Earlier, bool), String> {
     let cancelled = slot.cancelled.take();
     let (capture, settled) = if let Some((mut capture, end)) = cancelled {
@@ -612,6 +602,7 @@ async fn collect_earlier(
         running,
         capture: Some(capture),
     };
+    let cell_timeout = context.cell_timeout;
     let end = match settled {
         Some(end) if !matches!(end, End::TimedOut) => end,
         _ => {
@@ -621,7 +612,7 @@ async fn collect_earlier(
                 .expect("busy interpreter")
                 .cell(
                     None,
-                    time::Instant::now() + timeout,
+                    time::Instant::now() + cell_timeout,
                     lease.capture.as_mut().expect("leased capture"),
                     &mut CellReview { id, context, gate },
                 )
@@ -635,7 +626,7 @@ async fn collect_earlier(
         output: Box::new(
             lease
                 .finish(&end)
-                .finish(end, timeout, Participation::Waited, None, None)
+                .finish(end, cell_timeout, Participation::Waited, None, None)
                 .await,
         ),
     };

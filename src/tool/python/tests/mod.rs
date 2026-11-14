@@ -13,6 +13,31 @@ fn session(dir: &Path, confinement: Confinement, budget: usize) -> Arc<Context> 
     Arc::new(context(dir, confinement, budget))
 }
 
+fn session_with_timeout(
+    dir: &Path,
+    confinement: Confinement,
+    budget: usize,
+    timeout: Duration,
+) -> Arc<Context> {
+    let mut context = context(dir, confinement, budget);
+    context.cell_timeout = timeout;
+    Arc::new(context)
+}
+
+fn mcp_session(dir: &Path, registry: Arc<crate::mcp::Registry>, timeout: Duration) -> Arc<Context> {
+    let mut context = Context::new(
+        dir.to_path_buf(),
+        crate::tool::test_support::executable(),
+        dir.join("spill"),
+        10_000,
+        Confinement::Unrestricted,
+        registry,
+    )
+    .unwrap();
+    context.cell_timeout = timeout;
+    Arc::new(context)
+}
+
 async fn call(arguments: &Value, context: &Arc<Context>) -> Output {
     let mut live = context.live.start(
         "python",
@@ -410,18 +435,17 @@ async fn run_preserves_failure_adopts_survivors_and_kills_on_timeout() {
 #[tokio::test]
 async fn timeout_gracefully_interrupts_and_preserves_state() {
     let dir = TempDir::new("python-graceful-interrupt");
-    let context = session(dir.path(), Confinement::Unrestricted, 10_000);
+    let context = session_with_timeout(
+        dir.path(),
+        Confinement::Unrestricted,
+        10_000,
+        Duration::from_secs(1),
+    );
     cell(&context, "x = 42").await;
     let started = Instant::now();
-    let timed_out = call(
-        &json!({ "code": "run([\"bash\", \"-c\", 'echo $$ > command; sleep 30'])", "timeout": 1 }),
-        &context,
-    )
-    .await;
+    let timed_out = cell(&context, "import time; time.sleep(30)").await;
     assert!(started.elapsed() < Duration::from_secs(3));
     assert_eq!(timed_out.status, Status::Failed);
-    let pid = |name| fs::read_to_string(dir.path().join(name)).unwrap();
-    wait_until_dead(pid("command").trim()).await;
     text(&context, "x", "42").await;
 }
 
@@ -524,17 +548,7 @@ async fn cells_reach_mcp_servers() {
         &client,
         &store,
     );
-    let context = Arc::new(
-        Context::new(
-            dir.path().to_path_buf(),
-            crate::tool::test_support::executable(),
-            dir.path().join("spill"),
-            10_000,
-            Confinement::Unrestricted,
-            registry,
-        )
-        .unwrap(),
-    );
+    let context = mcp_session(dir.path(), registry, Duration::from_secs(1));
     assert!(
         cell(&context, "mcp.servers()")
             .await
@@ -561,7 +575,7 @@ async fn cells_reach_mcp_servers() {
     .await;
     let started = std::time::Instant::now();
     let hung = call(
-        &json!({ "code": "mcp(\"com.example / staging'$\", 'hang')", "timeout": 1 }),
+        &json!({ "code": "mcp(\"com.example / staging'$\", 'hang')" }),
         &context,
     )
     .await;
@@ -1354,7 +1368,7 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
                 );
                 assert_eq!(text.contains("sandbox: bool"), escape, "{case}");
                 assert_eq!(text.contains("build.wait() instead"), one_turn, "{case}");
-                assert_eq!(text.contains("def wait(self)"), one_turn, "{case}");
+                assert_eq!(text.contains("def wait(self"), one_turn, "{case}");
                 assert_eq!(
                     text.contains("the message resumes you"),
                     !one_turn,
@@ -1411,6 +1425,74 @@ async fn job_wait_exists_only_in_one_turn_sessions() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn fixed_cell_timeout_rejects_timeout_argument_and_pauses_during_bounded_run_and_job_wait() {
+    let dir = TempDir::new("python-pause-default-timeout");
+    let context = session_with_timeout(
+        dir.path(),
+        Confinement::Unrestricted,
+        10_000,
+        Duration::from_secs(1),
+    );
+    context.set_turn_mode(crate::tool::TurnMode::Prompt(
+        crate::tool::BackgroundJobs::Stop,
+    ));
+
+    let rejected = call(&json!({ "code": "print(1)", "timeout": 30 }), &context).await;
+    assert_eq!(rejected.status, Status::Failed, "{}", rejected.text);
+    assert!(rejected.text.contains("unknown field"), "{}", rejected.text);
+
+    let output = call(&json!({
+        "code": "r1 = run(['bash', '-c', 'sleep 0.8; echo first'], timeout=5)\nr2 = run(['bash', '-c', 'sleep 0.8; echo second'], timeout=5)\nprint(r1.stdout.strip(), r2.stdout.strip())"
+    }), &context)
+    .await;
+    assert_eq!(output.status, Status::Succeeded, "{}", output.text);
+    assert!(output.text.ends_with("first second"), "{}", output.text);
+
+    let timed_out_run = call(&json!({
+        "code": "try:\n    run(['bash', '-c', 'sleep 5'], timeout=1)\nexcept RunError as e:\n    print('caught', e.result.timed_out)"
+    }), &context)
+    .await;
+    assert_eq!(
+        timed_out_run.status,
+        Status::Succeeded,
+        "{}",
+        timed_out_run.text
+    );
+    assert!(
+        timed_out_run.text.starts_with("caught True\n")
+            && timed_out_run.text.contains("killed; timed out"),
+        "{}",
+        timed_out_run.text
+    );
+
+    let job_waited = call(&json!({
+        "code": "try:\n    j0 = bg_run(['true'])\n    j0.wait(timeout=0)\n    raise AssertionError('expected BartError')\nexcept BartError as e:\n    j0.wait()\nj = bg_run(['bash', '-c', 'sleep 1.4; echo done'])\nr = j.wait(timeout=5)\nprint(r.stdout.strip())"
+    }), &context)
+    .await;
+    assert_eq!(job_waited.status, Status::Succeeded, "{}", job_waited.text);
+    assert!(job_waited.text.ends_with("done"), "{}", job_waited.text);
+
+    let exhausted = cell(
+        &context,
+        "import time\ntime.sleep(0.6)\nr = run(['bash', '-c', 'sleep 1.2; echo waited'], timeout=5)\nprint(r.stdout.strip())\ntime.sleep(0.6)\nprint('unreachable')",
+    )
+    .await;
+    assert_eq!(exhausted.status, Status::Failed, "{}", exhausted.text);
+    assert!(exhausted.text.contains("waited"), "{}", exhausted.text);
+    assert!(
+        exhausted.text.contains("KeyboardInterrupt"),
+        "{}",
+        exhausted.text
+    );
+    assert!(
+        !exhausted.text.contains("unreachable"),
+        "{}",
+        exhausted.text
+    );
+    text(&context, "r.return_code", "0").await;
 }
 
 #[tokio::test]
@@ -1535,14 +1617,19 @@ async fn earlier_cells_processes_and_jobs_are_files_by_number_across_restarts() 
 #[tokio::test]
 async fn a_call_that_only_waited_for_a_busy_cell_is_not_numbered_as_one() {
     let dir = TempDir::new("python-busy");
-    let context = session(dir.path(), Confinement::Unrestricted, 10_000);
+    let context = session_with_timeout(
+        dir.path(),
+        Confinement::Unrestricted,
+        10_000,
+        Duration::from_secs(1),
+    );
     let busy = call(
-        &json!({"code": "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(60)", "timeout": 1}),
+        &json!({"code": "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\ntime.sleep(60)"}),
         &context,
     )
     .await;
     assert!(busy.text.contains("is still running"), "{}", busy.text);
-    let waited = call(&json!({"code": "print('never')", "timeout": 1}), &context).await;
+    let waited = call(&json!({"code": "print('never')"}), &context).await;
     assert_eq!(
         waited.text,
         "[Bart cell: cell[1] output continues]\n[Bart not run: cell[1] is still running after 1s more; call again to keep waiting, or pass restart: true]"
@@ -1622,15 +1709,24 @@ async fn showing_a_saved_image_again_names_it_without_its_path() {
 #[tokio::test]
 async fn a_busy_cell_keeps_its_number_and_shell_order_while_the_next_call_waits() {
     let dir = TempDir::new("python-busy-processes");
-    let context = session(dir.path(), Confinement::Unrestricted, 10_000);
+    let context = session_with_timeout(
+        dir.path(),
+        Confinement::Unrestricted,
+        10_000,
+        Duration::from_secs(1),
+    );
+    let release = dir.path().join("release");
     let busy = call(
-        &json!({"code": "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nrun([\"bash\", \"-c\", 'echo first'])\ntime.sleep(6)\nprint(run([\"bash\", \"-c\", 'echo second']).stdout, end='')", "timeout": 1}),
+        &json!({"code": "import pathlib, signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nrun([\"bash\", \"-c\", 'echo first'])\nwhile not pathlib.Path('release').exists():\n    time.sleep(0.05)\nprint(run([\"bash\", \"-c\", 'echo second']).stdout, end='')"}),
         &context,
     )
     .await;
     let first = busy.cell.unwrap();
     assert!(busy.text.contains("is still running"), "{}", busy.text);
-    let next = call(&json!({"code": "print('next')", "timeout": 20}), &context).await;
+    let (next, ()) = tokio::join!(cell(&context, "print('next')"), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        fs::write(&release, "").unwrap();
+    });
     assert!(
         next.text[..next.prefix_len.unwrap()].contains("second")
             && next
@@ -1797,18 +1893,8 @@ async fn interrupted_mcp_startup_waits_dispatch_nothing_and_leave_startup_runnin
         &reqwest::Client::new(),
         &crate::auth::Store::new(dir.path().join("auth.json")),
     );
-    let context = Arc::new(
-        Context::new(
-            dir.path().to_path_buf(),
-            crate::tool::test_support::executable(),
-            dir.path().join("spill"),
-            10_000,
-            Confinement::Unrestricted,
-            Arc::clone(&registry),
-        )
-        .unwrap(),
-    );
-    let interrupted = call(&json!({"code":"mcp('fx','echo')", "timeout":1}), &context).await;
+    let context = mcp_session(dir.path(), Arc::clone(&registry), Duration::from_secs(1));
+    let interrupted = call(&json!({"code":"mcp('fx','echo')"}), &context).await;
     assert!(interrupted.is_error());
     assert!(
         !calls.exists(),
@@ -2941,7 +3027,7 @@ fn prompt_description_states_the_selected_background_job_lifetime() {
             jobs == BackgroundJobs::Keep
         );
         assert!(text.contains("build.wait() instead"));
-        assert!(text.contains("def wait(self)"));
+        assert!(text.contains("def wait(self"));
     }
 }
 

@@ -1,8 +1,8 @@
-use std::io::Cursor;
+use std::io::{self, Cursor};
 
 use serde_json::Value;
 use tokio::{
-    io::BufReader,
+    io::{AsyncWriteExt, BufReader},
     process::{ChildStdin, ChildStdout},
 };
 
@@ -21,6 +21,17 @@ pub(super) struct Channel {
     pub(super) exchange: Exchange,
     pub(super) process: Option<ProgramTask>,
     pub(super) inventory: Option<Value>,
+}
+
+impl Channel {
+    pub(super) async fn reply(&mut self, message: &HostMessage<'_>) -> io::Result<()> {
+        self.exchange.queue(message);
+        self.send().await
+    }
+
+    pub(super) async fn send(&mut self) -> io::Result<()> {
+        self.requests.write_all_buf(&mut self.exchange.unsent).await
+    }
 }
 
 pub(super) struct CellOutput {

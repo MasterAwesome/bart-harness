@@ -134,10 +134,11 @@ assert (base/'.git/config').read_text() == 'protected'
 #[ignore = "needs a systemd user session and bubblewrap"]
 async fn jailed_commands_adopt_and_python_interrupts_in_its_own_namespace() {
     let dir = TempDir::new("python-jail-lifetime");
-    let context = session(
+    let context = session_with_timeout(
         dir.path(),
         Confinement::Jailed(Network::On, crate::tool::Escape::Withheld),
         10000,
+        Duration::from_secs(1),
     );
     let adopted = cell(
         &context,
@@ -164,7 +165,7 @@ async fn jailed_commands_adopt_and_python_interrupts_in_its_own_namespace() {
     .await;
     assert!(!exit.is_error(), "{}", exit.text);
     assert!(exit.text.contains("\"return_code\":3"));
-    let interrupted = call(&json!({"code": "while True: pass", "timeout": 1}), &context).await;
+    let interrupted = call(&json!({"code": "while True: pass"}), &context).await;
     assert!(
         interrupted.is_error() && interrupted.text.contains("KeyboardInterrupt"),
         "{}",

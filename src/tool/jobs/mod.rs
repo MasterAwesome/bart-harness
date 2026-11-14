@@ -415,6 +415,27 @@ impl Jobs {
         }).await.map_err(|error| format!("job result worker failed: {error}"))?
     }
 
+    pub(super) async fn wait(
+        &self,
+        id: u32,
+        timeout: std::time::Duration,
+        context: &Context,
+    ) -> Result<Value, String> {
+        let running = self.state().running.contains_key(&id);
+        if running
+            && tokio::time::timeout(timeout, self.wait_for(Some(id)))
+                .await
+                .is_err()
+            && self.state().running.contains_key(&id)
+        {
+            return Err(format!(
+                "job[{id}] is still running after {}s",
+                timeout.as_secs_f64()
+            ));
+        }
+        self.snapshot(id, context).await
+    }
+
     pub(super) async fn kill(&self, id: u32) -> Result<Option<String>, String> {
         let requested = {
             let state = self.state();

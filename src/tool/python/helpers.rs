@@ -1,10 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncWriteExt, BufReader},
-    process::ChildStdout,
-};
+use tokio::{io::BufReader, process::ChildStdout};
 
 use super::{
     CANCELLED, CellReview, INTERRUPTED, MAX_FRAME_BYTES, PROGRAM_OUTPUT_BYTES,
@@ -27,8 +24,38 @@ use crate::{
 };
 
 pub(super) const MAX_CELL_IMAGES: usize = 8;
+const HELPER_WATCHDOG_GRACE: Duration = crate::supervise::CLEANUP
+    .saturating_mul(2)
+    .saturating_add(Duration::from_secs(5));
 
-pub(super) async fn answer(
+pub(super) enum Prepared {
+    Handled,
+    End(End),
+    Work(Work),
+}
+
+pub(super) enum Work {
+    Resume,
+    Program(crate::tool::execution::Request, Name),
+    Outside(crate::tool::execution::Request, Name),
+    JobWait { id: u32, timeout: Duration },
+    Background(Value),
+    Other(Helper),
+}
+
+impl Work {
+    pub(super) fn watchdog(&self, channel: &Channel) -> Option<Duration> {
+        let bound = match self {
+            Self::Resume => channel.process.as_ref().map(|process| process.timeout),
+            Self::Program(request, _) | Self::Outside(request, _) => Some(request.timeout),
+            Self::JobWait { timeout, .. } => Some(*timeout),
+            Self::Background(_) | Self::Other(_) => None,
+        }?;
+        Some(bound.saturating_add(HELPER_WATCHDOG_GRACE))
+    }
+}
+
+pub(super) async fn prepare(
     read: std::io::Result<usize>,
     channel: &mut Channel,
     effects: &mut Effects,
@@ -36,18 +63,15 @@ pub(super) async fn answer(
     review: &mut CellReview<'_, '_>,
     live: &Progress,
     room: usize,
-) -> std::io::Result<Option<End>> {
+) -> std::io::Result<Prepared> {
     let call = if channel.process.is_some() {
         None
     } else {
         match transition(read, channel, effects).await? {
-            Transition::End(end) => return Ok(Some(end)),
+            Transition::End(end) => return Ok(Prepared::End(end)),
             Transition::Continue => {
-                channel
-                    .requests
-                    .write_all_buf(&mut channel.exchange.unsent)
-                    .await?;
-                return Ok(None);
+                channel.send().await?;
+                return Ok(Prepared::Handled);
             }
             Transition::Activity(activity) => {
                 let value = match activity {
@@ -63,29 +87,17 @@ pub(super) async fn answer(
                         Value::Null
                     }
                 };
-                channel.exchange.queue(&HostMessage::Result(value));
-                channel
-                    .requests
-                    .write_all_buf(&mut channel.exchange.unsent)
-                    .await?;
-                return Ok(None);
+                channel.reply(&HostMessage::Result(value)).await?;
+                return Ok(Prepared::Handled);
             }
             Transition::Call(call) => Some(call),
         }
     };
-    let Channel {
-        exchange,
-        requests,
-        replies,
-        process: process_task,
-        ..
-    } = channel;
-    exchange.awaiting = true;
-    if exchange.cancelled {
-        process_task.take();
-        exchange.queue(&HostMessage::Error(CANCELLED));
-        requests.write_all_buf(&mut exchange.unsent).await?;
-        return Ok(None);
+    channel.exchange.awaiting = true;
+    if channel.exchange.cancelled {
+        channel.process.take();
+        channel.reply(&HostMessage::Error(CANCELLED)).await?;
+        return Ok(Prepared::Handled);
     }
     let work = match call {
         None => Work::Resume,
@@ -106,22 +118,52 @@ pub(super) async fn answer(
                 }
             }
             Err(error) => {
-                exchange.queue(&HostMessage::Error(&error));
-                requests.write_all_buf(&mut exchange.unsent).await?;
-                return Ok(None);
+                channel.reply(&HostMessage::Error(&error)).await?;
+                return Ok(Prepared::Handled);
             }
         },
+        Some(Helper::JobWait { id, timeout }) => {
+            if !review.context.turn_mode().one_turn() {
+                channel
+                    .reply(&HostMessage::Error(
+                        "job wait is only available in one-turn sessions",
+                    ))
+                    .await?;
+                return Ok(Prepared::Handled);
+            }
+            match crate::tool::execution::parse_timeout(timeout) {
+                Ok(timeout) => Work::JobWait { id, timeout },
+                Err(error) => {
+                    channel.reply(&HostMessage::Error(&error)).await?;
+                    return Ok(Prepared::Handled);
+                }
+            }
+        }
         Some(Helper::Remaining { cell, .. }) => {
             match review.context.artifacts.remaining(cell, room).await {
-                Ok(page) => exchange.queue(&HostMessage::Result(json!(page))),
-                Err(error) => exchange.queue(&HostMessage::Error(&error)),
+                Ok(page) => channel.reply(&HostMessage::Result(json!(page))).await?,
+                Err(error) => channel.reply(&HostMessage::Error(&error)).await?,
             }
-            requests.write_all_buf(&mut exchange.unsent).await?;
-            return Ok(None);
+            return Ok(Prepared::Handled);
         }
         Some(Helper::Background(arguments)) => Work::Background(arguments),
         Some(call) => Work::Other(call),
     };
+    Ok(Prepared::Work(work))
+}
+
+pub(super) async fn finish(
+    work: Work,
+    channel: &mut Channel,
+    effects: &mut Effects,
+    review: &mut CellReview<'_, '_>,
+    live: &Progress,
+) -> std::io::Result<Option<End>> {
+    let Channel {
+        replies,
+        process: process_task,
+        ..
+    } = channel;
     let helped = match work {
         Work::Resume => execute(None, review.context, replies, live, process_task).await?,
         Work::Program(request, name) => {
@@ -142,6 +184,12 @@ pub(super) async fn answer(
                             .await
                             .map(|result| Helped::Program(name, result))
                     }
+                    Work::JobWait { id, timeout } => review
+                        .context
+                        .jobs
+                        .wait(id, timeout, review.context)
+                        .await
+                        .map(Helped::Value),
                     Work::Background(arguments) => job(arguments, review).await,
                     Work::Other(call) => helper(call, review.context, live).await,
                     Work::Resume | Work::Program(..) => unreachable!("handled above"),
@@ -202,19 +250,10 @@ pub(super) async fn answer(
         Err(error) => Err(error),
     };
     match answer {
-        Ok(value) => exchange.queue(&HostMessage::Result(value)),
-        Err(error) => exchange.queue(&HostMessage::Error(&error)),
+        Ok(value) => channel.reply(&HostMessage::Result(value)).await?,
+        Err(error) => channel.reply(&HostMessage::Error(&error)).await?,
     }
-    requests.write_all_buf(&mut exchange.unsent).await?;
     Ok(None)
-}
-
-enum Work {
-    Resume,
-    Program(crate::tool::execution::Request, Name),
-    Outside(crate::tool::execution::Request, Name),
-    Background(Value),
-    Other(Helper),
 }
 
 fn decode(data: &str, mime: Option<&str>, label: String) -> Result<InlineImage, String> {
@@ -243,6 +282,7 @@ pub(super) enum Helped {
 
 pub(super) struct ProgramTask {
     name: Name,
+    pub(super) timeout: Duration,
     pub(super) task: tokio::task::JoinHandle<crate::tool::process::ProgramResult>,
     cancellation: Option<crate::tool::jobs::CommandCancellation>,
 }
@@ -330,6 +370,7 @@ pub(super) async fn start_program(
     let cancellation = Some(process.cancellation());
     Ok(ProgramTask {
         name,
+        timeout,
         cancellation,
         task: tokio::spawn(
             async move { process.finish_result(collector, &progress, timeout).await },
@@ -390,9 +431,10 @@ pub(super) async fn helper(
                 serde_json::to_value(current).expect("identity serializes"),
             ))
         }
-        Helper::Run(_) | Helper::Background(_) | Helper::Remaining { .. } => {
-            Err("commands require the interpreter exchange".into())
-        }
+        Helper::Run(_)
+        | Helper::Background(_)
+        | Helper::JobWait { .. }
+        | Helper::Remaining { .. } => Err("commands require the interpreter exchange".into()),
         Helper::Job { id } => context.jobs.snapshot(id, context).await.map(Helped::Value),
         Helper::Kill { job } => context
             .jobs

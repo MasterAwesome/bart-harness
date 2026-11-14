@@ -1,7 +1,7 @@
-use std::{process::Stdio, sync::Arc, time::Duration};
+use std::{ops::ControlFlow, process::Stdio, sync::Arc, time::Duration};
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, BufReader},
     process::ChildStderr,
     sync::{Mutex, OwnedMutexGuard},
     time,
@@ -11,7 +11,7 @@ use super::{
     CANCELLED, CellReview, INTERRUPTED, MAX_FRAME_BYTES,
     capture::Capture,
     helper_configuration,
-    helpers::answer,
+    helpers::{Prepared, Work, finish, prepare},
     jsonl,
     protocol::HostMessage,
     transport::{CellOutput, Channel, Exchange, Transition, transition},
@@ -296,19 +296,14 @@ impl Running {
     pub(super) async fn cell(
         &mut self,
         code: Option<&str>,
-        mut deadline: time::Instant,
+        deadline: time::Instant,
         capture: &mut Capture,
         review: &mut CellReview<'_, '_>,
     ) -> End {
         let cancelled = capture.cancelled;
-        let Capture {
-            collector,
-            effects,
-            stream,
-            ..
-        } = capture;
         let web_search = review.context.web_route().is_some();
-        let cell = collector
+        let cell = capture
+            .collector
             .cell()
             .expect("a cell's collector holds its output");
         self.prepare_cell(
@@ -320,22 +315,26 @@ impl Running {
                 .diffs
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
-        match time::timeout_at(deadline, self.send()).await {
+        let mut timer = CellTimer::new(deadline);
+        match time::timeout_at(timer.deadline, self.channel.send()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return End::Broken(error),
             Err(_) => return End::TimedOut,
         }
         let mut buffer = vec![0; 64 * 1024];
-        let mut interrupted = false;
-        let child = &self.child;
         let end = loop {
-            self.emission.capture(collector, stream);
-            if !collector.flush_until(deadline).await {
-                match overdue(child, &mut interrupted, &mut deadline) {
-                    Ok(true) => break End::TimedOut,
-                    Ok(false) => {}
-                    Err(error) => break End::Broken(error),
-                }
+            match flush_output(
+                &self.child,
+                &mut self.emission,
+                &mut capture.collector,
+                &mut capture.stream,
+                &mut timer,
+            )
+            .await
+            {
+                Ok(None) => {}
+                Ok(Some(end)) => break end,
+                Err(error) => break End::Broken(error),
             }
             if let (Some(failed), true) = (self.channel.exchange.done, self.emission.ended) {
                 break if cancelled {
@@ -343,7 +342,7 @@ impl Running {
                 } else {
                     End::Done {
                         failed,
-                        interrupted,
+                        interrupted: timer.interrupted,
                     }
                 };
             }
@@ -359,53 +358,47 @@ impl Running {
                     let room = if let Ok(super::protocol::PythonMessage::Call(super::protocol::Helper::Remaining { barrier, .. })) =
                         serde_json::from_slice(&self.channel.replies.frame) {
                         while self.emission.synchronized < barrier {
-                            let n = match time::timeout_at(deadline, self.output.read(&mut buffer)).await {
+                            let n = match time::timeout_at(timer.deadline, self.output.read(&mut buffer)).await {
                                 Ok(Ok(n)) => n,
                                 Ok(Err(error)) => return End::Broken(error),
                                 Err(_) => return End::TimedOut,
                             };
                             if n == 0 { return End::Exited; }
                             self.emission.output.extend_from_slice(&buffer[..n]);
-                            self.emission.capture(collector, stream);
+                            self.emission.capture(&mut capture.collector, &mut capture.stream);
                         }
-                        collector.room().saturating_sub(stream.pending_bytes())
+                        capture.collector.room().saturating_sub(capture.stream.pending_bytes())
                     } else { 0 };
-                    let helper_live = stream.progress();
-                    {
-                        let mut answering = Box::pin(answer(read, &mut self.channel, effects, cell, review, &helper_live, room));
-                        loop {
-                            tokio::select! {
-                                result = &mut answering => break result,
-                                read = self.output.read(&mut buffer), if !self.emission.ended => {
-                                    match read {
-                                        Ok(0) => break Ok(Some(End::Exited)),
-                                        Ok(n) => {
-                                            self.emission.output.extend_from_slice(&buffer[..n]);
-                                            self.emission.capture(collector, stream);
-                                            if !collector.flush_until(deadline).await {
-                                                match overdue(child, &mut interrupted, &mut deadline) {
-                                                    Ok(true) => break Ok(Some(End::TimedOut)),
-                                                    Ok(false) => {},
-                                                    Err(error) => break Err(error),
-                                                }
-                                            }
-                                        }
-                                        Err(error) => break Err(error),
-                                    }
-                                }
-                                () = time::sleep_until(deadline) => {
-                                    match overdue(child, &mut interrupted, &mut deadline) {
-                                        Ok(true) => break Ok(Some(End::TimedOut)),
-                                        Ok(false) => {},
-                                        Err(error) => break Err(error),
-                                    }
-                                }
-                            }
+                    let helper_live = capture.stream.progress();
+                    let prepared = drive_helper(
+                        prepare(
+                            read,
+                            &mut self.channel,
+                            &mut capture.effects,
+                            cell,
+                            review,
+                            &helper_live,
+                            room,
+                        ),
+                        &self.child,
+                        (&mut self.output, &mut buffer),
+                        &mut self.emission,
+                        &mut capture.collector,
+                        &mut capture.stream,
+                        &mut timer,
+                    ).await;
+                    match prepared {
+                        Ok(ControlFlow::Continue(Prepared::Handled)) => Ok(None),
+                        Ok(ControlFlow::Break(end) | ControlFlow::Continue(Prepared::End(end))) => Ok(Some(end)),
+                        Ok(ControlFlow::Continue(Prepared::Work(work))) => {
+                            self.run_work(work, capture, review, &mut buffer, &mut timer)
+                                .await
                         }
+                        Err(error) => Err(error),
                     }
                 }
-                () = time::sleep_until(deadline) => {
-                    overdue(child, &mut interrupted, &mut deadline).map(|ended| ended.then_some(End::TimedOut))
+                () = time::sleep_until(timer.deadline) => {
+                    timer.overdue(&self.child).map(|ended| ended.then_some(End::TimedOut))
                 }
             };
             match step {
@@ -416,17 +409,45 @@ impl Running {
         };
         if !matches!(end, End::Done { .. } | End::Cancelled) {
             let rest = std::mem::take(&mut self.emission.output);
-            stream.render(&rest, |line| collector.line(line));
+            capture
+                .stream
+                .render(&rest, |line| capture.collector.line(line));
         }
-        stream.finish(|line| collector.line(line));
+        capture.stream.finish(|line| capture.collector.line(line));
         end
     }
 
-    pub(super) async fn send(&mut self) -> std::io::Result<()> {
-        self.channel
-            .requests
-            .write_all_buf(&mut self.channel.exchange.unsent)
-            .await
+    async fn run_work(
+        &mut self,
+        work: Work,
+        capture: &mut Capture,
+        review: &mut CellReview<'_, '_>,
+        buffer: &mut [u8],
+        timer: &mut CellTimer,
+    ) -> std::io::Result<Option<End>> {
+        let saved_remaining = timer.pause(work.watchdog(&self.channel));
+        let helper_live = capture.stream.progress();
+        let result = drive_helper(
+            finish(
+                work,
+                &mut self.channel,
+                &mut capture.effects,
+                review,
+                &helper_live,
+            ),
+            &self.child,
+            (&mut self.output, buffer),
+            &mut self.emission,
+            &mut capture.collector,
+            &mut capture.stream,
+            timer,
+        )
+        .await;
+        timer.resume(saved_remaining);
+        result.map(|flow| match flow {
+            ControlFlow::Break(end) => Some(end),
+            ControlFlow::Continue(end) => end,
+        })
     }
 
     pub(super) async fn settle(&mut self, capture: &mut Capture) -> End {
@@ -447,7 +468,7 @@ impl Running {
                 if self.channel.exchange.awaiting {
                     self.channel.exchange.queue(&HostMessage::Error(CANCELLED));
                 }
-                self.send().await?;
+                self.channel.send().await?;
                 self.emission.capture(collector, stream);
                 collector.flush().await;
                 if self.channel.exchange.done.is_some() && self.emission.ended {
@@ -477,18 +498,94 @@ impl Running {
     }
 }
 
-fn overdue(
+async fn drive_helper<T>(
+    helper: impl Future<Output = std::io::Result<T>>,
     child: &crate::child::Owner,
-    interrupted: &mut bool,
-    deadline: &mut time::Instant,
-) -> std::io::Result<bool> {
-    if *interrupted {
-        return Ok(true);
+    (output, buffer): (&mut ChildStderr, &mut [u8]),
+    emission: &mut CellOutput,
+    collector: &mut crate::tool::output::Collector,
+    stream: &mut crate::tool::live::Stream,
+    timer: &mut CellTimer,
+) -> std::io::Result<ControlFlow<End, T>> {
+    tokio::pin!(helper);
+    loop {
+        tokio::select! {
+            result = &mut helper => return result.map(ControlFlow::Continue),
+            read = output.read(buffer), if !emission.ended => {
+                let n = read?;
+                if n == 0 {
+                    return Ok(ControlFlow::Break(End::Exited));
+                }
+                emission.output.extend_from_slice(&buffer[..n]);
+                if let Some(end) = flush_output(child, emission, collector, stream, timer).await? {
+                    return Ok(ControlFlow::Break(end));
+                }
+            }
+            () = time::sleep_until(timer.deadline) => {
+                if timer.overdue(child)? {
+                    return Ok(ControlFlow::Break(End::TimedOut));
+                }
+            }
+        }
     }
-    child.interrupt()?;
-    *interrupted = true;
-    *deadline = time::Instant::now() + INTERRUPT_GRACE;
-    Ok(false)
+}
+
+struct CellTimer {
+    deadline: time::Instant,
+    interrupted: bool,
+}
+
+async fn flush_output(
+    child: &crate::child::Owner,
+    emission: &mut CellOutput,
+    collector: &mut crate::tool::output::Collector,
+    stream: &mut crate::tool::live::Stream,
+    timer: &mut CellTimer,
+) -> std::io::Result<Option<End>> {
+    emission.capture(collector, stream);
+    if !collector.flush_until(timer.deadline).await && timer.overdue(child)? {
+        return Ok(Some(End::TimedOut));
+    }
+    Ok(None)
+}
+
+impl CellTimer {
+    fn new(deadline: time::Instant) -> Self {
+        Self {
+            deadline,
+            interrupted: false,
+        }
+    }
+
+    fn overdue(&mut self, child: &crate::child::Owner) -> std::io::Result<bool> {
+        if self.interrupted {
+            return Ok(true);
+        }
+        child.interrupt()?;
+        self.interrupted = true;
+        self.deadline = time::Instant::now() + INTERRUPT_GRACE;
+        Ok(false)
+    }
+
+    fn pause(&mut self, watchdog: Option<Duration>) -> Option<Duration> {
+        if self.interrupted {
+            return None;
+        }
+        let watchdog = watchdog?;
+        let remaining = self
+            .deadline
+            .saturating_duration_since(time::Instant::now());
+        self.deadline = time::Instant::now() + watchdog;
+        Some(remaining)
+    }
+
+    fn resume(&mut self, saved_remaining: Option<Duration>) {
+        if !self.interrupted
+            && let Some(remaining) = saved_remaining
+        {
+            self.deadline = time::Instant::now() + remaining;
+        }
+    }
 }
 
 pub(in crate::tool) async fn identity(context: &Context) -> Option<String> {

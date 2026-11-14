@@ -193,6 +193,8 @@ def _call(name, **arguments):
         title = f"{public}({target})"
     elif name == "kill":
         title = f"job[{arguments['job']}].kill()"
+    elif name == "job_wait":
+        title = f"job[{arguments['id']}].wait()"
     else:
         title = f"{name}()"
     def outcome(value):
@@ -421,10 +423,9 @@ class Job(Result):
         raise AttributeError(name)
 
     if _CONFIG["one_turn"]:
-        def wait(self):
-            while (result := self._snapshot()).outcome is None:
-                time.sleep(0.2)
-            return result
+        def wait(self, *, timeout=_CONFIG["wait_default_seconds"]):
+            """Wait up to timeout seconds for this job to finish and return its Result."""
+            return Result(**_call("job_wait", id=self.id, timeout=timeout))
 
     def kill(self):
         """Stop this job; completed effects are not rolled back."""
