@@ -3,18 +3,20 @@ use std::path::PathBuf;
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use super::{
     Error, Model, Observation, Observer, Protocol, Request, StatusCode, Tools, Trace, Visibility,
-    deliver, messages, observe, prepare, quota_retry, unix_now, validate,
+    deliver, observe, prepare, quota_retry, unix_now, validate,
 };
 use crate::{
     auth::Credential,
-    history::{Assistant, Content, Message, ToolCall, ToolResult},
+    history::{Assistant, Content, Message, Part, ToolCall, ToolResult},
 };
 use wire::{Frame, Peer, failure};
 
 mod auth;
+mod output;
 mod wire;
 
 const TOOL_PREFIX: &str = "mcp__bart__";
@@ -35,8 +37,8 @@ struct Connection {
     model: String,
     effort: Option<String>,
     history: Vec<Message>,
-    calls: Vec<ToolCall>,
-    answered: usize,
+    active: Option<ToolCall>,
+    output: output::Output,
     reported_cost: f64,
     state: State,
 }
@@ -107,8 +109,8 @@ impl Route {
                 model: request.model.into(),
                 effort: request.reasoning_effort.map(str::to_owned),
                 history: Vec::new(),
-                calls: Vec::new(),
-                answered: 0,
+                active: None,
+                output: output::Output::default(),
                 reported_cost: 0.0,
                 state: State::Idle,
             });
@@ -116,13 +118,12 @@ impl Route {
         Ok(slot.as_mut().expect("the connection was just ensured"))
     }
 
-    /// Native tools run only after their own MCP callback arrives and matches.
-    pub(super) async fn admit(&self, call: &ToolCall) -> Result<(), Error> {
+    pub(super) async fn admit(&self, call: &ToolCall) -> Result<Option<CancellationToken>, Error> {
         let mut slot = self.connection.lock().await;
         let Some(connection) = slot.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
-        let admitted = connection.admit(call).await;
+        let admitted = connection.admit(call).map(Some);
         if admitted.is_err()
             && let Some(connection) = slot.take()
         {
@@ -131,14 +132,12 @@ impl Route {
         admitted
     }
 
-    /// Answers every result but the batch's last, which stays parked until the
-    /// next request so steering and configuration are checked first.
     pub(super) async fn answer(&self, result: &ToolResult) -> Result<(), Error> {
         let mut slot = self.connection.lock().await;
         let Some(connection) = slot.as_mut() else {
             return Ok(());
         };
-        let answered = connection.answer(result).await;
+        let answered = connection.check_result(result);
         if answered.is_err()
             && let Some(connection) = slot.take()
         {
@@ -171,6 +170,7 @@ fn prepare(request: &Request<'_>) -> Result<(Vec<Value>, String), Error> {
     }
     if matches!(request.tools, Tools::Disabled(_)) {
         instructions.push_str("\nTool definitions are reference only for this request. Do not call tools; respond with text only.");
+        tools.clear();
     }
     Ok((tools, instructions))
 }
@@ -279,8 +279,8 @@ impl Connection {
             State::Sending => false,
             State::Streaming => {
                 let stopped = self.peer.interrupt().await.is_ok();
-                self.calls.clear();
-                self.answered = 0;
+                self.active = None;
+                self.output = output::Output::default();
                 self.state = State::Idle;
                 stopped
             }
@@ -298,56 +298,33 @@ impl Connection {
         {
             return false;
         }
-        if self.calls.is_empty() {
+        let Some(call) = &self.active else {
             return true;
+        };
+        suffix.iter().all(result_attachment)
+            && suffix.iter().filter(|message| matches!(message, Message::ToolResult(_))).count() == 1
+            && suffix.iter().any(|message| matches!(message, Message::ToolResult(result) if result.call_id == call.id))
+    }
+
+    fn admit(&self, call: &ToolCall) -> Result<CancellationToken, Error> {
+        if self.state != State::Idle || self.active.as_ref() != Some(call) {
+            return Err(failure(
+                "Bart's tool call is not Claude Code's outstanding request",
+            ));
         }
-        if !suffix.iter().all(batched) {
-            return false;
-        }
-        let outputs: Vec<_> = suffix
-            .iter()
-            .filter_map(|message| match message {
-                Message::ToolResult(result) => Some(result),
-                _ => None,
-            })
-            .collect();
-        outputs.len() == self.calls.len()
-            && self.calls.iter().all(|call| {
-                outputs
-                    .iter()
-                    .filter(|result| result.call_id == call.id)
-                    .count()
-                    == 1
-            })
+        self.peer.admit(call)
     }
 
-    fn next_call(&self, id: &str) -> Result<&ToolCall, Error> {
-        self.calls
-            .get(self.answered)
-            .filter(|call| self.state == State::Idle && call.id == id)
-            .ok_or_else(|| failure("Bart's tool call is not Claude Code's next outstanding call"))
-    }
-
-    async fn admit(&mut self, call: &ToolCall) -> Result<(), Error> {
-        self.next_call(&call.id)?;
-        tokio::time::timeout(
-            super::IDLE_TIMEOUT,
-            self.peer.admit(call, &self.calls[self.answered..]),
-        )
-        .await
-        .map_err(|_| {
-            failure(format!(
-                "Claude Code did not deliver its tool callback within {} seconds",
-                super::IDLE_TIMEOUT.as_secs()
-            ))
-        })?
-    }
-
-    async fn answer(&mut self, result: &ToolResult) -> Result<(), Error> {
-        self.next_call(&result.call_id)?;
-        if self.answered + 1 < self.calls.len() {
-            self.peer.answer(result, Vec::new(), Vec::new()).await?;
-            self.answered += 1;
+    fn check_result(&self, result: &ToolResult) -> Result<(), Error> {
+        if self.state != State::Idle
+            || self
+                .active
+                .as_ref()
+                .is_none_or(|call| call.id != result.call_id)
+        {
+            return Err(failure(
+                "Bart's result is not for Claude Code's outstanding request",
+            ));
         }
         Ok(())
     }
@@ -369,8 +346,8 @@ impl Connection {
         self.peer.reset_budget();
         self.state = State::Sending;
         let suffix = &request.history[self.history.len()..];
-        let parked = !self.calls.is_empty();
-        let fresh = |message: &&Message| !parked || !batched(message);
+        let parked = self.active.is_some();
+        let fresh = |message: &&Message| !parked || !result_attachment(message);
         if suffix.iter().any(|message| fresh(&message)) {
             let slot = prepare::slot().await;
             let input: Vec<_> = suffix.iter().filter(fresh).cloned().collect();
@@ -393,58 +370,44 @@ impl Connection {
                 })??;
         }
         self.history = request.history.to_vec();
-        self.calls.clear();
-        self.answered = 0;
         self.state = State::Streaming;
         let stopper = self.peer.stopper();
         let response = self.respond(request, observer, trace).await;
         stopper.disarm();
         let assistant = response?;
-        self.calls = assistant
-            .parts
-            .iter()
-            .filter_map(|part| match &part.content {
-                Content::ToolCall(call) => Some(call.clone()),
-                _ => None,
-            })
-            .collect();
         self.history.push(Message::Assistant(assistant.clone()));
         self.state = State::Idle;
         Ok(assistant)
     }
 
     async fn release(&mut self, suffix: &[Message]) -> Result<(), Error> {
-        let mut images: Vec<_> = suffix
+        let images = suffix
             .iter()
             .filter_map(|message| match message {
                 Message::Image(image) => Some(image.clone()),
                 _ => None,
             })
             .collect();
-        let mut notes: Vec<_> = suffix
+        let notes = suffix
             .iter()
             .filter_map(|message| match message {
                 Message::Notification(note) => Some(note.text.to_string()),
                 _ => None,
             })
             .collect();
-        let remaining = &self.calls[self.answered..];
-        for (index, call) in remaining.iter().enumerate() {
-            self.peer.admit(call, &remaining[index..]).await?;
-            let result = suffix
-                .iter()
-                .find_map(|message| match message {
-                    Message::ToolResult(result) if result.call_id == call.id => Some(result),
-                    _ => None,
-                })
-                .ok_or_else(|| failure("missing Bart tool result"))?;
-            let (images, notes) = if index + 1 == remaining.len() {
-                (std::mem::take(&mut images), std::mem::take(&mut notes))
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            self.peer.answer(result, images, notes).await?;
-        }
+        let call = self
+            .active
+            .as_ref()
+            .ok_or_else(|| failure("no outstanding Claude Code request"))?;
+        let result = suffix
+            .iter()
+            .find_map(|message| match message {
+                Message::ToolResult(result) if result.call_id == call.id => Some(result),
+                _ => None,
+            })
+            .ok_or_else(|| failure("missing Bart tool result"))?;
+        self.peer.answer(result, images, notes).await?;
+        self.active = None;
         Ok(())
     }
 
@@ -454,59 +417,42 @@ impl Connection {
         observer: &mut impl Observer,
         mut trace: Option<&mut Trace>,
     ) -> Result<Assistant, Error> {
-        let mut stream = messages::Stream::new(request.provider.name(), request.model);
-        let mut complete: Option<Assistant> = None;
         loop {
             let (frame, size) = observe(self.peer.next(), trace.as_deref_mut()).await?;
             if let Some(trace) = &mut trace {
                 trace.chunk(size);
             }
             match frame {
-                Frame::Callback | Frame::Quiet => {}
+                Frame::Quiet | Frame::Control(_) => {}
                 Frame::Limits(limits) => {
                     observer.observation(Observation::Limits(limits));
                     observer.flush().await;
                 }
                 Frame::Stream(event) => {
-                    let done = stream.event(event.get(), &mut |delta| {
-                        deliver(trace.as_deref_mut(), observer, delta);
-                    })?;
-                    if let Some(assistant) = done {
-                        let mut assistant = self.native(request, assistant)?;
-                        if let Some(previous) = complete.take() {
-                            assistant.parts.splice(..0, previous.parts);
-                            if let (Some(old), Some(new)) = (previous.usage, &mut assistant.usage) {
-                                new.output_tokens =
-                                    new.output_tokens.saturating_add(old.output_tokens);
-                                new.reasoning_tokens =
-                                    match (old.reasoning_tokens, new.reasoning_tokens) {
-                                        (None, None) => None,
-                                        (old, new) => {
-                                            Some(old.unwrap_or(0).saturating_add(new.unwrap_or(0)))
-                                        }
-                                    };
-                            }
-                        }
-                        complete = Some(assistant);
-                        stream = messages::Stream::new(request.provider.name(), request.model);
-                    }
+                    self.output
+                        .event(&event, request, observer, trace.as_deref_mut())?;
                     observer.flush().await;
+                }
+                Frame::Assistant(frame) => self.output.assistant(&frame)?,
+                Frame::Call(call) => {
+                    if !self.peer.is_pending(&call.id) {
+                        continue;
+                    }
+                    let mut assistant = self.output.take(request, false);
+                    assistant.parts.push(Part {
+                        content: Content::ToolCall(call.clone()),
+                        replay: None,
+                    });
+                    validate(request, &assistant)?;
+                    self.active = Some(call);
+                    return Ok(assistant);
                 }
                 Frame::Result(frame) => {
                     if frame["is_error"] == true || frame["subtype"] != "success" {
                         return Err(self.failed(&frame, trace));
                     }
-                    if self.peer.has_pending() {
-                        return Err(failure("Claude Code completed with unresolved tools"));
-                    }
-                    let mut assistant = complete.take().ok_or_else(|| {
-                        failure("Claude Code completed without a streamed assistant message")
-                    })?;
-                    if calls(&assistant) {
-                        return Err(failure(
-                            "Claude Code completed without delivering its tool callback",
-                        ));
-                    }
+                    self.peer.finish_turn()?;
+                    let mut assistant = self.output.take(request, true);
                     if let Some(total) = frame["total_cost_usd"]
                         .as_f64()
                         .filter(|total| total.is_finite() && *total >= self.reported_cost)
@@ -520,37 +466,7 @@ impl Connection {
                     return Ok(assistant);
                 }
             }
-            if complete.as_ref().is_some_and(calls) {
-                return Ok(complete.take().expect("completed assistant"));
-            }
         }
-    }
-
-    fn native(&self, request: &Request<'_>, mut assistant: Assistant) -> Result<Assistant, Error> {
-        assistant.protocol = Protocol::Claude;
-        assistant.continues = false;
-        assistant
-            .parts
-            .retain(|part| !matches!(part.content, Content::Other));
-        for part in &mut assistant.parts {
-            part.replay = None;
-            let Content::ToolCall(call) = &mut part.content else {
-                continue;
-            };
-            let name = call
-                .name
-                .strip_prefix(TOOL_PREFIX)
-                .filter(|name| self.peer.tools.iter().any(|tool| tool["name"] == *name))
-                .ok_or_else(|| {
-                    failure(format!(
-                        "Claude Code requested an unoffered tool: {:?}",
-                        call.name
-                    ))
-                })?;
-            call.name = name.to_owned();
-        }
-        validate(request, &assistant)?;
-        Ok(assistant)
     }
 
     fn failed(&self, frame: &Value, trace: Option<&mut Trace>) -> Error {
@@ -595,14 +511,7 @@ impl Connection {
     }
 }
 
-fn calls(assistant: &Assistant) -> bool {
-    assistant
-        .parts
-        .iter()
-        .any(|part| matches!(part.content, Content::ToolCall(_)))
-}
-
-fn batched(message: &Message) -> bool {
+fn result_attachment(message: &Message) -> bool {
     matches!(
         message,
         Message::ToolResult(_) | Message::Image(_) | Message::Notification(_)
@@ -619,7 +528,14 @@ fn project(history: &[Message]) -> Result<Vec<u8>, Error> {
             | Message::Skill(_)
             | Message::Notification(_) => message.model_text().into_owned(),
             Message::Assistant(assistant) => {
-                let parts: Vec<_> = assistant.parts.iter().map(|part| &part.content).collect();
+                let parts: Vec<_> = assistant
+                    .parts
+                    .iter()
+                    .filter_map(|part| match &part.content {
+                        Content::Text(_) | Content::ToolCall(_) => Some(&part.content),
+                        Content::Reasoning(_) | Content::Other => None,
+                    })
+                    .collect();
                 format!(
                     "{}\n{}",
                     bart!(History, "assistant message from {}", assistant.model),

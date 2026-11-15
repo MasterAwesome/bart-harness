@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -280,7 +282,7 @@ struct Failure {
     reason = "fields mirror the provider's wire names"
 )]
 #[derive(Clone, Copy, Default, Deserialize)]
-struct Tokens {
+pub(super) struct Tokens {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
@@ -306,7 +308,7 @@ impl Tokens {
             .or(self.cache_creation_input_tokens);
     }
 
-    fn usage(self) -> Option<Usage> {
+    pub(super) fn usage(self) -> Option<Usage> {
         let (read, write) = (
             self.cache_read_input_tokens,
             self.cache_creation_input_tokens,
@@ -341,6 +343,8 @@ enum BlockDelta {
     InputJson { partial_json: String },
     #[serde(rename = "citations_delta")]
     Citations { citation: Value },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -376,6 +380,8 @@ enum Kind {
         _tool_use_id: String,
         content: SearchContent,
     },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Deserialize)]
@@ -417,19 +423,25 @@ fn invalid(error: &serde_json::Error) -> Error {
     Error::Invalid(format!("invalid Messages event: {error}"))
 }
 
+pub(super) struct Observed {
+    pub(super) usage: Option<Usage>,
+    pub(super) refused: bool,
+}
+
 pub(super) struct Stream {
     provider: String,
     model: String,
     served: Option<String>,
     tokens: Option<Tokens>,
-    blocks: Vec<Block>,
+    blocks: BTreeMap<usize, Block>,
     stop: Option<StopReason>,
+    observational: bool,
 }
 
 struct Block {
     value: Value,
     kind: Kind,
-    input: String,
+    input: Option<String>,
     open: bool,
 }
 
@@ -440,8 +452,16 @@ impl Stream {
             model: model.into(),
             served: None,
             tokens: None,
-            blocks: Vec::new(),
+            blocks: BTreeMap::new(),
             stop: None,
+            observational: false,
+        }
+    }
+
+    pub(super) fn observing(provider: &str, model: &str) -> Self {
+        Self {
+            observational: true,
+            ..Self::new(provider, model)
         }
     }
 
@@ -451,6 +471,30 @@ impl Stream {
         on_delta: &mut dyn FnMut(Delta<'_>),
     ) -> Result<Option<Assistant>, Error> {
         let event: Event = serde_json::from_str(data).map_err(|error| invalid(&error))?;
+        if self.apply(event, on_delta)? {
+            self.finish().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn observe(
+        &mut self,
+        data: &Value,
+        on_delta: &mut dyn FnMut(Delta<'_>),
+    ) -> Result<Option<Observed>, Error> {
+        let event = Event::deserialize(data).map_err(|error| invalid(&error))?;
+        if self.apply(event, on_delta)? {
+            Ok(Some(Observed {
+                usage: self.tokens.and_then(Tokens::usage),
+                refused: self.stop == Some(StopReason::Refusal),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn apply(&mut self, event: Event, on_delta: &mut dyn FnMut(Delta<'_>)) -> Result<bool, Error> {
         let started = self.tokens.is_some();
         match event {
             Event::Ignored => {}
@@ -473,12 +517,19 @@ impl Stream {
                 content_block,
             } => {
                 self.start(index, content_block)?;
-                if matches!(self.blocks[index].kind, Kind::Text { .. }) {
+                if matches!(self.blocks[&index].kind, Kind::Text { .. }) {
                     on_delta(Delta::MessageBoundary);
                 }
             }
             Event::ContentBlockDelta { index, delta } => {
-                self.open(index)?.delta(delta, on_delta)?;
+                let observational = self.observational;
+                let block = self.open(index)?;
+                if !observational
+                    || !(matches!(block.kind, Kind::Unknown)
+                        || matches!(delta, BlockDelta::Unknown))
+                {
+                    block.delta(delta, on_delta)?;
+                }
             }
             Event::ContentBlockStop { index } => {
                 let block = self.open(index)?;
@@ -493,46 +544,52 @@ impl Stream {
                     tokens.update(usage);
                 }
             }
-            Event::MessageStop => return self.finish().map(Some),
+            Event::MessageStop => return Ok(true),
         }
-        Ok(None)
+        Ok(false)
     }
 
     fn start(&mut self, index: usize, value: Value) -> Result<(), Error> {
-        if index != self.blocks.len() {
+        if !self.observational && index != self.blocks.len() {
             return Err(Error::Invalid("content blocks must start in order".into()));
         }
-        if self.blocks.len() == MAX_BLOCKS {
+        if self.blocks.len() == MAX_BLOCKS && !self.blocks.contains_key(&index) {
             return Err(Error::Limit(format!(
                 "more than {MAX_BLOCKS} content blocks"
             )));
         }
         let kind = Kind::deserialize(&value).map_err(|error| invalid(&error))?;
-        self.blocks.push(Block {
-            value,
-            kind,
-            input: String::new(),
-            open: true,
-        });
+        if matches!(kind, Kind::Unknown) && !self.observational {
+            return Err(Error::Invalid("unknown Messages content block type".into()));
+        }
+        self.blocks.insert(
+            index,
+            Block {
+                value,
+                kind,
+                input: (!self.observational).then(String::new),
+                open: true,
+            },
+        );
         Ok(())
     }
 
     fn open(&mut self, index: usize) -> Result<&mut Block, Error> {
         self.blocks
-            .get_mut(index)
+            .get_mut(&index)
             .filter(|block| block.open)
             .ok_or_else(|| Error::Invalid("content event for a block that is not open".into()))
     }
 
     fn finish(&mut self) -> Result<Assistant, Error> {
-        if self.blocks.iter().any(|block| block.open) {
+        if self.blocks.values().any(|block| block.open) {
             return Err(Error::Invalid(
                 "message stopped with an open content block".into(),
             ));
         }
         let calls = self
             .blocks
-            .iter()
+            .values()
             .any(|block| matches!(block.kind, Kind::ToolUse { .. }));
         match self.stop {
             Some(
@@ -560,7 +617,7 @@ impl Stream {
             }
         }
         let parts = std::mem::take(&mut self.blocks)
-            .into_iter()
+            .into_values()
             .map(Block::part)
             .collect::<Result<_, _>>()?;
         Ok(Assistant {
@@ -592,7 +649,9 @@ impl Block {
                 Kind::ToolUse { .. } | Kind::ServerToolUse { .. },
                 BlockDelta::InputJson { partial_json },
             ) => {
-                self.input.push_str(&partial_json);
+                if let Some(input) = &mut self.input {
+                    input.push_str(&partial_json);
+                }
                 on_delta(Delta::ToolBytes(partial_json.len()));
                 return Ok(());
             }
@@ -628,13 +687,13 @@ impl Block {
 
     fn part(self) -> Result<Part, Error> {
         let mut value = self.value;
+        let raw_input = self
+            .input
+            .as_deref()
+            .filter(|input| !input.is_empty())
+            .unwrap_or("{}");
         let input = || -> Result<Map<String, Value>, Error> {
-            let input = if self.input.is_empty() {
-                "{}"
-            } else {
-                &self.input
-            };
-            serde_json::from_str(input)
+            serde_json::from_str(raw_input)
                 .map_err(|_| Error::Invalid("tool input is not a JSON object".into()))
         };
         let content = match self.kind {
@@ -651,19 +710,18 @@ impl Block {
                     _ => Content::Other,
                 }
             }
+            Kind::Unknown => {
+                return Err(Error::Invalid("unknown Messages content block type".into()));
+            }
             Kind::RedactedThinking { .. } | Kind::WebSearchToolResult { .. } => Content::Other,
             Kind::ServerToolUse { .. } => {
-                if !self.input.is_empty() {
+                if self.input.as_ref().is_some_and(|input| !input.is_empty()) {
                     value["input"] = Value::Object(input()?);
                 }
                 Content::Other
             }
             Kind::ToolUse { id, name } => {
-                let arguments = Arguments::from_wire(if self.input.is_empty() {
-                    "{}"
-                } else {
-                    &self.input
-                });
+                let arguments = Arguments::from_wire(raw_input);
                 if arguments.as_object().is_none() {
                     return Err(Error::Invalid("tool input is not a JSON object".into()));
                 }

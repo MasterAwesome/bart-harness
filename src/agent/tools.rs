@@ -22,11 +22,14 @@ impl Session {
         let mut images = Vec::new();
         let mut failed = None;
         for (index, call) in calls.iter().enumerate() {
-            if let Err(error) = self.routing.transport.admit(call).await {
-                self.not_run(&calls[index..], &error, on_event).await;
-                failed = Some(error);
-                break;
-            }
+            let cancellation = match self.routing.transport.admit(call).await {
+                Ok(cancellation) => cancellation,
+                Err(error) => {
+                    self.not_run(&calls[index..], &error, on_event).await;
+                    failed = Some(error);
+                    break;
+                }
+            };
             let pending: usize = images.iter().map(crate::history::Image::history_len).sum();
             let full = Self::check_history_size(self.journal.bytes().saturating_add(pending)).err();
             let code = call.arguments.get("code").and_then(Value::as_str);
@@ -40,25 +43,40 @@ impl Session {
             });
             on_event.flush().await;
             let started = Instant::now();
-            let mut output = if let Some(error) = full {
-                Output::error(bart!(NotRun, "{error}"))
-            } else if stopped {
-                Output::error(bart!(const NotRun, "an earlier review stopped this turn").into())
-            } else if self
-                .routing
-                .preferences()
-                .effective
-                .permissions
-                .approval
-                .mode()
-                != Mode::None
-                || self.context.confinement().jailed()
-            {
-                let (output, stop) = self.reviewed_call(call, &live, on_event).await;
-                stopped = stop;
-                output
-            } else {
-                tool::run(call, &self.context, &live, None).await
+            let mut output = {
+                let execute = async {
+                    if let Some(error) = full {
+                        Output::error(bart!(NotRun, "{error}"))
+                    } else if stopped {
+                        Output::error(
+                            bart!(const NotRun, "an earlier review stopped this turn").into(),
+                        )
+                    } else if self
+                        .routing
+                        .preferences()
+                        .effective
+                        .permissions
+                        .approval
+                        .mode()
+                        != Mode::None
+                        || self.context.confinement().jailed()
+                    {
+                        let (output, stop) = self.reviewed_call(call, &live, on_event).await;
+                        stopped = stop;
+                        output
+                    } else {
+                        tool::run(call, &self.context, &live, None).await
+                    }
+                };
+                if let Some(cancellation) = cancellation {
+                    tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => Output::error(bart!(const Session, "tool request cancelled by Claude Code; earlier effects may remain").into()),
+                        output = execute => output,
+                    }
+                } else {
+                    execute.await
+                }
             };
             let room = if sees_images {
                 MAX_RESPONSE_IMAGES.saturating_sub(images.len())

@@ -143,7 +143,10 @@ impl Transport {
         .map_err(|error| error.sanitized(credential))
     }
 
-    pub(crate) async fn admit(&self, call: &ToolCall) -> Result<(), Error> {
+    pub(crate) async fn admit(
+        &self,
+        call: &ToolCall,
+    ) -> Result<Option<tokio_util::sync::CancellationToken>, Error> {
         self.claude.admit(call).await
     }
 

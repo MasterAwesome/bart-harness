@@ -19,61 +19,95 @@ def record(event, **fields):
         log.write(json.dumps(dict(event=event, pid=os.getpid(), **fields)) + "\n")
 
 
-def callback(index, code=None):
+def callback(index, code=None, name="python", arguments=None):
     send({"type": "control_request", "request_id": f"callback-{index}", "request": {
         "subtype": "mcp_message", "server_name": "bart", "message": {
             "jsonrpc": "2.0", "id": index, "method": "tools/call", "params": {
-                "name": "python", "arguments": {"code": code or CODES[index]},
+                "name": name, "arguments": arguments if arguments is not None else {"code": code or CODES[index]},
                 "_meta": {"claudecode/toolUseId": f"native-{index}", "progressToken": 7}}}}})
 
 
+MESSAGE = 0
+
+
 def response(text=None, codes=None, before_stop=lambda: None):
+    global MESSAGE
+    MESSAGE += 1
+    message_id = f"message-{MESSAGE}"
     codes = codes or CODES
     send({"type": "stream_event", "event": {"type": "message_start", "message": {
-        "id": "message", "model": "fixture", "usage": {"input_tokens": 40000 if text == "NEXT" else 10,
+        "id": message_id, "model": "fixture", "usage": {"input_tokens": 40000 if text == "NEXT" else 10,
         "cache_read_input_tokens": 30, "cache_creation_input_tokens": 4, "output_tokens": 0}}}})
+    offset = 7 if MODE == "observed-only" else 0
+    if offset:
+        send({"type": "stream_event", "event": {"type": "content_block_start", "index": 2,
+              "content_block": {"type": "future_block", "data": "ignored"}}})
+        send({"type": "stream_event", "event": {"type": "content_block_delta", "index": 2,
+              "delta": {"type": "future_delta", "text": "must not display"}}})
+        send({"type": "stream_event", "event": {"type": "content_block_stop", "index": 2}})
     for index in ([1] if text else sorted(codes)):
         block = {"type": "text", "text": ""} if text else {
             "type": "tool_use", "id": f"native-{index}", "name": "mcp__bart__python", "input": {}}
-        send({"type": "stream_event", "event": {"type": "content_block_start", "index": index - 1, "content_block": block}})
+        send({"type": "stream_event", "event": {"type": "content_block_start", "index": index - 1 + offset, "content_block": block}})
         delta = {"type": "text_delta", "text": text} if text else {
-            "type": "input_json_delta", "partial_json": json.dumps({"code": codes[index]})}
-        send({"type": "stream_event", "event": {"type": "content_block_delta", "index": index - 1, "delta": delta}})
-        send({"type": "stream_event", "event": {"type": "content_block_stop", "index": index - 1}})
+            "type": "input_json_delta", "partial_json": '{"code":' if MODE == "observed-only" else json.dumps({"code": codes[index]})}
+        send({"type": "stream_event", "event": {"type": "content_block_delta", "index": index - 1 + offset, "delta": delta}})
+        final = {"type": "text", "text": text} if text else {
+            "type": "tool_use", "id": f"native-{index}", "name": "mcp__bart__python", "input": {"code": codes[index]}}
+        send({"type": "assistant", "message": {"id": message_id, "model": "fixture", "role": "assistant",
+              "content": [final], "usage": {"input_tokens": 10, "output_tokens": 6}}})
+        send({"type": "stream_event", "event": {"type": "content_block_stop", "index": index - 1 + offset}})
     send({"type": "stream_event", "event": {"type": "message_delta", "delta": {
-        "stop_reason": "end_turn" if text else "tool_use"}, "usage": {"output_tokens": 6}}})
+        "stop_reason": ("refusal" if text == "REFUSED" or not text and (codes is CODES or MODE == "observed-only")
+                        else "end_turn" if text else "tool_use")}, "usage": {"output_tokens": 6}}})
     before_stop()
+    if not text and codes is CODES:
+        callback(1)
     send({"type": "stream_event", "event": {"type": "message_stop"}})
     if text:
         send({"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01})
-    elif codes is CODES:
-        callback(1)
 
 
-LATE = False
+MODE = None
 
 
 def marker(name):
     return f'from pathlib import Path\nPath("{name}").write_text("executed")'
 
 
-def unsafe(mode):
+def scenario(mode):
+    global MODE
+    MODE = mode
     if mode == "cancelled":
+        callback(1, 'from pathlib import Path\nimport time\nPath("cancellation-started").write_text("started")\ntime.sleep(30)\nPath("cancelled").write_text("must not happen")')
         def cancel():
-            callback(1, marker(mode))
+            deadline = time.monotonic() + 5
+            while not Path("cancellation-started").exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            for _ in range(32):
+                send({"type": "tool_progress", "tool_use_id": "native-1"})
             send({"type": "control_cancel_request", "request_id": "callback-1"})
-        response(codes={1: marker(mode)}, before_stop=cancel)
-    elif mode == "mismatched":
+            response("CANCELLED")
+        threading.Thread(target=cancel, daemon=True).start()
+    elif mode == "normalized":
+        code = marker("provisional") + '\nprint("\\u00ad")'
+        response(codes={1: code})
+        callback(1, marker("authoritative") + '\nprint("\u00ad")')
+    elif mode == "observed-only":
         response(codes={1: marker(mode)})
-        callback(1, "print(999)")
-    elif mode == "missing":
-        response(codes={1: marker(mode)})
-        send({"type": "result", "subtype": "success", "is_error": False})
-    else:
-        global LATE
-        LATE = True
-        response(codes={1: marker("late-1"), 2: marker("late-2")})
-        callback(1, marker("late-1"))
+        response("OBSERVED")
+    elif mode == "callback-only":
+        callback(1, marker(mode) + '\nprint("CALLBACK")')
+    elif mode == "refusal":
+        response("REFUSED")
+    elif mode == "tool-errors":
+        callback(1, 'print("unused")', name="unregistered")
+    elif mode == "duplicate":
+        send({"type": "assistant", "message": {"id": "redacted", "model": "fixture",
+              "content": [{"type": "redacted_thinking", "data": "opaque-fixture"}],
+              "usage": {"input_tokens": 10, "output_tokens": 0}}})
+        callback(1, marker(mode) + '\nprint("FIRST")')
 
 
 PIXEL = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP4/x8AAwAB/2+Bq7YAAAAASUVORK5CYII="
@@ -121,8 +155,8 @@ def fixture():
                           "result": "You've hit your limit"})
                 else:
                     response("RESUMED")
-            elif text.strip().startswith("unsafe-"):
-                unsafe(text.strip().removeprefix("unsafe-"))
+            elif text.strip().startswith("scenario-"):
+                scenario(text.strip().removeprefix("scenario-"))
             elif "wait-for-cancel" in text:
                 child = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(1000)"])
                 record("waiting", child=child.pid)
@@ -135,15 +169,34 @@ def fixture():
         elif frame["type"] == "control_response":
             result = frame["response"]["response"]["mcp_response"]
             index = result["id"]
-            if LATE:
-                callback(2, "print(999)")
+            if MODE == "normalized":
+                assert "\u00ad" in result["result"]["content"][0]["text"]
+                response("DONE")
+                continue
+            if MODE == "callback-only":
+                assert "CALLBACK" in result["result"]["content"][0]["text"]
+                response("DONE")
+                continue
+            if MODE == "cancelled":
+                raise AssertionError("cancelled request received a reply")
+            if MODE == "tool-errors":
+                assert result["result"]["isError"], result
+                if index == 1:
+                    callback(2, arguments={"code": 123})
+                elif index == 2:
+                    callback(3, arguments={"code": "print('must not run')", "extra": True})
+                else:
+                    response("RECOVERED")
+                continue
+            if MODE == "duplicate":
+                assert "FIRST" in result["result"]["content"][0]["text"]
+                callback(1, marker("duplicate-again"))
                 continue
             assert str(42 if index == 1 else 56) in result["result"]["content"][0]["text"]
             images = [block for block in result["result"]["content"] if block["type"] == "image"]
             assert images == ([{"type": "image", "data": PIXEL, "mimeType": "image/png"}] if index == 2 else []), images
             notes = [block for block in result["result"]["content"] if block.get("text", "").startswith("[Bart job: job[")]
-            assert len(notes) == (index == 2), result
-            record("released", call=index)
+            record("released", call=index, notes=len(notes))
             if index == 1:
                 callback(2)
             else:
@@ -211,6 +264,7 @@ def check(binary):
         first = [e for e in seen if e["pid"] == mains[0]["pid"] and e["event"] == "input"]
         assert len(first) == 2, first
         assert len([e for e in seen if e["event"] == "released"]) == 2
+        assert sum(e["notes"] for e in seen if e["event"] == "released") == 1
         last = [e for e in seen if e["pid"] == mains[1]["pid"] and e["event"] == "input"][0]
         assert "[Bart summary: replaces earlier context" in last["text"], last
         assert 0.01 in costs, costs
@@ -219,20 +273,43 @@ def check(binary):
         assert limited.returncode == 0 and limited.stdout.split() == ["RESUMED"], limited
         assert "HTTP 429 Too Many Requests: You've hit your limit" in limited.stderr, limited.stderr
         assert "for reset, then continuing" in limited.stderr, limited.stderr
-        for mode in ["cancelled", "mismatched", "missing", "late"]:
-            persistent = args[:1] + args[2:] if mode == "late" else args
-            failed = subprocess.run(persistent + ["--prompt", f"unsafe-{mode}"], cwd=root, env=env,
-                                    text=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
-            assert failed.returncode != 0 and "response failed (claude_cli)" in failed.stderr, failed
-            started = failed.stderr.count("\u2192 python(")
-            assert started == (mode == "late"), failed.stderr
-            assert not (root / mode).exists() and not (root / "late-2").exists(), mode
-        assert (root / "late-1").exists()
+        for mode, expected in [("normalized", "DONE"), ("callback-only", "DONE"),
+                               ("observed-only", "OBSERVED"), ("cancelled", "CANCELLED"),
+                               ("tool-errors", "RECOVERED")]:
+            completed = subprocess.run(args + ["--prompt", f"scenario-{mode}"], cwd=root, env=env,
+                                       text=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+            assert completed.returncode == 0 and completed.stdout.strip() == expected, completed
+        assert (root / "authoritative").read_text() == "executed"
+        assert (root / "callback-only").read_text() == "executed"
+        assert not (root / "provisional").exists() and not (root / "observed-only").exists()
+        assert (root / "cancellation-started").exists() and not (root / "cancelled").exists()
+        persistent = args[:1] + args[2:]
+        failed = subprocess.run(persistent + ["--prompt", "scenario-duplicate"], cwd=root, env=env,
+                                text=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        assert failed.returncode != 0 and "duplicate Claude Code tool request" in failed.stderr, failed
+        assert (root / "duplicate").exists() and not (root / "duplicate-again").exists()
         session = next((root / "state" / "bart" / "sessions").rglob("session.jsonl")).read_text()
         results = [message["content"] for line in session.splitlines() for event in [json.loads(line)]
                    if event["event"] == "messages" for message in event["data"] if message["role"] == "tool_result"]
-        assert [(r["call_id"], r["is_error"], r["output"].startswith("[Bart not run: ")) for r in results] == [
-            ("native-1", False, False), ("native-2", True, True)], results
+        assert [(r["call_id"], r["is_error"]) for r in results] == [("native-1", False)], results
+        redacted = [part["replay"] for line in session.splitlines() for event in [json.loads(line)]
+                    if event["event"] == "messages" for message in event["data"] if message["role"] == "assistant"
+                    for part in message["content"]["parts"] if (part.get("replay") or {}).get("type") == "redacted_thinking"]
+        assert redacted == [{"type": "redacted_thinking", "data": "opaque-fixture"}], redacted
+        assert "opaque-fixture" not in failed.stdout + failed.stderr
+        for mode, expected_refusal, expected_text in [("observed-only", False, "OBSERVED"), ("refusal", True, "REFUSED")]:
+            result = subprocess.run(persistent + ["--prompt", f"scenario-{mode}"], cwd=root, env=env,
+                                    text=True, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+            assert result.returncode == 0 and result.stdout.strip() == expected_text, result
+            journals = [[json.loads(line) for line in path.read_text().splitlines()]
+                        for path in (root / "state" / "bart" / "sessions").rglob("session.jsonl")]
+            matching = [journal for journal in journals if any(
+                message["role"] == "user" and message["content"] == f"scenario-{mode}"
+                for event in journal if event["event"] == "messages" for message in event["data"])]
+            assert len(matching) == 1, matching
+            final = [message["content"] for event in matching[0] if event["event"] == "messages"
+                     for message in event["data"] if message["role"] == "assistant"][-1]
+            assert final["refused"] is expected_refusal, final
         waiting = subprocess.Popen(args + ["--prompt", "wait-for-cancel"], cwd=root, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
