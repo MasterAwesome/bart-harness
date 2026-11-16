@@ -5,62 +5,59 @@
   </picture>
 </h1>
 
-<p align="center">A terminal coding agent that works through a persistent Python interpreter.</p>
+<p align="center"><strong>Bart is an agent that likes notebooks!</strong></p>
 
-Bart reads your code, runs commands, edits files and checks the results, in your
-repository and your terminal. Instead of a fixed menu of tools, the model writes
-short Python cells against one long-lived interpreter, so it can loop, filter and
-combine steps the way you would in a notebook. You can follow every step and open
-the exact code, output and file diffs behind it.
-
-It works with a ChatGPT subscription, Claude Code subscription (via
-`claude -p`), or any provider that speaks OpenAI Responses, Chat Completions,
-Anthropic Messages or Gemini.
+A terminal coding harness built in Rust around a single persistent Python interpreter. Multi-step file reads, targeted edits, command runs and verification share one live Python session instead of burning extra model turns per tool call, with full **Ctrl+O** inspection of every step.
 
 ## Install
 
-Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel). Bart needs Python 3.10+
-and Bash.
-
 ```sh
 curl -fsSL https://github.com/MasterAwesome/bart-harness/releases/latest/download/install.sh | sh
+bart login chatgpt
+cd your-work-folder && bart
 ```
 
-The installer checks the download and installs Bart to `~/.local/bin`. If that
-directory is not on your PATH, it prints the line to add to your shell configuration.
-Then run `bart` in your project.
+Linux (`x86_64`, `aarch64`) and macOS (Apple Silicon, Intel), requiring **Python 3.10+** and **Bash**. Installs to `~/.local/bin` ([inspect install.sh](.github/install.sh)); upgrade in place with `bart update`.
 
-Or build from source with
-`cargo install --locked --git https://github.com/MasterAwesome/bart-harness`.
+<details>
+<summary>Build from source and optional Linux dependencies</summary>
 
-Pasting screenshots needs `wl-paste` or `xclip` on Linux. The optional Linux
-sandbox needs a systemd user session, `systemd-run` and bubblewrap.
+- **From source (Rust 1.99+):** `cargo install --locked --git https://github.com/MasterAwesome/bart-harness`
+- **Clipboard images (`Ctrl+V` on Linux):** requires `wl-paste` or `xclip`
+- **Containerless sandbox (`--jail` on Linux):** requires a systemd user session, `systemd-run` and `bubblewrap`
 
-Bart runs with your user permissions and does not ask before acting, like a
-shell you hand to someone else. See [approval and sandbox](#approval-and-sandbox)
-to review actions first.
+</details>
 
-## How it works
+## Why Bart performs well
 
-The model has one tool: run a Python cell. Inside a cell it calls helpers such as
-`read`, `edit`, `write`, `run` and `bg_run` like ordinary functions, and its
-variables stay alive between cells. This follows the idea of executable code
-actions: one cell can read twenty files, run the tests and summarize the
-failures, where a tool-per-step agent needs a round trip for each.
+- **One persistent Python session instead of isolated tool calls.** Imports, parsed ASTs and JSON, helper functions and open handles persist across cells, letting one turn inspect, transform, edit and test without a separate model round-trip per action.
+- **Data stays out of prompt context until needed.** Assigning `text = read(path)` or capturing command output in Python variables lets the agent filter, parse and slice in interpreter memory instead of bloating conversation history with full files or long logs.
+- **Non-blocking background jobs with `bg_run`.** Servers, watchers and slow builds run asynchronously via `bg_run(..., notify=regex)` and wake the session on output matches or process exit instead of burning turns polling.
+- **Lazy MCP discovery without schema bloat.** Configured MCP tools are queried inside Python via `mcp.tools(...)` rather than injecting every server schema into every request.
+- **Step-level inspection and reversible turns.** Press **Ctrl+O** to inspect full Python code, stdout/stderr and diffs behind every cell, or use `/rewind` to roll conversation state back to an earlier message.
 
-## Connect a model
+## Benchmarks
 
-Sign in once; later runs reuse your last choice.
+Across 62 tasks on [FrontierHarness v1.1](https://frontierharness.org) using the same `gpt-6.1-terra` model at medium reasoning effort, Bart passed **68.7%** of tasks at **$0.060** estimated cost per passed task—highest pass rate of the four harnesses tested (vs. **60.0%** Pi, **59.7%** Codex and **53.5%** OpenCode; estimated cost includes failed attempts at list token prices). OpenCode (**$0.037**) and Pi (**$0.043**) cost less per solved task at lower completion rates, while Bart beat Codex on both pass rate (**+9.0 pp**) and cost per passed task (**≈20% lower** than **$0.075**).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/assets/benchmark-dark.svg">
+  <img alt="FrontierHarness v1.1: Bart 68.7%, Pi 60.0%, Codex 59.7%, OpenCode 53.5% pass rate. Estimated cost per passed task, including failed attempts: Bart $0.060, Pi $0.043, Codex $0.075, OpenCode $0.037. Same gpt-6.1-terra model at medium reasoning effort." src=".github/assets/benchmark-light.svg">
+</picture>
+
+<sub>Tested across several Claude and other GPT models in interactive use but benchmarks are expensive, would love contributions here!</sub>
+
+## Providers and auth
+
+Use an existing **ChatGPT** or **Claude Code** subscription, an API provider, or a local model server:
 
 ```sh
-bart login chatgpt            # a ChatGPT subscription (--device to sign in with a code)
+bart login chatgpt            # ChatGPT subscription (--device for headless code login)
 ```
 
-Claude Code works too: install it and sign in with `claude auth login`, and it
-appears in `/model`.
+For Claude Code, install `claude` and run `claude auth login`; Bart discovers it automatically in `/model`.
 
-Any other provider is added with its protocol and base URL, with the API key on
-stdin (`--no-key` for local servers):
+For API and local endpoints, specify `<protocol>:<name>` and pipe the key on stdin (or pass `--no-key`):
 
 ```sh
 bart login responses:openai   --url https://api.openai.com/v1 < key-file
@@ -70,116 +67,52 @@ bart login chat:openrouter    --url https://openrouter.ai/api/v1 < key-file
 bart login chat:local         --url http://localhost:8080/v1 --no-key
 ```
 
-Inside Bart, `/model` switches provider and model and `/effort` sets the reasoning
-effort; **Alt+=** and **Alt+-** step it while you type. `bart models <name>` lists
-a provider's models.
+Switch models with `/model`, adjust reasoning effort with `/effort` (**Alt+=** / **Alt+-** while typing), and list available models with `bart models <name>`.
 
-## Add tools with MCP
+## CLI and scripting
+
+```sh
+bart -p "Summarize the errors in these logs and write summary.md"
+bart --json
+bart --resume
+bart --approval manual --jail --no-network
+```
+
+- `-p, --prompt <TEXT>` runs headless for CI or scripts (`--keep-background-jobs` leaves spawned processes running after completion).
+- `--json` streams a session over JSON lines (`messages` on stdin, `events` on stdout).
+- `--resume` / `--session <ID>` continue saved local sessions; `--temporary` discards history on exit.
+- Run `bart --help` for the full option list.
+
+## Interactive controls and customization
+
+| Key or command | Action |
+| --- | --- |
+| `Enter` | Send prompt, or steer an active turn |
+| `Tab` | Queue a message for the next turn |
+| `Esc` | Interrupt the current turn |
+| `Ctrl+O` | Inspect full code, stdout/stderr and diffs per cell |
+| `Alt+Enter` / `Ctrl+J` | Insert newline |
+| `@` | Insert a workspace file path |
+| `Ctrl+V` | Paste a clipboard screenshot |
+| `/resume`, `/rewind` | Resume a session; undo conversation back to an earlier message (files untouched) |
+| `/compact` | Compact context and continue |
+| `/settings` | Configure approval mode, sandbox and preferences |
+
+### MCP tools, `AGENTS.md` and skills
 
 ```sh
 bart mcp add local -- <command> <args...>
 bart mcp add remote --url https://example.com/mcp --bearer-token-env MCP_TOKEN
 ```
 
-The model finds and calls MCP tools from its Python cells. `/mcps` shows each
-server's status and tools and turns servers on or off.
+Bart calls configured MCP tools directly from Python cells; toggle or inspect servers with `/mcps`. Project conventions load from `AGENTS.md`, and reusable workflows in `~/.agents/skills/<name>/SKILL.md` trigger via `/<name>`.
 
-## Everyday use
+## Execution control, privacy and license
 
-| Key or command | Does |
-| --- | --- |
-| Enter | Send, or steer the turn that is running |
-| Tab | Queue a message for after the turn |
-| Esc | Interrupt |
-| Ctrl+O | Open the full code, output and diffs of each step |
-| Alt+Enter | New line |
-| `@` | Insert a file path from your project |
-| Ctrl+V | Paste a screenshot |
-| `/resume`, `/rewind` | Continue an earlier session; undo the conversation back to a message (not your files) |
-| `/compact` | Shrink the context and keep working |
-| `/settings` | Approval, sandbox, tool view and other preferences |
+- **Permissions and isolation:** Bart executes with your user permissions by default (`--approval none`). Pass `--approval manual` to review each cell, `--approval auto` for automated review, or `--jail` (`--no-network`) on Linux to isolate commands with `bubblewrap`.
+- **Privacy:** **No telemetry.** Session records are saved locally; `/resume` restores history with a fresh Python interpreter. Prompts are sent only to your selected model provider.
+- **Safety and license:** Built in Rust (`unsafe_code = "forbid"`), licensed under **MIT** or **Apache-2.0**.
 
-Bart follows your project's `AGENTS.md`. Skills in `~/.agents/skills/<name>/SKILL.md`
-are used by starting a message with `/<name>`.
+## Feedback
 
-`bart --prompt "…"` runs one turn without the interface, for scripts and CI; a prompt
-piped to `bart` does the same. Background jobs stop when that turn ends. Continue the
-session later with `--resume` or `--session ID`.
-
-For externally managed environments, `bart -p "…" --keep-background-jobs` keeps
-background commands and their descendants alive after successful completion. The
-caller must clean them up (for example, by stopping their container). Cancellation
-and errors still stop jobs. The Python interpreter always exits. Finite work must
-still be awaited with `job.wait()`; this method is only available in one-turn mode.
-The flag cannot be combined with `--jail` or `--temporary`. Output captured before
-handoff remains available; subsequent stdout/stderr are drained and discarded so retained jobs can continue writing without
-broken pipes. Bart and Python exit; the existing native supervisors remain only to
-drain pipes and reap descendants. No further model turns or completion notifications
-occur, and resuming the session does not reconnect to retained jobs.
-If handing off several jobs fails partway through,
-Bart reports an error and cleans up jobs it still owns; already detached jobs remain
-the caller's responsibility.
-
-`bart --json` runs a whole session over JSON lines. Write `{"type":"user","text":"…"}`
-to stdin to start a turn (or to steer a running one), `{"type":"interrupt"}` to stop
-it and `{"type":"compact"}` to compact; closing stdin ends the session and stops its
-jobs. Events arrive on stdout, one object per line, each with a `type`: `session`,
-`turn_started`, `text`, `reasoning`, `tool_started`, `tool_finished`, `job_finished`,
-`job_matched`, `usage` and `turn_done`. `turn_done` carries the final message and
-`jobs_running`; when a job ends, a turn with cause `job` starts by itself.
-A compact request during a turn, or a user message exceeding the pending-input budget,
-produces `request_rejected` with `request` and `error` fields. Retry after `turn_done`.
-A `retrying` event with `discarded: true` replaces the failed attempt's displayed text
-with its `message` field. Closing stdin also interrupts an active turn.
-Piped prompts and individual JSON input lines are limited to 16 MiB.
-
-`bart update` installs the latest release.
-
-## Approval and sandbox
-
-Both are off by default. Change them in `/settings`, or for one run with
-`--approval` and `--jail`.
-
-- **Approval `manual`** shows each cell's code before it runs; you allow or deny it.
-- **Approval `auto`** has a reviewer model you choose judge each cell. It allows
-  routine work that serves your request and asks you about the rest.
-- **Sandbox** (Linux, experimental) runs the model's code with only your project
-  writable. Its `.git` stays read-only. The rest of the machine, your home
-  directory included, stays readable, and the network stays on unless you turn it
-  off, so treat it as protection against accidents, not against a determined attacker.
-
-Headless runs cannot ask you, so they refuse `manual`.
-
-## Sessions and your data
-
-Every session is saved under `~/.local/state/bart/sessions`, readable only by you.
-`/resume` (or `bart --resume`) continues one; Python starts fresh, so earlier
-variables are gone. Configuration and credentials live in `~/.config/bart`.
-
-When reporting a bug, the session's `diagnostics.jsonl` is usually what helps: it
-has request timings and outcomes but no message content or credentials. Do not
-share `session.jsonl`, `output/` or `~/.config/bart`, which hold your
-conversations and keys.
-
-**Bart collects no telemetry:** It connects only to the model provider you
-choose and its sign-in service, the MCP servers you add, and GitHub (for
-`bart update`, and to read the current Codex release number when listing ChatGPT
-models). Commands the model runs can use the network like any program you run.
-
-## Limitations
-
-- Linux and macOS only.
-- On macOS, Bart cleans up a command's process group on a best-effort basis. A
-  program that moves to its own process group or session can escape cleanup.
-  A program that forks and exits quickly can also leave children running in
-  the same group, even after Bart reports completion or tries to stop them.
-- Python variables do not survive quitting; a resumed session starts a fresh
-  interpreter. (Saving interpreter state is being worked on; for now the model
-  is told when its state was cleared.)
-- The Linux sandbox is experimental: your home directory stays readable and it
-  is not a barrier against data leaving the machine.
-- Bart is pre-1.0. Settings and the session format may still change.
-
-`bart --help` lists every command-line option and `bart mcp` the MCP commands.
-
-Licensed under MIT or Apache-2.0, at your option.
+Found a bug or have a proposal? [Open an issue](https://github.com/MasterAwesome/bart-harness/issues/new/choose), or report security issues via a [private advisory](https://github.com/MasterAwesome/bart-harness/security/advisories/new).

@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="532" viewBox="0 0 960 532" role="img" aria-labelledby="title desc">
+<title id="title">FrontierHarness v1.1 — Bart, Codex, Pi and OpenCode</title>
+<desc id="desc">Bart: 68.7% passed, $0.060 estimated cost per passed task; Pi: 60.0% passed, $0.043 estimated cost per passed task; Codex: 59.7% passed, $0.075 estimated cost per passed task; OpenCode: 53.5% passed, $0.037 estimated cost per passed task. Same model and reasoning effort. Higher pass rate and lower cost are better.</desc>
+<style>text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;fill:#edf0f7}</style>
+<text x="8" y="22" font-size="11" font-weight="600" text-anchor="start" style="fill:#a1a7b4">HARNESS EVALUATION</text>
+<text x="8" y="65" font-size="34" font-weight="600" text-anchor="start" style="fill:#edf0f7">FrontierHarness v1.1</text>
+<text x="8" y="94" font-size="15" font-weight="400" text-anchor="start" style="fill:#a1a7b4">gpt-6.1-terra  /  medium reasoning effort</text>
+<path d="M8 118 L952 118" stroke="#2c3340" fill="none"/>
+<text x="8" y="157" font-size="21" font-weight="600" text-anchor="start" style="fill:#edf0f7">Tasks passed</text>
+<text x="8" y="180" font-size="13" font-weight="400" text-anchor="start" style="fill:#a1a7b4">Pass rate (%) · higher is better</text>
+<path d="M96.0 208 L96.0 402" stroke="#2c3340" fill="none"/>
+<text x="96.0" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">0%</text>
+<path d="M168.5 208 L168.5 402" stroke="#2c3340" fill="none"/>
+<text x="168.5" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">25%</text>
+<path d="M241.0 208 L241.0 402" stroke="#2c3340" fill="none"/>
+<text x="241.0" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">50%</text>
+<path d="M313.5 208 L313.5 402" stroke="#2c3340" fill="none"/>
+<text x="313.5" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">75%</text>
+<path d="M386.0 208 L386.0 402" stroke="#2c3340" fill="none"/>
+<text x="386.0" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">100%</text>
+<text x="84" y="236" font-size="14" font-weight="600" text-anchor="end" style="fill:#edf0f7">Bart</text>
+<rect x="96" y="219" width="199.258" height="25" fill="#cc82e4"/>
+<text x="304.258064516129" y="238" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">68.7%</text>
+<text x="84" y="285" font-size="14" font-weight="400" text-anchor="end" style="fill:#edf0f7">Pi</text>
+<rect x="96" y="268" width="174.000" height="25" fill="#8694a8"/>
+<text x="279.0" y="287" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">60.0%</text>
+<text x="84" y="334" font-size="14" font-weight="400" text-anchor="end" style="fill:#edf0f7">Codex</text>
+<rect x="96" y="317" width="173.065" height="25" fill="#8694a8"/>
+<text x="278.0645161290322" y="336" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">59.7%</text>
+<text x="84" y="383" font-size="14" font-weight="400" text-anchor="end" style="fill:#edf0f7">OpenCode</text>
+<rect x="96" y="366" width="155.290" height="25" fill="#8694a8"/>
+<text x="260.2903225806451" y="385" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">53.5%</text>
+<text x="498" y="157" font-size="21" font-weight="600" text-anchor="start" style="fill:#edf0f7">Cost per passed task</text>
+<text x="498" y="180" font-size="13" font-weight="400" text-anchor="start" style="fill:#a1a7b4">Estimated USD · lower is better</text>
+<path d="M586.0 208 L586.0 402" stroke="#2c3340" fill="none"/>
+<text x="586.0" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">$0.00</text>
+<path d="M658.5 208 L658.5 402" stroke="#2c3340" fill="none"/>
+<text x="658.5" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">$0.02</text>
+<path d="M731.0 208 L731.0 402" stroke="#2c3340" fill="none"/>
+<text x="731.0" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">$0.04</text>
+<path d="M803.5 208 L803.5 402" stroke="#2c3340" fill="none"/>
+<text x="803.5" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">$0.06</text>
+<path d="M876.0 208 L876.0 402" stroke="#2c3340" fill="none"/>
+<text x="876.0" y="424" font-size="12" font-weight="400" text-anchor="middle" style="fill:#a1a7b4">$0.08</text>
+<text x="574" y="236" font-size="14" font-weight="600" text-anchor="end" style="fill:#edf0f7">Bart</text>
+<rect x="586" y="219" width="217.456" height="25" fill="#cc82e4"/>
+<text x="812.4555741784037" y="238" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">$0.060</text>
+<text x="574" y="285" font-size="14" font-weight="400" text-anchor="end" style="fill:#edf0f7">Pi</text>
+<rect x="586" y="268" width="155.595" height="25" fill="#8694a8"/>
+<text x="750.5952474462365" y="287" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">$0.043</text>
+<text x="574" y="334" font-size="14" font-weight="400" text-anchor="end" style="fill:#edf0f7">Codex</text>
+<rect x="586" y="317" width="272.859" height="25" fill="#8694a8"/>
+<text x="867.8585604729728" y="336" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">$0.075</text>
+<text x="574" y="383" font-size="14" font-weight="400" text-anchor="end" style="fill:#edf0f7">OpenCode</text>
+<rect x="586" y="366" width="133.552" height="25" fill="#8694a8"/>
+<text x="728.5521844879518" y="385" font-size="19" font-weight="600" text-anchor="start" style="fill:#edf0f7">$0.037</text>
+<path d="M8 449 L952 449" stroke="#2c3340" fill="none"/>
+<text x="8" y="474" font-size="13" font-weight="400" text-anchor="start" style="fill:#a1a7b4">62 tasks. Cost per pass = total estimated cost ÷ tasks passed, including failed attempts.</text>
+<text x="8" y="497" font-size="13" font-weight="400" text-anchor="start" style="fill:#a1a7b4">Bart 0.0.3 (920c9125) · Codex 0.169.0 · Pi 1.5.2 · OpenCode 2.3.0</text>
+<text x="8" y="520" font-size="12" font-weight="400" text-anchor="start" style="fill:#a1a7b4">Cost estimates use recorded token usage at common list prices, not billed charges.</text>
+</svg>
