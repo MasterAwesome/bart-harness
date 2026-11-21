@@ -29,12 +29,25 @@ struct CodexModel {
     #[serde(default)]
     support_verbosity: bool,
     default_verbosity: Option<String>,
+    service_tiers: Option<Value>,
     input_modalities: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct Level {
     effort: String,
+}
+
+pub(super) fn tier_ids(values: &Value) -> Option<Vec<crate::preferences::ServiceTier>> {
+    Some(
+        values
+            .as_array()?
+            .iter()
+            .filter_map(|v| {
+                crate::preferences::ServiceTier::deserialize(v.get("id").unwrap_or(v)).ok()
+            })
+            .collect(),
+    )
 }
 
 pub(super) fn codex_models(list: &Value) -> Result<Vec<super::Model>, Error> {
@@ -51,6 +64,7 @@ pub(super) fn codex_models(list: &Value) -> Result<Vec<super::Model>, Error> {
                     id: model.slug,
                     visibility: super::Visibility::parse(&model.visibility),
                     name: model.display_name,
+                    service_tiers: model.service_tiers.as_ref().and_then(tier_ids),
                     efforts: model
                         .supported_reasoning_levels
                         .into_iter()
@@ -87,6 +101,9 @@ pub(super) fn body(
         "model": request.model,
         "stream": true,
     });
+    if request.service_tier != crate::preferences::ServiceTier::Auto {
+        body["service_tier"] = request.service_tier.as_str().into();
+    }
     body["input"] = Value::Array(input(request)?);
     if let Some(tokens) = request.max_output_tokens.filter(|_| !codex) {
         body["max_output_tokens"] = tokens.into();

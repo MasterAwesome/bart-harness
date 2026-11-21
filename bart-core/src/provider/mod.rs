@@ -7,6 +7,7 @@ use tokio::time;
 use crate::{
     auth::{self, Credential, Store},
     history::{Assistant, Message, ToolDefinition as Definition},
+    preferences::ServiceTier,
 };
 
 mod catalog;
@@ -228,6 +229,29 @@ impl Provider {
         }
     }
 
+    fn supports_tier(&self, model: Option<&Model>, tier: ServiceTier) -> bool {
+        self.protocol() == Protocol::Responses
+            && (tier == ServiceTier::Auto
+                || model
+                    .and_then(|m| m.service_tiers.as_ref())
+                    .is_none_or(|tiers| tiers.contains(&tier)))
+    }
+
+    pub fn service_tiers(&self, model: Option<&Model>) -> Vec<ServiceTier> {
+        ServiceTier::ALL
+            .into_iter()
+            .filter(|&tier| self.supports_tier(model, tier))
+            .collect()
+    }
+
+    pub(crate) fn effective_tier(&self, model: Option<&Model>, tier: ServiceTier) -> ServiceTier {
+        if self.supports_tier(model, tier) {
+            tier
+        } else {
+            ServiceTier::Auto
+        }
+    }
+
     pub fn capabilities(&self) -> Capabilities {
         let Some(http) = self.http() else {
             return Capabilities {
@@ -332,6 +356,7 @@ pub(crate) struct Request<'a> {
     pub(crate) instructions: &'a str,
     pub(crate) history: &'a [Message],
     pub(crate) tools: Tools<'a>,
+    pub(crate) service_tier: ServiceTier,
     pub(crate) reasoning_effort: Option<&'a str>,
     pub(crate) summaries: bool,
     pub(crate) verbosity: Option<&'a str>,

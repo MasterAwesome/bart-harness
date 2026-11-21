@@ -142,7 +142,7 @@ impl Picker {
 
     pub(super) fn context_loaded(
         &mut self,
-        provider: String,
+        provider: &Provider,
         model: String,
         catalog: Option<Model>,
     ) {

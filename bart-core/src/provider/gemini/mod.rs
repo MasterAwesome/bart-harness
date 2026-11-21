@@ -89,6 +89,7 @@ pub(super) fn models(list: &Value) -> Result<super::Page, Error> {
                 verbosity: None,
                 images: None,
                 context_window: model.input_token_limit,
+                service_tiers: None,
                 max_context_window: None,
                 max_output_tokens: model.output_token_limit,
             })

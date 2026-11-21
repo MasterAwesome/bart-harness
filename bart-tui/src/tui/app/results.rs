@@ -173,7 +173,7 @@ impl App {
                                     .into_iter()
                                     .find(|m| m.id == self.info.settings.model);
                                 picker.context_loaded(
-                                    name,
+                                    &self.info.settings.provider,
                                     self.info.settings.model.clone(),
                                     model,
                                 );
@@ -181,7 +181,11 @@ impl App {
                         }
                         Err(error) => {
                             if let Some(Surface::Picker(picker)) = &mut self.surface {
-                                picker.context_loaded(name, self.info.settings.model.clone(), None);
+                                picker.context_loaded(
+                                    &self.info.settings.provider,
+                                    self.info.settings.model.clone(),
+                                    None,
+                                );
                             }
                             self.set_status(
                                 StatusKind::Error,
@@ -327,10 +331,12 @@ impl App {
             self.set_status(StatusKind::Info, "session opening is still running");
             return;
         }
+        let mut preferences = self.info.preferences.clone();
+        preferences.effective.service_tier = crate::preferences::ServiceTier::Auto;
         self.start_task(Task::Open(Box::new(crate::tui::tasks::Opening {
             opener: self.shared.opener.clone(),
             settings,
-            preferences: self.info.preferences.clone(),
+            preferences,
             from,
         })));
     }

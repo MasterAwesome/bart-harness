@@ -62,6 +62,9 @@ impl Routing {
     }
 
     pub(super) fn select(&mut self, settings: Settings) {
+        if self.settings.provider != settings.provider || self.settings.model != settings.model {
+            self.preferences.effective.service_tier = crate::preferences::ServiceTier::Auto;
+        }
         self.settings = settings;
         self.catalog = Catalog::NotLooked;
     }
@@ -160,6 +163,10 @@ impl Routing {
             instructions,
             history,
             tools: provider::Tools::Functions(tools),
+            service_tier: self
+                .settings
+                .provider
+                .effective_tier(entry, self.preferences.effective.service_tier),
             reasoning_effort: self
                 .settings
                 .reasoning_effort
@@ -180,6 +187,13 @@ impl Routing {
         confinement: Confinement,
         mcp_pending: bool,
     ) -> Result<Preferred, String> {
+        if let Change::ServiceTier(tier) = change {
+            self.preferences.effective.service_tier = *tier;
+            return Ok(Preferred {
+                confinement: None,
+                warning: None,
+            });
+        }
         if let Change::ContextWindow {
             provider, model, ..
         } = change
@@ -251,5 +265,74 @@ impl Routing {
 
     pub(super) fn preferences_mut(&mut self) -> &mut Current {
         &mut self.preferences
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        preferences::ServiceTier,
+        provider::{Custom, HttpProtocol, Provider},
+        tool::test_support::TempDir,
+    };
+
+    #[tokio::test]
+    async fn service_tier_is_session_ephemeral_and_resets_on_model_switch() {
+        let dir = TempDir::new("routing-service-tier");
+        let p = Provider::custom(
+            "p",
+            &Custom {
+                protocol: HttpProtocol::Responses,
+                url: "https://fixture.invalid/v1".into(),
+                key: false,
+            },
+        )
+        .unwrap();
+        let mut routing = Routing::new(
+            Client::new(),
+            Store::new(dir.path().join("auth.json")),
+            Settings {
+                provider: p.clone(),
+                model: "m1".into(),
+                reasoning_effort: None,
+            },
+            Current::default(),
+            dir.path().to_path_buf(),
+        );
+        routing
+            .prefer(
+                &Change::ServiceTier(ServiceTier::Flex),
+                dir.path(),
+                Confinement::Unrestricted,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            routing.preferences().effective.service_tier,
+            ServiceTier::Flex
+        );
+        assert!(!dir.path().join("settings.json").exists());
+
+        routing.select(Settings {
+            provider: p.clone(),
+            model: "m1".into(),
+            reasoning_effort: Some("high".into()),
+        });
+        assert_eq!(
+            routing.preferences().effective.service_tier,
+            ServiceTier::Flex
+        );
+
+        routing.select(Settings {
+            provider: p,
+            model: "m2".into(),
+            reasoning_effort: None,
+        });
+        assert_eq!(
+            routing.preferences().effective.service_tier,
+            ServiceTier::Auto
+        );
     }
 }

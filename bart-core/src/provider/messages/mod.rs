@@ -807,6 +807,7 @@ mod tests {
             Message::User("hi".into()),
         ];
         let request = Request {
+            service_tier: Default::default(),
             provider: &provider,
             model: "claude-sonnet-4-6",
             instructions: "",

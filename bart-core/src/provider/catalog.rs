@@ -42,6 +42,7 @@ pub struct Model {
     pub verbosity: Option<String>,
     pub images: Option<bool>,
     pub context_window: Option<u64>,
+    pub service_tiers: Option<Vec<crate::preferences::ServiceTier>>,
     pub max_context_window: Option<u64>,
     pub max_output_tokens: Option<u64>,
 }
@@ -263,6 +264,7 @@ struct ListedModel {
     display_name: Option<String>,
     context_length: Option<u64>,
     context_window: Option<u64>,
+    service_tiers: Option<Value>,
     max_input_tokens: Option<u64>,
     max_context_window: Option<u64>,
     #[serde(default)]
@@ -296,6 +298,7 @@ pub(super) fn data_models(list: &Value) -> Result<Vec<Model>, Error> {
                 .context_length
                 .or(model.context_window)
                 .or(model.max_input_tokens),
+            service_tiers: model.service_tiers.as_ref().and_then(responses::tier_ids),
             max_context_window: model.max_context_window,
             max_output_tokens: None,
         })

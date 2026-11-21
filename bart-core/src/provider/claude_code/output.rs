@@ -142,6 +142,7 @@ mod tests {
     fn second_message_start_without_stop_resets_stream() {
         let provider = Provider { kind: Kind::Claude };
         let request = Request {
+            service_tier: Default::default(),
             provider: &provider,
             model: "claude-sonnet-4-6",
             instructions: "",

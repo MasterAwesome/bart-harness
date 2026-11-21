@@ -56,6 +56,7 @@ fn empty_notification_does_not_emit_empty_part() {
         Message::User("hi".into()),
     ];
     let request = Request {
+        service_tier: Default::default(),
         provider: &provider,
         model: "gemini-2.5-pro",
         instructions: "",

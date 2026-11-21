@@ -78,6 +78,12 @@ impl App {
                 self.set_status(StatusKind::Error, error);
             }
             UiEvent::Switched(Ok(settings)) => {
+                if self.info.settings.provider != settings.provider
+                    || self.info.settings.model != settings.model
+                {
+                    self.info.preferences.effective.service_tier =
+                        crate::preferences::ServiceTier::Auto;
+                }
                 self.info.settings = settings;
                 self.info.limits = None;
             }

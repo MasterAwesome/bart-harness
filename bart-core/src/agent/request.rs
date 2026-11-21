@@ -118,6 +118,7 @@ pub(super) async fn name(
     mut request: Request<'_>,
     on_event: &mut impl Reporter,
 ) -> Result<String, String> {
+    request.service_tier = Default::default();
     request.reasoning_effort = routing
         .cached()
         .filter(|model| model.efforts.iter().any(|effort| effort == "low"))

@@ -593,6 +593,7 @@ fn listing(started: wire::Started, selected: Option<&str>) -> Result<Vec<Model>,
                 verbosity: None,
                 images: None,
                 context_window: None,
+                service_tiers: None,
                 max_context_window: None,
                 max_output_tokens: None,
             };

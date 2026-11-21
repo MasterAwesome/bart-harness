@@ -713,6 +713,7 @@ mod tests {
         };
         let history = [Message::User("hello".into())];
         let request = Request {
+            service_tier: Default::default(),
             provider: &provider,
             model: "m",
             instructions: "be concise",

@@ -12,12 +12,51 @@ pub enum Ui {
     ToolsOnly,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceTier {
+    #[default]
+    Auto,
+    Default,
+    Flex,
+    Scale,
+    Priority,
+    Fast,
+    Ultrafast,
+}
+
+impl ServiceTier {
+    pub const ALL: [Self; 7] = [
+        Self::Auto,
+        Self::Default,
+        Self::Flex,
+        Self::Scale,
+        Self::Priority,
+        Self::Fast,
+        Self::Ultrafast,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Default => "default",
+            Self::Flex => "flex",
+            Self::Scale => "scale",
+            Self::Priority => "priority",
+            Self::Fast => "fast",
+            Self::Ultrafast => "ultrafast",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Preferences {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, BTreeMap<String, ModelPreferences>>,
     pub permissions: Permissions,
+    #[serde(skip)]
+    pub service_tier: ServiceTier,
     pub wait_for_reset: bool,
     pub reasoning_summaries: bool,
     pub diffs: bool,
@@ -75,6 +114,7 @@ impl Default for Preferences {
         Self {
             models: BTreeMap::new(),
             permissions: Permissions::default(),
+            service_tier: ServiceTier::Auto,
             wait_for_reset: true,
             reasoning_summaries: true,
             diffs: true,
@@ -185,7 +225,9 @@ impl Current {
     }
 
     pub fn apply(&mut self, change: &Change) -> Result<(), &'static str> {
-        change.apply(&mut self.saved)?;
+        if !matches!(change, Change::ServiceTier(_)) {
+            change.apply(&mut self.saved)?;
+        }
         change.apply(&mut self.effective)
     }
 }
@@ -201,6 +243,7 @@ pub enum Change {
     Reviewer(crate::choice::Choice),
     Sandbox(bool),
     Network(crate::confinement::Network),
+    ServiceTier(ServiceTier),
     WaitForReset(bool),
     ReasoningSummaries(bool),
     Diffs(bool),
@@ -238,6 +281,7 @@ impl Change {
             Self::Reviewer(reviewer) => preferences.permissions.approval.auto(reviewer.clone()),
             Self::Sandbox(enabled) => preferences.permissions.sandbox.enabled = *enabled,
             Self::Network(network) => preferences.permissions.sandbox.network = *network,
+            Self::ServiceTier(tier) => preferences.service_tier = *tier,
             Self::WaitForReset(enabled) => preferences.wait_for_reset = *enabled,
             Self::ReasoningSummaries(enabled) => preferences.reasoning_summaries = *enabled,
             Self::Diffs(enabled) => preferences.diffs = *enabled,

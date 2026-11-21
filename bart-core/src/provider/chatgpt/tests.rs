@@ -32,6 +32,7 @@ fn credential(account: &str) -> Credential {
 
 fn request<'a>(provider: &'a Provider, history: &'a [Message]) -> Request<'a> {
     Request {
+        service_tier: Default::default(),
         provider,
         model: "m",
         instructions: "instructions",
@@ -46,6 +47,65 @@ fn request<'a>(provider: &'a Provider, history: &'a [Message]) -> Request<'a> {
             window: 0,
         }),
     }
+}
+
+#[test]
+fn service_tier_on_the_wire() {
+    use crate::preferences::ServiceTier;
+    let provider = provider("https://fixture.invalid/v1");
+    let mut request = request(&provider, &[]);
+    for tier in ServiceTier::ALL {
+        request.service_tier = tier;
+        let snapshot = super::super::prepare::Snapshot::new(&request);
+        let body =
+            responses::body(&snapshot.request(&[]), provider.endpoint().unwrap(), false).unwrap();
+        assert_eq!(
+            body.get("service_tier"),
+            (tier != ServiceTier::Auto).then(|| json!(tier)).as_ref()
+        );
+    }
+}
+
+#[test]
+fn service_tier_choices_follow_responses_protocol_and_catalog() {
+    use super::super::{Custom, HttpProtocol, data_models};
+    use crate::preferences::ServiceTier::{self, Auto, Flex};
+    let custom = |protocol| {
+        Provider::custom(
+            "test",
+            &Custom {
+                protocol,
+                url: "https://fixture.invalid/v1".into(),
+                key: false,
+            },
+        )
+        .unwrap()
+    };
+    let model = data_models(&json!({"data":[{"id":"m", "service_tiers":["flex", "turbo"]}]}))
+        .unwrap()
+        .remove(0);
+    let responses = custom(HttpProtocol::Responses);
+    assert_eq!(responses.service_tiers(None), ServiceTier::ALL);
+    assert_eq!(responses.service_tiers(Some(&model)), [Auto, Flex]);
+    assert!(
+        custom(HttpProtocol::Chat)
+            .service_tiers(Some(&model))
+            .is_empty()
+    );
+}
+
+#[test]
+fn service_tier_is_limited_to_codex_catalog() {
+    use crate::preferences::ServiceTier::{Auto, Flex, Priority};
+    let provider = provider("http://localhost");
+    let models = responses::codex_models(&json!({"models":[
+        {"slug":"one","service_tiers":[{"id":"flex"},{"id":"unknown"}]},
+        {"slug":"none", "service_tiers":[]}
+    ]}))
+    .unwrap();
+    assert_eq!(provider.service_tiers(Some(&models[0])), [Auto, Flex]);
+    assert_eq!(provider.service_tiers(Some(&models[1])), [Auto]);
+    assert_eq!(provider.effective_tier(Some(&models[0]), Priority), Auto);
 }
 
 /// Serves Responses over WebSocket. Only the first connection sends a turn state.

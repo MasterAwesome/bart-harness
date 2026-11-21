@@ -536,6 +536,7 @@ impl Gate<'_> {
                 instructions: POLICY,
                 history: &history,
                 tools: provider::Tools::Disabled(&[]),
+                service_tier: Default::default(),
                 reasoning_effort: reviewer.effort.as_deref(),
                 summaries: false,
                 verbosity: None,

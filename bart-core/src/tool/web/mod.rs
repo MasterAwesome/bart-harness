@@ -99,6 +99,7 @@ async fn search_with(
             instructions: &instructions,
             history: &history,
             tools: provider::Tools::WebSearch,
+            service_tier: Default::default(),
             reasoning_effort: route.effort.as_deref(),
             summaries: true,
             verbosity: None,

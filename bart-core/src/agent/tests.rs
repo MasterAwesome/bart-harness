@@ -115,6 +115,7 @@ fn model(window: u64) -> crate::provider::Model {
         verbosity: None,
         images: None,
         context_window: Some(window),
+        service_tiers: None,
         max_context_window: None,
         max_output_tokens: Some(32_000),
     }

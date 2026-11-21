@@ -12,16 +12,18 @@ use crossterm::event::{KeyCode, KeyEvent};
 use super::{Choice, DEFAULT_EFFORT, Entry, Route, models::ModelPicker};
 use crate::{
     approval::Mode,
-    preferences::{Change, ContextWindow, Preferences},
-    provider::Model,
+    preferences::{Change, ContextWindow, Preferences, ServiceTier},
+    provider::{Model, Provider},
     tool::Network,
 };
 
 const CONTEXT: &str = "Context window";
+const TIER: &str = "Responses service tier";
 const SEARCH: &str = "Web search";
 const RETRY_MCP: &str = "MCP restart";
 
 struct Target {
+    tiers: Vec<ServiceTier>,
     provider: String,
     model: String,
     catalog: Option<Model>,
@@ -112,12 +114,13 @@ impl SettingsPicker {
 
     pub(super) fn context_loaded(
         &mut self,
-        provider: String,
+        provider: &Provider,
         model: String,
         catalog: Option<Model>,
     ) {
         self.context = Some(Target {
-            provider,
+            tiers: provider.service_tiers(catalog.as_ref()),
+            provider: provider.name().into(),
             model,
             catalog,
         });
@@ -177,13 +180,39 @@ impl SettingsPicker {
         )
     }
 
+    fn tier_choices(&self) -> Option<(&[ServiceTier], usize)> {
+        let tiers = &self.context.as_ref()?.tiers;
+        if tiers.len() < 2 {
+            return None;
+        }
+        let index = tiers
+            .iter()
+            .position(|&t| t == self.preferences.service_tier)
+            .unwrap_or(0);
+        Some((tiers, index))
+    }
+
+    fn cycle_tier(&self, backwards: bool) -> Choice {
+        let Some((tiers, index)) = self.tier_choices() else {
+            return Choice::Stay;
+        };
+        let step = if backwards { tiers.len() - 1 } else { 1 };
+        Choice::Prefer(Change::ServiceTier(tiers[(index + step) % tiers.len()]))
+    }
+
     fn sections(&self) -> Vec<Section> {
         let mut sections = settings_sections(&self.preferences, self.mcp_retry.as_ref());
-        sections
-            .last_mut()
-            .expect("settings section")
-            .rows
-            .push(self.context_row());
+        let rows = &mut sections.last_mut().expect("settings section").rows;
+        if let Some((tiers, index)) = self.tier_choices() {
+            let mut tier = row(TIER, "", true);
+            tier.options = tiers
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (Clean::literal(t.as_str()), i == index))
+                .collect();
+            rows.push(tier);
+        }
+        rows.push(self.context_row());
         sections
     }
 
@@ -192,6 +221,7 @@ impl SettingsPicker {
             provider,
             model,
             catalog,
+            ..
         }) = &self.context
         else {
             return row(CONTEXT, "loading catalog…", false);
@@ -314,6 +344,9 @@ impl SettingsPicker {
             }
         }
         if key.code == KeyCode::Left {
+            if self.menu.selected_key() == Some(TIER) {
+                return self.cycle_tier(true);
+            }
             if self.menu.selected_key() == Some("Approval") {
                 let approval = &self.preferences.permissions.approval;
                 return match approval.mode() {
@@ -345,6 +378,9 @@ impl SettingsPicker {
     }
 
     fn choose(&mut self, value: &str) -> Choice {
+        if value == TIER {
+            return self.cycle_tier(false);
+        }
         if value == RETRY_MCP {
             return self.mcp_retry.clone().map_or(Choice::Stay, Choice::Prefer);
         }
@@ -395,6 +431,7 @@ impl SettingsPicker {
             provider,
             model,
             catalog,
+            ..
         } = self.context.as_ref().expect("catalog loaded");
         let current = self
             .preferences
@@ -503,6 +540,7 @@ impl SettingsPicker {
         }
     }
     pub(super) fn refresh(&mut self) {
+        let selected = self.menu.selected_key().map(str::to_owned);
         self.menu.title = if self.first_run {
             "first run: check these settings"
         } else {
@@ -510,6 +548,9 @@ impl SettingsPicker {
         }
         .into();
         self.menu.set_sections(self.sections());
+        if let Some(key) = selected {
+            self.menu.select_key(&key);
+        }
         let ready = self.menu.selected_key().is_some_and(|key| {
             self.menu
                 .sections
@@ -759,6 +800,76 @@ mod tests {
         }
     }
 
+    fn fixture_provider(protocol: crate::provider::HttpProtocol) -> Provider {
+        Provider::custom(
+            "fixture",
+            &crate::provider::Custom {
+                protocol,
+                url: "https://fixture.invalid/v1".into(),
+                key: false,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn service_tier_picker_cycles_only_available_options() {
+        use ServiceTier::{Default, Flex, Ultrafast};
+        let mut picker = SettingsPicker::new(Preferences::default(), None);
+        picker.context_loaded(
+            &fixture_provider(crate::provider::HttpProtocol::Chat),
+            "m".into(),
+            None,
+        );
+        assert!(
+            !picker
+                .sections()
+                .iter()
+                .flat_map(|s| &s.rows)
+                .any(|r| r.key == TIER)
+        );
+        let mut model = Model {
+            id: "m".into(),
+            visibility: crate::provider::Visibility::Listed,
+            name: None,
+            efforts: Vec::new(),
+            default_effort: None,
+            summaries: None,
+            verbosity: None,
+            images: None,
+            context_window: Some(128_000),
+            service_tiers: Some(Vec::new()),
+            max_context_window: None,
+            max_output_tokens: None,
+        };
+        let responses = fixture_provider(crate::provider::HttpProtocol::Responses);
+        picker.context_loaded(&responses, "m".into(), Some(model.clone()));
+        assert!(
+            !picker
+                .sections()
+                .iter()
+                .flat_map(|s| &s.rows)
+                .any(|r| r.key == TIER)
+        );
+        model.service_tiers = Some(vec![Flex]);
+        picker.context_loaded(&responses, "m".into(), Some(model));
+        picker.menu.select_key(TIER);
+        assert_eq!(
+            picker.key(key(KeyCode::Left), None),
+            Choice::Prefer(Change::ServiceTier(Flex))
+        );
+        picker.context_loaded(&responses, "m".into(), None);
+        picker.menu.select_key(TIER);
+        assert_eq!(
+            picker.key(key(KeyCode::Left), None),
+            Choice::Prefer(Change::ServiceTier(Ultrafast))
+        );
+        assert_eq!(
+            picker.key(key(KeyCode::Right), None),
+            Choice::Prefer(Change::ServiceTier(Default))
+        );
+    }
+
     #[test]
     fn unrestricted_manual_approval_needs_no_restart_confirmation() {
         let mut picker = SettingsPicker::new(Preferences::default(), None);
@@ -772,7 +883,11 @@ mod tests {
     #[test]
     fn window_prompt_rejects_empty_input_on_tab_as_well_as_enter() {
         let mut picker = SettingsPicker::window(Preferences::default(), None);
-        picker.context_loaded("p".into(), "m".into(), None);
+        picker.context_loaded(
+            &fixture_provider(crate::provider::HttpProtocol::Chat),
+            "m".into(),
+            None,
+        );
         assert_eq!(
             picker.key(key(KeyCode::Tab), None),
             Choice::Refused("enter the model's context window in tokens".into())

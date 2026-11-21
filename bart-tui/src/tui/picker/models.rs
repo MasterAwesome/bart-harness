@@ -323,6 +323,7 @@ mod tests {
                 id: "gpt-5.4".into(),
                 name: None,
                 context_window: Some(128_000),
+                service_tiers: None,
                 max_context_window: None,
                 max_output_tokens: None,
                 images: None,
