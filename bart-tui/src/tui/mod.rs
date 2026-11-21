@@ -23,6 +23,7 @@ mod clipboard;
 mod composer;
 mod highlight;
 mod input;
+mod links;
 mod markdown;
 mod mention;
 mod palette;
@@ -87,6 +88,7 @@ pub(crate) async fn run(
     launch: Launch,
     terminations: crate::signals::Terminations,
 ) -> Result<(), String> {
+    links::init().await;
     let failed = |error: io::Error| format!("terminal error: {error}");
     let job_control = crate::signals::JobControl::listen().map_err(failed)?;
     let (mut screen, input_mode, pending) = start().map_err(failed)?;

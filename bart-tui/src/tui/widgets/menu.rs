@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::Rect,
-    style::Stylize,
+    style::{Style, Stylize},
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -17,6 +17,7 @@ pub(in crate::tui) struct Row {
     pub(in crate::tui) key: String,
     pub(in crate::tui) label: Clean,
     pub(in crate::tui) note: Clean,
+    pub(in crate::tui) note_style: Style,
     pub(in crate::tui) detail: Clean,
     pub(in crate::tui) options: Vec<(Clean, bool)>,
     pub(in crate::tui) state: State,
@@ -26,6 +27,7 @@ pub(in crate::tui) fn row(key: &str, note: &str, ready: bool) -> Row {
         key: key.into(),
         label: Clean::new(key),
         note: Clean::new(note),
+        note_style: Style::new(),
         detail: Clean::default(),
         options: Vec::new(),
         state: if ready {
@@ -304,7 +306,10 @@ impl Menu {
             } else {
                 text::clip_end(&value, room)
             };
-            let line = Line::from(format!("{prefix}{value}"));
+            let mut line = Line::from(vec![Span::raw(prefix), Span::styled(value, row.note_style)]);
+            if let Some(spans) = crate::tui::links::annotated(&line.spans) {
+                line.spans = spans;
+            }
             lines.push(if row.state == State::Unavailable {
                 line.dim()
             } else if selected {

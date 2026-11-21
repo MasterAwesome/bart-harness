@@ -1,6 +1,7 @@
 use crate::tui::text::Clean;
 use crate::tui::widgets::menu::{Hint, Menu, Row, Section, row};
 use crossterm::event::KeyEvent;
+use ratatui::style::Style;
 
 use super::{Choice, DEFAULT_EFFORT, Entry};
 use crate::provider::{Model, Provider, Visibility};
@@ -101,6 +102,10 @@ impl ModelPicker {
                     };
                     Row {
                         label: Clean::new(entry.provider.label()),
+                        note_style: crate::tui::links::style(
+                            Style::new(),
+                            entry.provider.endpoint().filter(|_| entry.ready).cloned(),
+                        ),
                         ..row(entry.provider.name(), &note, entry.ready)
                     }
                 })

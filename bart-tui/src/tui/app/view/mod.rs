@@ -52,6 +52,7 @@ impl App {
                     .content
                     .iter()
                     .any(|cell| SPIN.contains(&cell.symbol()));
+            crate::tui::links::paint(frame.buffer_mut());
         })?;
         let stamp = FrameStamp {
             seq: self.paint.seq + 1,
@@ -201,10 +202,14 @@ impl App {
         );
         if hint_rows > 0 {
             let hint = match self.status.text() {
-                Some(text) => Line::from(Span::styled(
-                    clip_end(&format!("  {text}"), usize::from(hints.width)),
-                    Style::new().fg(brand()),
-                )),
+                Some(text) => {
+                    let text = format!("  {text}");
+                    Line::from(crate::tui::links::clipped(
+                        &text,
+                        clip_end(&text, usize::from(hints.width)),
+                        Style::new().fg(brand()),
+                    ))
+                }
                 None => self.hint_line(usize::from(hints.width), hint_context),
             };
             frame.render_widget(Paragraph::new(hint), hints);
@@ -502,12 +507,16 @@ impl App {
                 found
                     .into_iter()
                     .map(|found| {
+                        let style = crate::tui::links::style(
+                            Style::new(),
+                            crate::tui::links::file(&self.shared.opener.cwd.join(&found.path)),
+                        );
                         found
                             .display
                             .chars()
                             .enumerate()
                             .map(|(at, c)| {
-                                let span = Span::raw(c.to_string());
+                                let span = Span::styled(c.to_string(), style);
                                 if found.matched.contains(&at) {
                                     span.fg(brand()).bold()
                                 } else {

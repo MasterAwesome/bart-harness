@@ -271,25 +271,32 @@ fn render_events<'a>(
 fn inline(nodes: &[Node<'_>], style: Style, out: &mut Vec<Span<'static>>) {
     for node in nodes {
         match node {
+            Node::Element(Tag::Link { dest_url, .. }, children) => {
+                let link = crate::tui::links::markdown_style(style, dest_url);
+                let label_style = link.unwrap_or_else(|| style.underlined());
+                let start = out.len();
+                inline(children, label_style, out);
+                let label = &out[start..];
+                if label.iter().all(|span| span.content.trim().is_empty()) {
+                    out.truncate(start);
+                    out.push(Span::styled(Clean::new(dest_url), label_style));
+                } else if link.is_none()
+                    && !label
+                        .iter()
+                        .flat_map(|span| span.content.bytes())
+                        .eq(dest_url.bytes())
+                {
+                    out.push(Span::styled(Clean::new(&format!(" ({dest_url})")), style));
+                }
+            }
             Node::Element(tag, children) => {
                 let next = match tag {
                     Tag::Emphasis => style.italic(),
                     Tag::Strong => style.bold(),
                     Tag::Strikethrough => style.crossed_out(),
-                    Tag::Link { .. } => style.underlined(),
                     _ => style,
                 };
-                let start = out.len();
                 inline(children, next, out);
-                if let Tag::Link { dest_url, .. } = tag {
-                    let label: String = out[start..]
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect();
-                    if label != dest_url.as_ref() {
-                        out.push(Span::styled(Clean::new(&format!(" ({dest_url})")), style));
-                    }
-                }
             }
             Node::Leaf(event) => match event {
                 Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {

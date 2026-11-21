@@ -75,3 +75,48 @@ fn empty_notice_does_not_panic() {
     let block = transcript.notice(ratatui::text::Text::from("   "));
     assert!(block.rows.is_empty());
 }
+
+#[test]
+fn markdown_links_underline_and_show_url_only_when_osc8_unavailable() {
+    let source = "See [docs](https://example.com/guide) and [mail](mailto:hi@example.com).";
+    let disabled = super::super::links::with_enabled(false, || {
+        separated_with(source, STREAM_WIDTH, &References::new())
+            .into_iter()
+            .flat_map(|row| row.project(80))
+            .collect::<Vec<_>>()
+    });
+    let disabled_text: String = disabled.iter().map(ToString::to_string).collect();
+    assert!(disabled_text.contains("docs (https://example.com/guide)"));
+    assert!(disabled_text.contains("mail (mailto:hi@example.com)"));
+    assert!(disabled.iter().flat_map(|line| &line.spans).any(|span| {
+        span.content == "docs"
+            && span
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+    }));
+
+    let enabled = super::super::links::with_enabled(true, || {
+        separated_with(source, STREAM_WIDTH, &References::new())
+            .into_iter()
+            .flat_map(|row| row.project(80))
+            .collect::<Vec<_>>()
+    });
+    let enabled_text: String = enabled.iter().map(ToString::to_string).collect();
+    assert!(enabled_text.contains("See docs and mail (mailto:hi@example.com)."));
+    assert!(!enabled_text.contains("(https://example.com/guide)"));
+    assert!(
+        enabled
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.content == "docs" && span.style.underline_color.is_some())
+    );
+    assert!(enabled.iter().flat_map(|line| &line.spans).any(|span| {
+        span.content == "mail"
+            && span.style.underline_color.is_none()
+            && span
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+    }));
+}

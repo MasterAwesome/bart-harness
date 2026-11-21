@@ -203,8 +203,8 @@ pub(super) fn tools(
         let right = format!("{summary}{duration}");
         let Subject { name, rest } = &call.subject;
         let room = width.saturating_sub(text::width(&right) + 5 + text::width(name));
-        let rest = clip_end(rest, room);
-        let left = format!("{glyph} {name}{rest}");
+        let clipped = clip_end(rest, room);
+        let left = format!("{glyph} {name}{clipped}");
         let gap = width
             .saturating_sub(text::width(&left) + text::width(&right) + 1)
             .max(2);
@@ -214,15 +214,18 @@ pub(super) fn tools(
         } else {
             quiet
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(glyph, Style::new().fg(color)),
             Span::raw(" "),
             Span::styled(name.clone(), quiet.bold()),
-            Span::styled(rest, quiet),
+        ];
+        spans.extend(crate::tui::links::clipped(rest, clipped, quiet));
+        spans.extend([
             Span::raw(" ".repeat(gap)),
             Span::styled(summary, summary_style),
             Span::styled(duration, quiet),
-        ]));
+        ]);
+        lines.push(Line::from(spans));
         for line in expand {
             lines.push(Line::from(vec![
                 Span::raw("    ").dim(),
@@ -238,10 +241,12 @@ pub(super) fn tools(
                 .filter(|activity| activity.state == crate::tool::LiveState::Running)
                 .collect();
             for activity in running.iter().take(RUNNING_SHOWN) {
-                lines.push(Line::styled(
-                    clip_end(&format!("  ↳ {}", activity.title), width),
+                let text = format!("  ↳ {}", activity.title);
+                lines.push(Line::from(crate::tui::links::clipped(
+                    &text,
+                    clip_end(&text, width),
                     quiet,
-                ));
+                )));
             }
             if running.len() > RUNNING_SHOWN {
                 lines.push(Line::styled(
@@ -305,7 +310,15 @@ pub(super) fn activities(
                     spans.push(Span::raw(arguments.to_owned()));
                     spans.push(Span::styled(")", muted(Style::new())));
                 } else {
-                    spans.push(Span::raw(arguments.to_owned()));
+                    let original = activity
+                        .title
+                        .split_once('(')
+                        .map_or(arguments, |(_, args)| args);
+                    spans.extend(crate::tui::links::clipped(
+                        original,
+                        arguments.to_owned(),
+                        Style::new(),
+                    ));
                 }
             }
             spans.extend([
@@ -340,7 +353,15 @@ pub(super) fn activities(
 pub(super) fn diff_rows(diffs: &[DisplayDiff], prefix: &str) -> Vec<Line<'static>> {
     let quiet = muted(Style::new());
     let rows = diffs.iter().flat_map(|diff| {
-        std::iter::once((quiet.bold(), &*diff.path, false)).chain(diff.hunks.lines().map(|line| {
+        std::iter::once((
+            crate::tui::links::style(
+                quiet.bold(),
+                crate::tui::links::file(std::path::Path::new(&*diff.path)),
+            ),
+            &*diff.path,
+            false,
+        ))
+        .chain(diff.hunks.lines().map(|line| {
             let (style, bar) = diff_style(line);
             (style, line, bar)
         }))

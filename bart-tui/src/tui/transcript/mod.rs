@@ -476,6 +476,7 @@ impl Transcript {
             UiEvent::ToolBytes(_) | UiEvent::Approval(_) | UiEvent::CompactingBytes(_) => {}
             UiEvent::Responded => self.responded = true,
             UiEvent::Image(path) => {
+                let target = crate::tui::links::file(&path);
                 self.flush_text(&mut done, width);
                 let path = crate::terminal_text::safe_text(
                     &path.to_string_lossy(),
@@ -487,7 +488,16 @@ impl Transcript {
                 } else {
                     format!("display({path})")
                 };
+                let link = crate::tui::links::style(Style::new(), target);
                 self.note(&title, &path);
+                if link != Style::new()
+                    && let Some(detail) = self.details.last_mut()
+                {
+                    detail.highlights.push(Highlight {
+                        range: 0..detail.output.len(),
+                        style: link,
+                    });
+                }
                 let quiet = muted(Style::new().italic());
                 self.emit(
                     Kind::Tools(Vec::new()),
@@ -501,14 +511,9 @@ impl Transcript {
                                 Style::new().fg(brand()).bold()
                             },
                         ),
-                        Span::styled(
-                            if cells {
-                                format!(" · {path}")
-                            } else {
-                                format!("({path})")
-                            },
-                            quiet,
-                        ),
+                        Span::styled(if cells { " · " } else { "(" }, quiet),
+                        Span::styled(path, quiet.patch(link)),
+                        Span::styled(if cells { "" } else { ")" }, quiet),
                     ])),
                     &mut done,
                 );
@@ -640,7 +645,10 @@ impl Transcript {
                     body.push_str(&diff.path);
                     detail.highlights.push(Highlight {
                         range: start..body.len(),
-                        style: muted(Style::new()).bold(),
+                        style: crate::tui::links::style(
+                            muted(Style::new()).bold(),
+                            crate::tui::links::file(std::path::Path::new(&*diff.path)),
+                        ),
                     });
                     for line in diff.hunks.lines() {
                         body.push('\n');

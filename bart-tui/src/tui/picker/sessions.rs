@@ -11,6 +11,7 @@ use crate::{
     },
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Style;
 use std::time::{Duration, SystemTime};
 
 pub(in crate::tui) struct SessionPicker {
@@ -101,6 +102,15 @@ impl SessionPicker {
                             || !session.in_use
                                 && (self.purpose == Purpose::Delete || session.description.is_ok()),
                     );
+                    if self.all
+                        && (!session.in_use || current)
+                        && let Ok(description) = &session.description
+                    {
+                        r.note_style = crate::tui::links::style(
+                            Style::new(),
+                            crate::tui::links::file(&description.meta.cwd),
+                        );
+                    }
                     let marker = if current { "[current session] " } else { "" };
                     r.label = Clean::new(&format!("{marker}{}  {preview}", age(session.modified)));
                     r

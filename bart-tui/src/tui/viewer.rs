@@ -19,7 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use std::{borrow::Cow, fmt::Write as _};
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Selection {
@@ -566,18 +566,49 @@ impl Viewer {
                     .output
                     .split_inclusive('\n')
                     .map(|segment| {
-                        while highlights
-                            .peek()
-                            .is_some_and(|span| span.range.end <= offset)
-                        {
-                            highlights.next();
+                        let line = segment.trim_end_matches(['\n', '\r']);
+                        let line_end = offset + line.len();
+                        let mut spans = Vec::new();
+                        let mut line_bg = None;
+                        let mut at = offset;
+                        while at < line_end {
+                            while highlights.peek().is_some_and(|span| span.range.end <= at) {
+                                highlights.next();
+                            }
+                            let (to, style) = match highlights.peek() {
+                                Some(span) if span.range.start <= at => {
+                                    if span.range.start <= offset && span.range.end >= line_end {
+                                        line_bg = line_bg.or(span.style.bg);
+                                    }
+                                    (line_end.min(span.range.end), span.style)
+                                }
+                                Some(span) => (line_end.min(span.range.start), Style::new()),
+                                None => (line_end, Style::new()),
+                            };
+                            spans.push(Span::styled(
+                                line[at - offset..to - offset].to_owned(),
+                                style,
+                            ));
+                            at = to;
                         }
-                        let style = highlights
-                            .peek()
-                            .filter(|span| span.range.start <= offset)
-                            .map_or(Style::new(), |span| span.style);
+                        if spans.is_empty() {
+                            while highlights
+                                .peek()
+                                .is_some_and(|span| span.range.end <= offset)
+                            {
+                                highlights.next();
+                            }
+                            if let Some(span) = highlights.peek().filter(|span| {
+                                span.range.start <= offset && span.range.end > offset
+                            }) {
+                                line_bg = span.style.bg;
+                            }
+                        }
                         offset += segment.len();
-                        Line::styled(segment.trim_end_matches(['\n', '\r']).to_owned(), style)
+                        Line::from(spans).style(Style {
+                            bg: line_bg,
+                            ..Style::new()
+                        })
                     })
                     .collect()
             };
@@ -1025,13 +1056,25 @@ fn content<'a>(selected: Selection, details: &'a [Detail], live: &Live) -> Optio
     }
 }
 fn from_snapshot(snapshot: Snapshot) -> Content<'static> {
-    let mut output = snapshot.output;
+    let mut output = Clean::new(&snapshot.output).to_string();
+    let mut highlights = Vec::new();
     if let Some(path) = snapshot.saved {
-        let _ = write!(output, "\n[saved printed output: {}]", path.display());
+        let target = super::links::file(&path);
+        output.push_str("\n[saved printed output: ");
+        let start = output.len();
+        output.push_str(&Clean::new(&path.display().to_string()));
+        let end = output.len();
+        output.push(']');
+        let style = super::links::style(Style::new(), target);
+        if style != Style::new() {
+            highlights.push(Highlight {
+                range: start..end,
+                style,
+            });
+        }
     }
-    let output = Clean::new(&output);
     let (output, output_complete, highlights) =
-        output_excerpt(&output, snapshot.output_complete, &[]);
+        output_excerpt(&output, snapshot.output_complete, &highlights);
     Content {
         title: Clean::new(&snapshot.summary.title).to_string(),
         review: None,
@@ -1118,5 +1161,79 @@ mod tests {
         key(&mut viewer, &mut status, KeyCode::Enter);
         key(&mut viewer, &mut status, KeyCode::Char('n'));
         assert!(draw(&mut viewer, &mut status).contains("[2/2]"));
+    }
+
+    #[test]
+    fn link_highlights_do_not_bleed_into_trailing_cells_and_saved_paths_stay_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("my output.txt");
+        std::fs::write(&saved, "ok\n").unwrap();
+
+        let make_snapshot = || Snapshot {
+            summary: crate::tool::LiveSummary {
+                id: 1,
+                job: None,
+                title: "run".into(),
+                state: LiveState::Finished,
+                order: 1,
+            },
+            code: String::new(),
+            code_complete: true,
+            output: "hello".into(),
+            output_complete: true,
+            saved: Some(saved.clone()),
+        };
+
+        let disabled = super::super::links::with_enabled(false, || from_snapshot(make_snapshot()));
+        assert!(
+            disabled
+                .output
+                .contains(&format!("[saved printed output: {}]", saved.display()))
+        );
+        assert!(!disabled.output.contains("file://"));
+        assert!(disabled.highlights.is_empty());
+
+        super::super::links::with_enabled(true, || {
+            let content = from_snapshot(make_snapshot());
+            assert!(
+                content
+                    .output
+                    .contains(&format!("[saved printed output: {}]", saved.display()))
+            );
+            assert_eq!(content.highlights.len(), 1);
+            assert_eq!(
+                &content.output[content.highlights[0].range.clone()],
+                saved.display().to_string()
+            );
+
+            let mut transcript = crate::tui::transcript::Transcript::default();
+            transcript.apply(crate::tui::session::UiEvent::Image(saved.clone()), 80);
+            let details = transcript.details();
+            let live = Live::default();
+            let mut viewer = Viewer::new(details, &live, true);
+            let mut status = Status::default();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).unwrap();
+            viewer.prepare(Size::new(80, 10), details, &live, &mut status);
+            terminal
+                .draw(|frame| {
+                    viewer.draw(frame, &status);
+                    super::super::links::paint(frame.buffer_mut());
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer();
+            let row = viewer.output.area.y;
+            assert!(buf[(0, row)].symbol().contains("\x1b]8;id=bart"));
+            assert!(
+                !buf[(79, row)].symbol().contains("\x1b]8;"),
+                "trailing blank cell must not be wrapped in OSC 8"
+            );
+            assert!(
+                !buf[(79, row)]
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED),
+                "trailing blank cell must not be underlined"
+            );
+        });
     }
 }

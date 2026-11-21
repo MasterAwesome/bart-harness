@@ -90,6 +90,8 @@ pub(super) fn wrap(
     if limit == 0 || width == 0 {
         return (Vec::new(), !spans.is_empty());
     }
+    let annotated = super::links::annotated(spans);
+    let spans = annotated.as_deref().unwrap_or(spans);
     let indent = if matches!(mode, Wrap::Prose) {
         spans
             .iter()

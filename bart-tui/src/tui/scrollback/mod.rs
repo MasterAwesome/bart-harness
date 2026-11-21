@@ -25,7 +25,7 @@ fn wrapped(source: &[RenderRow], block: u64, width: u16) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut byte = 0;
     for logical in source {
-        for line in logical.project(width) {
+        for mut line in logical.project(width) {
             let len = line
                 .spans
                 .iter()
@@ -39,6 +39,9 @@ fn wrapped(source: &[RenderRow], block: u64, width: u16) -> Vec<Row> {
                 <= usize::from(width.max(1))
                 && !line.spans.iter().any(|span| span.content.contains('\n'))
             {
+                if let Some(spans) = super::links::annotated(&line.spans) {
+                    line.spans = spans;
+                }
                 rows.push(Row {
                     block,
                     byte,
