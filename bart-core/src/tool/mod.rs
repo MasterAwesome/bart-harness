@@ -57,6 +57,7 @@ pub struct Context {
     artifacts: Arc<output::Storage>,
     output_budget: usize,
     cell_timeout: std::time::Duration,
+    sees_images: std::sync::atomic::AtomicBool,
     pub diffs: std::sync::atomic::AtomicBool,
     turn_mode: std::sync::Mutex<TurnMode>,
     environment: std::sync::Mutex<Environment>,
@@ -148,6 +149,7 @@ impl Context {
             spill_dir,
             output_budget,
             cell_timeout: python::CELL_TIMEOUT,
+            sees_images: std::sync::atomic::AtomicBool::new(true),
             diffs: std::sync::atomic::AtomicBool::new(true),
             turn_mode: std::sync::Mutex::default(),
             environment: std::sync::Mutex::new(Environment {
@@ -310,6 +312,16 @@ impl Context {
         self.interpreter.reset();
     }
 
+    pub fn set_image_input(&self, support: crate::provider::ImageInput) {
+        self.sees_images
+            .store(support.supported(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn sees_images(&self) -> bool {
+        self.sees_images.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn route_web(&self, route: Option<WebRoute>) {
         let route = if self.confinement().network() == Network::Off {
             None
@@ -336,6 +348,7 @@ pub(crate) async fn definitions(context: &Context) -> Vec<Definition> {
         python: &python,
         escape: context.confinement().escape() == Escape::Offered,
         web_search: context.searches(),
+        display: context.sees_images(),
         mode: context.turn_mode(),
         mcp_servers: &mcp_servers,
     })]

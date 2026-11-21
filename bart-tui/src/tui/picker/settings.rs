@@ -836,7 +836,7 @@ mod tests {
             default_effort: None,
             summaries: None,
             verbosity: None,
-            images: None,
+            images: crate::provider::ImageInput::Supported,
             context_window: Some(128_000),
             service_tiers: Some(Vec::new()),
             max_context_window: None,

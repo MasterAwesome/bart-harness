@@ -276,7 +276,7 @@ impl Running {
         })
     }
 
-    fn prepare_cell(&mut self, cell: u64, code: Option<&str>, web_search: bool, diffs: bool) {
+    fn prepare_cell(&mut self, cell: u64, code: Option<&str>, context: &Context) {
         if let Some(code) = code {
             self.emission.output = std::mem::take(&mut self.emission.pending);
             self.emission.ended = false;
@@ -284,8 +284,9 @@ impl Running {
             self.channel.exchange.queue(&HostMessage::Run {
                 cell,
                 code,
-                web_search,
-                diffs,
+                web_search: context.searches(),
+                display: context.sees_images(),
+                diffs: context.diffs.load(std::sync::atomic::Ordering::Relaxed),
             });
         } else if self.channel.exchange.awaiting && self.channel.process.is_none() {
             self.channel
@@ -302,20 +303,11 @@ impl Running {
         review: &mut CellReview<'_, '_>,
     ) -> End {
         let cancelled = capture.cancelled;
-        let web_search = review.context.web_route().is_some();
         let cell = capture
             .collector
             .cell()
             .expect("a cell's collector holds its output");
-        self.prepare_cell(
-            cell,
-            code,
-            web_search,
-            review
-                .context
-                .diffs
-                .load(std::sync::atomic::Ordering::Relaxed),
-        );
+        self.prepare_cell(cell, code, review.context);
         let mut timer = CellTimer::new(deadline);
         match time::timeout_at(timer.deadline, self.channel.send()).await {
             Ok(Ok(())) => {}

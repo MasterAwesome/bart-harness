@@ -25,7 +25,7 @@ pub(crate) mod search;
 mod sse;
 mod transport;
 
-pub use catalog::{Model, Visibility, model, models};
+pub use catalog::{ImageInput, Model, Visibility, model, models};
 use catalog::{Page, Paging, data_models};
 pub use claude_code::available as claude_code_available;
 pub(crate) use config::is_builtin;

@@ -8,6 +8,7 @@ pub(super) enum HostMessage<'a> {
         cell: u64,
         code: &'a str,
         web_search: bool,
+        display: bool,
         diffs: bool,
     },
     Result(Value),

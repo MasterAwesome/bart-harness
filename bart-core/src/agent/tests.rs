@@ -113,7 +113,7 @@ fn model(window: u64) -> crate::provider::Model {
         default_effort: None,
         summaries: None,
         verbosity: None,
-        images: None,
+        images: crate::provider::ImageInput::Supported,
         context_window: Some(window),
         service_tiers: None,
         max_context_window: None,
@@ -3439,4 +3439,88 @@ async fn finish_preserves_both_mcp_and_job_cleanup_errors() {
     );
     drop(hold);
     drop(socket);
+}
+
+#[tokio::test]
+async fn python_display_tracks_catalog_image_input_across_model_switches() {
+    use crate::provider::mock::{Reply, serve_catalog};
+
+    let dir = TempDir::new("agent-display-gating");
+    std::fs::write(
+        dir.path().join("pixel.png"),
+        crate::history::test_support::PNG,
+    )
+    .unwrap();
+    let catalog = json!({
+        "models": [
+            { "slug": "text-only", "context_window": 100_000, "input_modalities": ["text"] },
+            { "slug": "vision", "context_window": 100_000, "input_modalities": ["text", "image"] }
+        ]
+    });
+    let call = |id| Reply::python(id, &json!({"code": "display('pixel.png')"}));
+    let (provider, requests, _, _) = serve_catalog(
+        dir.path(),
+        vec![
+            call("c1"),
+            Reply::text("no vision"),
+            call("c2"),
+            Reply::text("saw vision"),
+            call("c3"),
+            Reply::text("saw unknown"),
+        ],
+        catalog,
+    )
+    .await;
+
+    let mut preferences = Current::default();
+    crate::preferences::Change::ContextWindow {
+        provider: provider.name().into(),
+        model: "unlisted".into(),
+        tokens: Some(100_000.try_into().unwrap()),
+    }
+    .apply(&mut preferences.effective)
+    .unwrap();
+
+    let route = |model: &str| Settings {
+        provider: provider.clone(),
+        model: model.into(),
+        reasoning_effort: None,
+    };
+    let context =
+        crate::tool::test_support::context(dir.path(), Confinement::Unrestricted, 400_000);
+    let mut session = Session::new(
+        Client::new(),
+        Store::new(dir.path().join("auth.json")),
+        route("text-only"),
+        preferences,
+        context,
+        "k".into(),
+        None,
+    );
+
+    turn(&mut session, "try on text-only").await;
+    session.switch(route("vision"), |_: Event<'_>| {}).await;
+    assert!(session.context.sees_images());
+    turn(&mut session, "try on vision").await;
+    session.switch(route("unlisted"), |_: Event<'_>| {}).await;
+    turn(&mut session, "try on unknown").await;
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    let has_display = |index: usize| {
+        requests[index]["tools"][0]["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("def display(")
+    };
+    assert!(!has_display(0), "text-only prompt must omit display()");
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("NameError: name 'display' is not defined")
+    );
+    assert!(has_display(2), "vision prompt must include display()");
+    assert!(requests[3]["messages"].to_string().contains("image_url"));
+    assert!(has_display(4), "unknown prompt must include display()");
+    assert!(requests[5]["messages"].to_string().contains("image_url"));
 }

@@ -1198,6 +1198,8 @@ def _is_image(value):
 def display(*images):
     """Shows you images after this cell's result: image file paths (PNG, JPEG, GIF or WebP) or
     PIL images."""
+    if "display" not in helpers:
+        raise BartError("the current model does not accept image input")
     for image in images:
         if _is_image(image):
             _show_image(image)
@@ -1333,7 +1335,7 @@ def _observe_file(function):
 
 read, write, edit = map(_observe_file, (read, write, edit))
 
-bart_builtins = dict(whoami=whoami, run=run, RunError=RunError, bg_run=bg_run, job=job, read=read, write=write, edit=edit, display=display, mcp=Mcp(),
+bart_builtins = dict(whoami=whoami, run=run, RunError=RunError, bg_run=bg_run, job=job, read=read, write=write, edit=edit, mcp=Mcp(),
                      Text=Text, Result=Result, SavedStream=SavedStream, BartError=BartError, Job=Job, Cell=Cell, Edit=dict)
 # Trailing double underscores prevent class-name mangling of the injected hook.
 _DISPLAY_HOOK = "__bart_display__"
@@ -1373,7 +1375,7 @@ namespace = {"__name__": "__main__", "__builtins__": helpers, "collections": col
 
 def restore():
     """Removes globals that shadow a helper, and says which."""
-    names = bart_builtins.keys() | {_DISPLAY_HOOK} | ({"web_search"} if "web_search" in helpers else set())
+    names = bart_builtins.keys() | {_DISPLAY_HOOK} | ({"display", "web_search"} & helpers.keys())
     if rebound := sorted(names & namespace.keys()):
         for name in rebound:
             del namespace[name]
@@ -1438,7 +1440,7 @@ def execute_cell(code, diffs, cell_number):
         exec(compile(tree, filename, "exec"), namespace)
         if last is not None:
             value = eval(compile(ast.Expression(last.value), filename, "eval"), namespace)
-            if _is_image(value):
+            if "display" in helpers and _is_image(value):
                 _show_image(value)
             elif _displayable(value):
                 value._display()
@@ -1493,10 +1495,14 @@ def execute_cell(code, diffs, cell_number):
 while line := _read_line():
     try:
         request = json.loads(line)["run"]
-        if request["web_search"]:
-            helpers["web_search"] = web_search
-        else:
-            helpers.pop("web_search", None)
+        for helper in (display, web_search):
+            name = helper.__name__
+            if request[name]:
+                if name not in helpers:
+                    namespace.pop(name, None)
+                helpers[name] = helper
+            else:
+                helpers.pop(name, None)
         failed = execute_cell(request["code"], request["diffs"], request["cell"])
     except KeyboardInterrupt:
         _diagnostic(_bart("cell", f"cell[{request['cell']}] interrupted"))

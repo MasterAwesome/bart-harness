@@ -50,6 +50,11 @@ pub(super) fn models(list: &Value) -> Result<super::Page, Error> {
                 .find(|item| item["id"].as_str() == Some(&model.id))
         });
         let capabilities = item.map(|item| &item["capabilities"]);
+        if let Some(supported) =
+            capabilities.and_then(|caps| caps["image_input"]["supported"].as_bool())
+        {
+            model.images = super::ImageInput::from_bool(supported);
+        }
         model.max_output_tokens = item.and_then(|item| item["max_tokens"].as_u64());
         model.efforts = capabilities
             .filter(|caps| {

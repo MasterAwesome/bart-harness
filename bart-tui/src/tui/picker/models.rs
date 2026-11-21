@@ -331,7 +331,7 @@ mod tests {
                 service_tiers: None,
                 max_context_window: None,
                 max_output_tokens: None,
-                images: None,
+                images: crate::provider::ImageInput::Supported,
                 efforts: vec!["low".into(), "high".into()],
                 default_effort: Some("high".into()),
                 summaries: None,

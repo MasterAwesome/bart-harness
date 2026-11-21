@@ -87,7 +87,7 @@ pub(super) fn models(list: &Value) -> Result<super::Page, Error> {
                 default_effort: None,
                 summaries: None,
                 verbosity: None,
-                images: None,
+                images: super::ImageInput::Supported,
                 context_window: model.input_token_limit,
                 service_tiers: None,
                 max_context_window: None,

@@ -58,6 +58,7 @@ pub(super) struct Surface<'a> {
     pub(super) python: &'a str,
     pub(super) escape: bool,
     pub(super) web_search: bool,
+    pub(super) display: bool,
     pub(super) mode: super::TurnMode,
     pub(super) mcp_servers: &'a [String],
 }
@@ -66,12 +67,12 @@ fn description(surface: &Surface<'_>) -> String {
     let mut text = header(surface);
     text.push_str(&files());
     text.push_str(&commands(surface.escape, surface.mode));
-    text.push_str(&types(surface.mode.one_turn()));
+    text.push_str(&types(surface.mode.one_turn(), surface.display));
     if surface.web_search {
         text.push_str(WEB_SEARCH);
     }
     if !surface.mcp_servers.is_empty() {
-        text.push_str(MCP);
+        text.push_str(&mcp(surface.display));
         let _ = writeln!(
             text,
             "mcp: _Mcp  # servers: {}",
@@ -232,7 +233,21 @@ def bg_run(argv: Sequence[str], *, notify: str | None = None,
     )
 }
 
-fn types(one_turn: bool) -> String {
+fn types(one_turn: bool, display: bool) -> String {
+    let display = if display {
+        format!(
+            r#"def display(*images: str | PathLike[str] | Image) -> None:
+    """Show image files (PNG, JPEG, GIF, WebP) or PIL images: display("plot.png"); display(image[1])
+    A PIL image as the final expression is shown too; print(path) shows only text.
+    At most {images} per cell, {image_mib} MiB each."""
+
+"#,
+            images = helpers::MAX_CELL_IMAGES,
+            image_mib = crate::history::MAX_IMAGE_BYTES / (1024 * 1024),
+        )
+    } else {
+        String::new()
+    };
     let wait = if one_turn {
         format!(
             "    def wait(self, *, timeout: float = {}) -> Result: ...\n",
@@ -282,15 +297,8 @@ image: Mapping[int, Path]    # images by the N in "image[N]"
 paste: Mapping[int, Path]    # text the user attached, by the N in "paste[N]"
 history: Mapping[int, Path]  # earlier context saved as JSON messages: json.loads(read(history[N]))
 
-def display(*images: str | PathLike[str] | Image) -> None:
-    """Show image files (PNG, JPEG, GIF, WebP) or PIL images: display("plot.png"); display(image[1])
-    A PIL image as the final expression is shown too; print(path) shows only text.
-    At most {images} per cell, {image_mib} MiB each."""
-
-def whoami() -> dict: ...    # the current provider, model and reasoning_effort
+{display}def whoami() -> dict: ...    # the current provider, model and reasoning_effort
 "#,
-        images = helpers::MAX_CELL_IMAGES,
-        image_mib = crate::history::MAX_IMAGE_BYTES / (1024 * 1024),
     )
 }
 
@@ -305,7 +313,14 @@ def web_search(*queries: str) -> Text:
     Put a query that depends on an answer in a later cell, after reading that answer."""
 "#;
 
-const MCP: &str = r#"
+fn mcp(display: bool) -> String {
+    let returns = if display {
+        "Returns JSON or Text and shows any\n        returned images. A tool error raises BartError;"
+    } else {
+        "Returns JSON or Text.\n        A tool error raises BartError;"
+    };
+    format!(
+        r#"
 class _Mcp:
     @auto_display
     def tools(self, server: str | None = None, query: str | None = None) -> Text:
@@ -317,14 +332,15 @@ class _Mcp:
         """The tool's full description, input and output schemas and server guidance. Read
         it before a first call instead of guessing argument names."""
     def __call__(self, server: str, tool: str, /, **arguments: Any) -> Any:
-        """Call a tool: mcp(server, tool, **arguments). Returns JSON or Text and shows any
-        returned images. A tool error raises BartError; if a call that changes something
+        """Call a tool: mcp(server, tool, **arguments). {returns} if a call that changes something
         fails midway, check the remote state before repeating it."""
     def servers(self) -> list[dict[str, Any]]:
         """Each server's name and status (starting, ready, failed or disabled), with
         tool_count, about, error or reason. Calls wait while a server starts."""
 
-"#;
+"#
+    )
+}
 
 #[must_use]
 pub(super) fn definition(surface: &Surface<'_>) -> Definition {

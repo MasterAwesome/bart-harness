@@ -18,7 +18,7 @@ impl Session {
         on_event: &mut impl Reporter,
     ) -> Result<bool, Error> {
         let mut stopped = false;
-        let sees_images = self.routing.sees_images();
+        let sees_images = self.routing.image_input().supported();
         let mut images = Vec::new();
         let mut failed = None;
         for (index, call) in calls.iter().enumerate() {

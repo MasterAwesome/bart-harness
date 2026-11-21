@@ -30,7 +30,7 @@ struct CodexModel {
     support_verbosity: bool,
     default_verbosity: Option<String>,
     service_tiers: Option<Value>,
-    input_modalities: Option<Vec<String>>,
+    input_modalities: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -75,7 +75,9 @@ pub(super) fn codex_models(list: &Value) -> Result<Vec<super::Model>, Error> {
                     verbosity: model.default_verbosity.filter(|_| model.support_verbosity),
                     images: model
                         .input_modalities
-                        .map(|modalities| modalities.iter().any(|modality| modality == "image")),
+                        .as_ref()
+                        .and_then(super::ImageInput::from_modalities)
+                        .unwrap_or(super::ImageInput::Supported),
                     context_window: model.context_window,
                     max_context_window: model.max_context_window,
                     max_output_tokens: None,

@@ -278,7 +278,7 @@ impl Session {
             title.to_owned()
         } else {
             self.settle_recording_with(&mut on_event).await;
-            self.routing.entry().await;
+            self.refresh_model().await;
             let first = self
                 .journal
                 .history()
@@ -352,6 +352,15 @@ impl Session {
         self.settle_recording_with(&mut on_event).await;
     }
 
+    fn sync_image_input(&self) {
+        self.context.set_image_input(self.routing.image_input());
+    }
+
+    async fn refresh_model(&mut self) {
+        self.routing.entry().await;
+        self.sync_image_input();
+    }
+
     fn refresh_instructions(&mut self) {
         self.instructions.refresh(&self.context);
         self.rebase_context();
@@ -370,6 +379,7 @@ impl Session {
 
     fn apply_switch(&mut self, settings: Settings) {
         self.routing.select(settings);
+        self.sync_image_input();
         self.context.identify(
             self.routing.settings().provider.name(),
             &self.routing.settings().model,
@@ -439,6 +449,7 @@ impl Session {
             self.apply_confinement(confinement, &mcp, &mut warning, &mut on_event)
                 .await;
         }
+        self.sync_image_input();
         self.context.diffs.store(
             self.routing.preferences().effective.diffs,
             std::sync::atomic::Ordering::Relaxed,
@@ -549,7 +560,7 @@ impl Session {
                 return Err(Error::Context(INPUT_FULL.into()));
             }
         };
-        self.routing.entry().await;
+        self.refresh_model().await;
         if let Err(error) = self.compaction_threshold() {
             let rejected = held.release();
             on_event.event(Event::InputRejected(&rejected));
@@ -572,7 +583,7 @@ impl Session {
     ) -> Result<(Vec<crate::history::Skill>, Vec<Message>), Error> {
         let mut input = input.clone();
         input.resolve_skill().map_err(Error::Context)?;
-        if !input.images.is_empty() && !self.routing.sees_images() {
+        if !input.images.is_empty() && !self.routing.image_input().supported() {
             return Err(Error::Unsupported(format!(
                 "{} does not accept images",
                 self.routing.settings().model
@@ -643,7 +654,7 @@ impl Session {
         self.recover(on_event).await;
         self.report_jobs(on_event).await;
         on_event.flush().await;
-        self.routing.entry().await;
+        self.refresh_model().await;
         let limit = self.compaction_threshold()?;
         let full_window = self.routing.window()?;
         let context = self.route_context();
@@ -791,7 +802,7 @@ impl Session {
     }
 
     pub async fn prewarm(&mut self) {
-        self.routing.entry().await;
+        self.refresh_model().await;
         self.refresh_instructions();
         let definitions = tool::definitions(&self.context).await;
         let request = self.routing.request(
@@ -818,12 +829,11 @@ impl Session {
             .begin_turn()
             .await
             .map_err(Error::Model)?;
-        let definitions = tool::definitions(&self.context).await;
         let mut recovered = false;
         loop {
             self.recover(on_event).await;
             self.report_jobs(on_event).await;
-            self.routing.entry().await;
+            self.refresh_model().await;
             while let Some(held) = self.inbox.next() {
                 self.add_input(held, true, on_event).await?;
             }
@@ -850,6 +860,7 @@ impl Session {
             if accounting.context_tokens >= self.compaction_threshold()? && !continuing {
                 self.compact_with(on_event, 0).await?;
             }
+            let definitions = tool::definitions(&self.context).await;
             self.journal
                 .record_prompt(self.instructions.as_str(), &definitions)
                 .await;

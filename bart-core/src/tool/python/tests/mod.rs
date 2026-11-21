@@ -1348,54 +1348,63 @@ fn the_description_names_only_what_the_session_has_and_its_interface_is_python()
     let servers = ["tracker".to_owned(), "docs".to_owned()];
     for escape in [false, true] {
         for web_search in [false, true] {
-            for mcp_servers in [&[][..], &servers[..]] {
-                let one_turn = escape != web_search;
-                let text = super::definition(&super::Surface {
-                    python: "Python 3.12.3 (/usr/bin/python3)",
-                    escape,
-                    web_search,
-                    mode: if one_turn {
-                        crate::tool::TurnMode::Prompt(crate::tool::BackgroundJobs::Stop)
-                    } else {
-                        crate::tool::TurnMode::Session
-                    },
-                    mcp_servers,
-                })
-                .description;
-                let case = format!(
-                    "escape={escape} web_search={web_search} mcp={}",
-                    mcp_servers.len()
-                );
-                assert_eq!(text.contains("sandbox: bool"), escape, "{case}");
-                assert_eq!(text.contains("build.wait() instead"), one_turn, "{case}");
-                assert_eq!(text.contains("def wait(self"), one_turn, "{case}");
-                assert_eq!(
-                    text.contains("the message resumes you"),
-                    !one_turn,
-                    "{case}"
-                );
-                assert_eq!(text.contains("web_search"), web_search, "{case}");
-                assert_eq!(text.contains("mcp"), !mcp_servers.is_empty(), "{case}");
-                let stub = text
-                    .split_once("```python\n")
-                    .and_then(|(_, rest)| rest.split_once("```"))
-                    .expect("one Python block")
-                    .0;
-                let mut parse = std::process::Command::new("python3")
-                    .args([
-                        "-I",
-                        "-c",
-                        "import ast, sys; ast.parse(sys.stdin.read(), feature_version=(3, 10))",
-                    ])
-                    .stdin(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap();
-                std::io::Write::write_all(&mut parse.stdin.take().unwrap(), stub.as_bytes())
-                    .unwrap();
-                assert!(
-                    parse.wait().unwrap().success(),
-                    "{case}: the stub is not Python 3.10:\n{stub}"
-                );
+            for display in [false, true] {
+                for mcp_servers in [&[][..], &servers[..]] {
+                    let one_turn = escape != web_search;
+                    let text = super::definition(&super::Surface {
+                        display,
+                        python: "Python 3.12.3 (/usr/bin/python3)",
+                        escape,
+                        web_search,
+                        mode: if one_turn {
+                            crate::tool::TurnMode::Prompt(crate::tool::BackgroundJobs::Stop)
+                        } else {
+                            crate::tool::TurnMode::Session
+                        },
+                        mcp_servers,
+                    })
+                    .description;
+                    let case = format!(
+                        "escape={escape} web_search={web_search} display={display} mcp={}",
+                        mcp_servers.len()
+                    );
+                    assert_eq!(text.contains("sandbox: bool"), escape, "{case}");
+                    assert_eq!(text.contains("build.wait() instead"), one_turn, "{case}");
+                    assert_eq!(text.contains("def wait(self"), one_turn, "{case}");
+                    assert_eq!(
+                        text.contains("the message resumes you"),
+                        !one_turn,
+                        "{case}"
+                    );
+                    assert_eq!(text.contains("def display("), display, "{case}");
+                    assert_eq!(
+                        text.contains("returned images"),
+                        display && !mcp_servers.is_empty(),
+                        "{case}"
+                    );
+                    assert_eq!(text.contains("web_search"), web_search, "{case}");
+                    assert_eq!(text.contains("mcp"), !mcp_servers.is_empty(), "{case}");
+                    let stub = text
+                        .split_once("```python\n")
+                        .and_then(|(_, rest)| rest.split_once("```"))
+                        .expect("one Python block")
+                        .0;
+                    let mut parse = std::process::Command::new("python3")
+                        .args([
+                            "-I",
+                            "-c",
+                            "import ast, sys; ast.parse(sys.stdin.read(), feature_version=(3, 10))",
+                        ])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    std::io::Write::write_all(&mut parse.stdin.take().unwrap(), stub.as_bytes())
+                        .unwrap();
+                    assert!(
+                        parse.wait().unwrap().success(),
+                        "{case}: the stub is not Python 3.10:\n{stub}"
+                    );
+                }
             }
         }
     }
@@ -1800,6 +1809,7 @@ async fn every_name_the_stub_defines_exists_in_cells_with_its_parameters() {
     let dir = TempDir::new("python-stub-drift");
     let context = session(dir.path(), Confinement::Unrestricted, 1_000_000);
     let description = super::definition(&super::Surface {
+        display: true,
         python: "Python 3",
         escape: false,
         web_search: false,
@@ -3007,6 +3017,7 @@ fn prompt_description_states_the_selected_background_job_lifetime() {
     use crate::tool::{BackgroundJobs, TurnMode};
     for jobs in [BackgroundJobs::Stop, BackgroundJobs::Keep] {
         let text = super::definition(&super::Surface {
+            display: true,
             python: "Python 3",
             escape: false,
             web_search: false,
@@ -3138,4 +3149,62 @@ latest_report = {'ok': True}
         !inventory.contains("\"name\":\"os\""),
         "imported stdlib modules should yield slots to substantive bindings when capped: {inventory}"
     );
+}
+
+#[tokio::test]
+async fn dynamic_helpers_enforce_gates_and_clear_stale_shadows_when_enabled() {
+    use crate::provider::{Custom, HttpProtocol, ImageInput, Provider};
+    use crate::tool::WebRoute;
+
+    let dir = TempDir::new("python-dynamic-helpers");
+    fs::write(
+        dir.path().join("pixel.png"),
+        crate::history::test_support::PNG,
+    )
+    .unwrap();
+    let context = session(dir.path(), Confinement::Unrestricted, 10_000);
+    context.set_image_input(ImageInput::Unsupported);
+
+    let absent = cell(&context, "display('pixel.png')").await;
+    assert!(
+        absent.is_error()
+            && absent
+                .text
+                .contains("NameError: name 'display' is not defined")
+    );
+
+    let bound = cell(&context, "display = 'local'\nweb_search = 'local'").await;
+    assert!(!bound.is_error() && !bound.text.contains("helper bindings removed"));
+
+    context.set_image_input(ImageInput::Supported);
+    let provider = Provider::custom(
+        "search",
+        &Custom {
+            protocol: HttpProtocol::Responses,
+            url: "https://fixture.invalid/v1".into(),
+            key: false,
+        },
+    )
+    .unwrap();
+    context.route_web(Some(WebRoute {
+        client: reqwest::Client::new(),
+        store: crate::auth::Store::new(dir.path().join("auth.json")),
+        provider,
+        model: "m".into(),
+        effort: None,
+        diagnostics: None,
+    }));
+
+    let restored = cell(
+        &context,
+        "stashed = display\ndisplay('pixel.png')\nprint(callable(display), callable(web_search))",
+    )
+    .await;
+    assert!(
+        !restored.is_error() && restored.images.len() == 1 && restored.text.trim() == "True True"
+    );
+
+    context.set_image_input(ImageInput::Unsupported);
+    let stashed = cell(&context, "stashed('pixel.png')").await;
+    assert!(stashed.is_error() && stashed.text.contains("does not accept image input"));
 }

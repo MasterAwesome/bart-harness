@@ -104,8 +104,9 @@ impl Routing {
         }
     }
 
-    pub(super) fn sees_images(&self) -> bool {
-        !matches!(&self.catalog, Catalog::Looked(Some(model)) if model.images == Some(false))
+    pub(super) fn image_input(&self) -> crate::provider::ImageInput {
+        self.cached()
+            .map_or(crate::provider::ImageInput::Supported, |model| model.images)
     }
 
     pub(super) fn compaction_threshold(&self) -> Result<u64, super::Error> {

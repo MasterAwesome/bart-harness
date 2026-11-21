@@ -31,6 +31,37 @@ impl Visibility {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageInput {
+    #[default]
+    Supported,
+    Unsupported,
+}
+
+impl ImageInput {
+    #[must_use]
+    pub const fn supported(self) -> bool {
+        matches!(self, Self::Supported)
+    }
+
+    pub(super) fn from_modalities(value: &Value) -> Option<Self> {
+        let list = value.as_array()?;
+        if list.is_empty() {
+            return None;
+        }
+        let strings = list.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?;
+        Some(Self::from_bool(strings.contains(&"image")))
+    }
+
+    pub(super) const fn from_bool(supported: bool) -> Self {
+        if supported {
+            Self::Supported
+        } else {
+            Self::Unsupported
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub id: String,
@@ -40,7 +71,7 @@ pub struct Model {
     pub default_effort: Option<String>,
     pub summaries: Option<bool>,
     pub verbosity: Option<String>,
-    pub images: Option<bool>,
+    pub images: ImageInput,
     pub context_window: Option<u64>,
     pub service_tiers: Option<Vec<crate::preferences::ServiceTier>>,
     pub max_context_window: Option<u64>,
@@ -267,6 +298,8 @@ struct ListedModel {
     service_tiers: Option<Value>,
     max_input_tokens: Option<u64>,
     max_context_window: Option<u64>,
+    input_modalities: Option<Value>,
+    architecture: Option<Value>,
     #[serde(default)]
     visibility: Value,
 }
@@ -293,7 +326,18 @@ pub(super) fn data_models(list: &Value) -> Result<Vec<Model>, Error> {
             default_effort: None,
             summaries: None,
             verbosity: None,
-            images: None,
+            images: model
+                .input_modalities
+                .as_ref()
+                .and_then(ImageInput::from_modalities)
+                .or_else(|| {
+                    model
+                        .architecture
+                        .as_ref()
+                        .and_then(|arch| arch.get("input_modalities"))
+                        .and_then(ImageInput::from_modalities)
+                })
+                .unwrap_or(ImageInput::Supported),
             context_window: model
                 .context_length
                 .or(model.context_window)
@@ -424,5 +468,52 @@ mod tests {
         assert_eq!(gets.load(Ordering::SeqCst), 4);
         assert_eq!(ids(models(&client, &provider, Some(&b)).await), ["b"]);
         assert_eq!(gets.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn catalog_parsers_extract_image_input_and_default_unknown_to_supported() {
+        let data = serde_json::json!({
+            "data": [
+                { "id": "plain" },
+                { "id": "or-text", "architecture": { "input_modalities": ["text"] } },
+                { "id": "or-vision", "architecture": { "input_modalities": ["text", "image"] } },
+                { "id": "gw-text", "input_modalities": ["text"] },
+                { "id": "str-arch", "architecture": "transformer", "context_length": 16_000 }
+            ]
+        });
+        let parsed = data_models(&data).unwrap();
+        let images =
+            |models: &[Model], id: &str| models.iter().find(|m| m.id == id).unwrap().images;
+        assert_eq!(images(&parsed, "plain"), ImageInput::Supported);
+        assert_eq!(images(&parsed, "or-text"), ImageInput::Unsupported);
+        assert_eq!(images(&parsed, "or-vision"), ImageInput::Supported);
+        assert_eq!(images(&parsed, "gw-text"), ImageInput::Unsupported);
+        assert_eq!(images(&parsed, "str-arch"), ImageInput::Supported);
+
+        let anthropic = messages::models(&serde_json::json!({
+            "has_more": false,
+            "data": [
+                { "id": "a-vision", "capabilities": { "image_input": { "supported": true } } },
+                { "id": "a-text", "capabilities": { "image_input": { "supported": false } } },
+                { "id": "a-unknown", "capabilities": {} }
+            ]
+        }))
+        .unwrap()
+        .models;
+        assert_eq!(images(&anthropic, "a-vision"), ImageInput::Supported);
+        assert_eq!(images(&anthropic, "a-text"), ImageInput::Unsupported);
+        assert_eq!(images(&anthropic, "a-unknown"), ImageInput::Supported);
+
+        let codex = responses::codex_models(&serde_json::json!({
+            "models": [
+                { "slug": "c-text", "input_modalities": ["text"] },
+                { "slug": "c-vision", "input_modalities": ["text", "image"] },
+                { "slug": "c-unknown" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(images(&codex, "c-text"), ImageInput::Unsupported);
+        assert_eq!(images(&codex, "c-vision"), ImageInput::Supported);
+        assert_eq!(images(&codex, "c-unknown"), ImageInput::Supported);
     }
 }

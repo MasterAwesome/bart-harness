@@ -453,7 +453,12 @@ pub(super) async fn helper(
             .kill(job)
             .await
             .map(|text| Helped::Value(text.map_or(Value::Null, Value::String))),
-        Helper::Image { label, data } => decode(&data, None, label).map(Helped::Image),
+        Helper::Image { label, data } => {
+            if !context.sees_images() {
+                return Err("the current model does not accept image input".into());
+            }
+            decode(&data, None, label).map(Helped::Image)
+        }
         Helper::WebSearch { queries } => {
             if !(1..=web::MAX_QUERIES).contains(&queries.len()) {
                 return Err(format!(
