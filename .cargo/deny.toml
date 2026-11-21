@@ -4,6 +4,8 @@ ignore = [
     # FIXME: remove once syntect ships without bincode (trishume/syntect#694).
     # This advisory marks bincode as unmaintained. Syntect uses it for built-in grammars.
     { id = "RUSTSEC-2025-0141", reason = "syntect 5 loads its compiled-in syntax dump with bincode 1.3.3" },
+    # FIXME: Remove once both crates drop chrono.
+    { id = "RUSTSEC-2026-0543", reason = "oauth2 and rmcp still use chrono" },
 ]
 
 [licenses]

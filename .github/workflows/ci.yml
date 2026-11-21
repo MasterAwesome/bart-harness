@@ -31,19 +31,19 @@ jobs:
           python-version: '3.10'
       - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y tmux
       - if: runner.os == 'macOS'
         run: brew install tmux
-      - run: cargo test --locked --test terminal -- --ignored
+      - run: cargo test --locked -p bart --test terminal -- --ignored
       - if: runner.os == 'Linux'
         uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - if: runner.os == 'Linux'
-        run: cargo test --locked --test unit traceback
+        run: cargo test --locked -p bart-core --test unit traceback
 
   deny:
     runs-on: ubuntu-22.04
@@ -67,7 +67,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }} && rustup default stable
-      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - run: cargo build --locked -p bart --release --target ${{ matrix.target }}
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
@@ -88,11 +88,21 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
+          path: release-assets
       - name: Tag matches the crate version
         run: test "$GITHUB_REF_NAME" = "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-      - name: Pin the installer to this release
-        run: sed "s#^release=.*#release=https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME#" .github/install.sh > install.sh
-      - run: sha256sum bart-* install.sh > SHA256SUMS
-      - run: gh release create "$GITHUB_REF_NAME" bart-* SHA256SUMS install.sh --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+      - name: Stage files and verify checksums
+        working-directory: release-assets
+        run: |
+          sed "s#^release=.*#release=https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME#" ../.github/install.sh > install.sh
+          files=(bart-linux-x86_64 bart-linux-aarch64 bart-darwin-arm64 bart-darwin-x86_64 install.sh)
+          sha256sum "${files[@]}" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          printf '%s\n' "${files[@]}" SHA256SUMS > "$RUNNER_TEMP/bart-upload-list"
+      - name: Publish staged files
+        working-directory: release-assets
+        run: |
+          mapfile -t files < "$RUNNER_TEMP/bart-upload-list"
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
