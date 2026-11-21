@@ -97,25 +97,44 @@ dependencies = [
 name = "bart"
 version = "0.0.3"
 dependencies = [
- "async-trait",
+ "bart-core",
  "base64 0.23.1",
- "bytes",
  "clap",
  "crossterm",
  "filedescriptor",
- "futures-util",
  "fuzzy-matcher",
+ "ignore",
+ "pulldown-cmark",
+ "ratatui",
+ "ratatui-crossterm",
+ "reqwest",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "syntect",
+ "tempfile",
+ "tokio",
+ "unicase",
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
+name = "bart-core"
+version = "0.0.3"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "futures-util",
  "getrandom 0.4.3",
  "http",
  "httparse",
  "httpdate",
  "hyper-util",
- "ignore",
  "oauth2",
  "percent-encoding",
- "pulldown-cmark",
- "ratatui",
- "ratatui-crossterm",
  "regex",
  "reqwest",
  "rmcp",
@@ -129,14 +148,10 @@ dependencies = [
  "signal-hook 0.4.6",
  "similar",
  "soketto",
- "syntect",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-util",
- "unicase",
- "unicode-segmentation",
- "unicode-width",
  "uuid",
 ]
 

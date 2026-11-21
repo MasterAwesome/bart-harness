@@ -22,7 +22,9 @@ Linux (`x86_64`, `aarch64`) and macOS (Apple Silicon, Intel), requiring **Python
 <details>
 <summary>Build from source and optional Linux dependencies</summary>
 
-- **From source (Rust 1.99+):** `cargo install --locked --git https://github.com/MasterAwesome/bart-harness`
+- **From source (Rust 1.99+):**
+  - From Git: `cargo install --locked --git https://github.com/MasterAwesome/bart-harness bart`
+  - From a local checkout: `cargo install --locked --path bart-tui`
 - **Clipboard images (`Ctrl+V` on Linux):** requires `wl-paste` or `xclip`
 - **Containerless sandbox (`--jail` on Linux):** requires a systemd user session, `systemd-run` and `bubblewrap`
 
@@ -67,7 +69,7 @@ bart login chat:openrouter    --url https://openrouter.ai/api/v1 < key-file
 bart login chat:local         --url http://localhost:8080/v1 --no-key
 ```
 
-Switch models with `/model`, adjust reasoning effort with `/effort` (**Alt+=** / **Alt+-** while typing), and list available models with `bart models <name>`.
+Switch models with `/model`, adjust reasoning effort with `/effort` (**Alt+=** / **Alt+-** while typing), and list available `provider/model` pairs with `bart models`. Use `bart models <provider>` for model names and supported effort levels.
 
 ## CLI and scripting
 
