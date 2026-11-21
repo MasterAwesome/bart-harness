@@ -1436,8 +1436,38 @@ async fn job_wait_exists_only_in_one_turn_sessions() {
     }
 }
 
+#[test]
+fn cell_arguments_ignore_timeout_and_reject_other_unknown_keys() {
+    assert!(Arguments::parse(&json!({"restart": true, "timeout": 30})).is_err());
+    assert!(Arguments::parse(&json!({"code": 3, "timeout": 30})).is_err());
+    assert!(Arguments::parse(&json!({"code": "1", "restart": "yes", "timeout": 30})).is_err());
+    assert!(
+        !Arguments::parse(&json!({"code": "1", "timeout": 30}))
+            .unwrap()
+            .restart
+    );
+    assert!(
+        !Arguments::parse(&json!({"code": "1", "timeout": null}))
+            .unwrap()
+            .restart
+    );
+    assert!(
+        Arguments::parse(&json!({"code": "", "restart": true, "timeout": 30}))
+            .unwrap()
+            .restart
+    );
+    let err = Arguments::parse(&json!({"code": "1", "cwd": "/tmp"}))
+        .err()
+        .unwrap();
+    assert_eq!(
+        err,
+        "invalid arguments: unknown field `cwd`, expected `code` or `restart`"
+    );
+    assert!(Arguments::parse(&json!({"code": "1", "extra": 1})).is_err());
+}
+
 #[tokio::test]
-async fn fixed_cell_timeout_rejects_timeout_argument_and_pauses_during_bounded_run_and_job_wait() {
+async fn fixed_cell_timeout_ignores_timeout_argument_and_pauses_during_bounded_run_and_job_wait() {
     let dir = TempDir::new("python-pause-default-timeout");
     let context = session_with_timeout(
         dir.path(),
@@ -1449,9 +1479,9 @@ async fn fixed_cell_timeout_rejects_timeout_argument_and_pauses_during_bounded_r
         crate::tool::BackgroundJobs::Stop,
     ));
 
-    let rejected = call(&json!({ "code": "print(1)", "timeout": 30 }), &context).await;
-    assert_eq!(rejected.status, Status::Failed, "{}", rejected.text);
-    assert!(rejected.text.contains("unknown field"), "{}", rejected.text);
+    let accepted = call(&json!({ "code": "print(1)", "timeout": 0 }), &context).await;
+    assert_eq!(accepted.status, Status::Succeeded, "{}", accepted.text);
+    assert_eq!(accepted.text, "1");
 
     let output = call(&json!({
         "code": "r1 = run(['bash', '-c', 'sleep 0.8; echo first'], timeout=5)\nr2 = run(['bash', '-c', 'sleep 0.8; echo second'], timeout=5)\nprint(r1.stdout.strip(), r2.stdout.strip())"

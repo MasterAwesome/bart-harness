@@ -37,7 +37,6 @@ const INTERRUPTED: &str =
     "this helper call was cut off by a timeout; whether it took effect is unknown";
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Arguments {
     code: String,
     #[serde(default)]
@@ -46,6 +45,15 @@ struct Arguments {
 
 impl Arguments {
     fn parse(arguments: &Value) -> Result<Self, String> {
+        if let Some(map) = arguments.as_object()
+            && let Some(key) = map
+                .keys()
+                .find(|key| !matches!(key.as_str(), "code" | "restart" | "timeout"))
+        {
+            return Err(format!(
+                "invalid arguments: unknown field `{key}`, expected `code` or `restart`"
+            ));
+        }
         let arguments: Self = parse_arguments(arguments)?;
         if arguments.code.trim().is_empty() && !arguments.restart {
             return Err(super::EMPTY_CELL_REFUSAL.into());
@@ -350,8 +358,8 @@ pub(super) fn definition(surface: &Surface<'_>) -> Definition {
         parameters: json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "Python source for one cell. May be empty only with restart. Several cells in one response run in order, and a later one still runs if an earlier one failed" },
-                "restart": { "type": "boolean", "description": "Start a fresh interpreter before running code, discarding variables and imports. For a cell that will not stop or a broken interpreter" }
+                "code": { "type": "string", "description": "Python source for one cell. May be empty only when restart is true." },
+                "restart": { "type": "boolean", "description": "Start a fresh interpreter before running the cell. Defaults to false." }
             },
             "required": ["code"],
             "additionalProperties": false
