@@ -4,7 +4,7 @@ members = ["bart-core", "bart-tui"]
 default-members = ["bart-core", "bart-tui"]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 rust-version = "1.99.0"
 description = "Bart is an agent that likes notebooks!"
