@@ -1,39 +1,33 @@
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
-use bytes::BytesMut;
 use reqwest::{
     StatusCode,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use sha1::{Digest, Sha1};
-use soketto::{
-    connection::{Builder, Mode, Receiver, Sender},
-    extension::{Extension, Param, deflate::Deflate},
-};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
-use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::protocol::{Role, WebSocketConfig},
+};
 
 // RFC 6455 §1.3.
 const ACCEPT_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-// soketto requires server_no_context_takeover to decompress messages.
-const DEFLATE_OFFER: &str =
-    "permessage-deflate; client_max_window_bits; server_no_context_takeover";
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
 
 pub(super) trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
-pub(super) type Stream = Compat<Box<dyn Io>>;
+pub(super) type Stream = Box<WebSocketStream<Box<dyn Io>>>;
 
 pub(super) enum Upgrade {
     Open {
-        sender: Sender<Stream>,
-        receiver: Receiver<Stream>,
+        stream: Stream,
         headers: HeaderMap,
     },
     Refused {
@@ -79,8 +73,7 @@ pub(super) async fn connect(url: &reqwest::Url, headers: &HeaderMap) -> Result<U
     let authority = url.authority();
     let mut head = format!(
         "GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
-         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n\
-         Sec-WebSocket-Extensions: {DEFLATE_OFFER}\r\n"
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {key}\r\n"
     );
     for (name, value) in headers {
         let value = value
@@ -120,26 +113,25 @@ pub(super) async fn connect(url: &reqwest::Url, headers: &HeaderMap) -> Result<U
     if headers.contains_key("sec-websocket-protocol") {
         return Err("websocket upgrade chose a subprotocol that was not offered".into());
     }
+    if headers.contains_key("sec-websocket-extensions") {
+        return Err("websocket upgrade chose an extension that was not offered".into());
+    }
     let expected = base64::engine::general_purpose::STANDARD
         .encode(Sha1::digest(format!("{key}{ACCEPT_GUID}")));
-    if headers
-        .get("sec-websocket-accept")
+    let mut accepts = headers.get_all("sec-websocket-accept").iter();
+    if accepts
+        .next()
         .is_none_or(|accept| accept.as_bytes() != expected.as_bytes())
+        || accepts.next().is_some()
     {
         return Err("websocket upgrade with a wrong Sec-WebSocket-Accept".into());
     }
-    let mut builder = Builder::new(io.compat(), Mode::Client);
-    builder.set_buffer(BytesMut::from(&rest[..]));
-    builder.set_max_message_size(MAX_MESSAGE_BYTES);
-    if let Some(deflate) = negotiated(&headers)? {
-        builder.add_extensions([Box::new(deflate) as Box<dyn Extension + Send>]);
-    }
-    let (sender, receiver) = builder.finish();
-    Ok(Upgrade::Open {
-        sender,
-        receiver,
-        headers,
-    })
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES));
+    let stream =
+        Box::new(WebSocketStream::from_partially_read(io, rest, Role::Client, Some(config)).await);
+    Ok(Upgrade::Open { stream, headers })
 }
 
 fn tls() -> Result<Arc<rustls::ClientConfig>, String> {
@@ -268,48 +260,4 @@ fn dechunk(mut raw: &[u8]) -> Option<Vec<u8>> {
         body.extend_from_slice(raw.get(..size)?);
         raw = raw.get(size + 2..)?;
     }
-}
-
-// RFC 7692 §5: the server accepts at most the one extension offered, and its
-// parameters configure the client's deflate.
-fn negotiated(headers: &HeaderMap) -> Result<Option<Deflate>, String> {
-    let mut accepted = Vec::new();
-    for value in headers.get_all("sec-websocket-extensions") {
-        let value = value.to_str().map_err(|_| "extension header is not text")?;
-        accepted.extend(
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|offer| !offer.is_empty()),
-        );
-    }
-    let [offer] = accepted[..] else {
-        return match accepted.len() {
-            0 => Ok(None),
-            _ => Err(format!("server accepted several extensions: {accepted:?}")),
-        };
-    };
-    let mut parts = offer.split(';').map(str::trim);
-    if parts.next() != Some("permessage-deflate") {
-        return Err(format!("server chose an unoffered extension: {offer}"));
-    }
-    let params: Vec<Param<'_>> = parts
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            let (name, value) = part.split_once('=').map_or((part, None), |(name, value)| {
-                (name.trim(), Some(value.trim().trim_matches('"')))
-            });
-            let mut param = Param::new(name);
-            param.set_value(value);
-            param
-        })
-        .collect();
-    let mut deflate = Deflate::new(Mode::Client);
-    deflate
-        .configure(&params)
-        .map_err(|error| format!("deflate parameters: {error}"))?;
-    if !deflate.is_enabled() {
-        return Err(format!("unsupported deflate parameters: {offer}"));
-    }
-    Ok(Some(deflate))
 }

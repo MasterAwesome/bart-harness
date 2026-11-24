@@ -4,10 +4,14 @@ use std::{
 };
 
 use base64::Engine as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use sha1::Digest as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio_util::compat::TokioAsyncReadCompatExt as _;
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{Message as WsMessage, protocol::Role},
+};
 
 use super::super::{Cache, Kind, Provider, Request, Tools, Transport, mock::completed, responses};
 use crate::{
@@ -150,18 +154,16 @@ async fn serve() -> (String, Frames) {
                 ""
             };
             tcp.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n{route}\r\n").as_bytes()).await.unwrap();
-            let (mut sender, mut receiver) =
-                soketto::connection::Builder::new(tcp.compat(), soketto::Mode::Server).finish();
+            let mut ws = WebSocketStream::from_raw_socket(tcp, Role::Server, None).await;
             let seen = Arc::clone(&seen);
             let responses = Arc::clone(&responses);
             tokio::spawn(async move {
                 let mut said = None;
                 loop {
-                    let mut data = Vec::new();
-                    if receiver.receive_data(&mut data).await.is_err() {
+                    let Some(Ok(WsMessage::Text(text))) = ws.next().await else {
                         return;
-                    }
-                    let frame: Value = serde_json::from_slice(&data).unwrap();
+                    };
+                    let frame: Value = serde_json::from_str(&text).unwrap();
                     seen.lock().unwrap().push((connection, frame.clone()));
                     if let Some(item) = frame["input"].as_array().and_then(|input| input.last()) {
                         said = Some(item["content"][0]["text"].clone());
@@ -169,8 +171,7 @@ async fn serve() -> (String, Frames) {
                     if said == Some(json!("lost")) && frame["previous_response_id"].is_string() {
                         let lost =
                             json!({"type":"error","error":{"code":"previous_response_not_found"}});
-                        sender.send_text(lost.to_string()).await.unwrap();
-                        sender.flush().await.unwrap();
+                        ws.send(WsMessage::text(lost.to_string())).await.unwrap();
                         continue;
                     }
                     let item = if said == Some(json!("tool")) {
@@ -193,9 +194,8 @@ async fn serve() -> (String, Frames) {
                     done["response"]["id"] = format!("resp{number}").into();
                     events.push(done);
                     for event in events {
-                        sender.send_text(event.to_string()).await.unwrap();
+                        ws.send(WsMessage::text(event.to_string())).await.unwrap();
                     }
-                    sender.flush().await.unwrap();
                 }
             });
             connection += 1;
@@ -437,10 +437,8 @@ async fn websocket_error_event_with_context_overflow_classifies_as_overflow() {
             "{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
         )));
         tcp.write_all(format!("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").as_bytes()).await.unwrap();
-        let (mut sender, mut receiver) =
-            soketto::connection::Builder::new(tcp.compat(), soketto::Mode::Server).finish();
-        let mut data = Vec::new();
-        receiver.receive_data(&mut data).await.unwrap();
+        let mut ws = WebSocketStream::from_raw_socket(tcp, Role::Server, None).await;
+        ws.next().await.unwrap().unwrap();
         let overflow = json!({
             "type": "error",
             "status": 400,
@@ -449,8 +447,9 @@ async fn websocket_error_event_with_context_overflow_classifies_as_overflow() {
                 "message": "Your input exceeds the context window of this model."
             }
         });
-        sender.send_text(overflow.to_string()).await.unwrap();
-        sender.flush().await.unwrap();
+        ws.send(WsMessage::text(overflow.to_string()))
+            .await
+            .unwrap();
     });
 
     let provider = provider(&origin);
@@ -593,4 +592,141 @@ async fn truncated_websocket_upgrade_refusal_does_not_trigger_context_overflow()
         }
         other => panic!("truncated refusal must not classify as ContextOverflow: {other:?}"),
     }
+}
+
+async fn read_ws_handshake_key(tcp: &mut tokio::net::TcpStream) -> String {
+    let mut head = Vec::new();
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let mut bytes = [0; 4096];
+        let read = tcp.read(&mut bytes).await.unwrap();
+        head.extend_from_slice(&bytes[..read]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let key = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("sec-websocket-key"))
+        .unwrap()
+        .1
+        .trim();
+    base64::engine::general_purpose::STANDARD.encode(sha1::Sha1::digest(format!(
+        "{key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    )))
+}
+
+#[tokio::test]
+async fn peer_initiated_close_receives_close_reply_and_coalesced_frames_decode() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        // First connection: send an unsolicited Ping coalesced right behind the 101 response,
+        // then close after receiving the request, and verify the client flushes a Close reply.
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        let accept = read_ws_handshake_key(&mut tcp).await;
+        let mut coalesced = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .into_bytes();
+        // Server-to-client unmasked text frame containing a response.created event.
+        let payload = json!({
+            "type": "response.created",
+            "response": {"id": "resp-coalesced"}
+        })
+        .to_string();
+        assert!(payload.len() < 126);
+        coalesced.push(0x81);
+        coalesced.push(u8::try_from(payload.len()).unwrap());
+        coalesced.extend_from_slice(payload.as_bytes());
+        tcp.write_all(&coalesced).await.unwrap();
+        let mut ws = WebSocketStream::from_raw_socket(tcp, Role::Server, None).await;
+        ws.next().await.unwrap().unwrap();
+        ws.send(WsMessage::Close(None)).await.unwrap();
+        let reply = ws.next().await;
+        let _ = close_tx.send(matches!(reply, Some(Ok(WsMessage::Close(_)))));
+    });
+
+    let provider = provider(&origin);
+    let history = [Message::User("hello".into())];
+    let request = request(&provider, &history);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("auth.json"));
+    save_account(&store, "account").await;
+    let transport = Transport::default();
+    let error = transport
+        .stream(
+            &crate::http_client::new(),
+            &store,
+            &request,
+            |_: super::Delta<'_>| {},
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, super::super::Error::Interrupted(ref message) if message.contains("closed before the response completed")),
+        "expected mid-stream Interrupted after coalesced event, got {error:?}"
+    );
+    assert!(
+        close_rx.await.unwrap(),
+        "client must flush RFC 6455 Close reply on peer-initiated Close"
+    );
+}
+
+#[tokio::test]
+async fn websocket_upgrade_rejects_unoffered_extensions_and_duplicate_accept() {
+    for extra in [
+        "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+        "Sec-WebSocket-Accept: duplicate\r\n",
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let extra = extra.to_owned();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let accept = read_ws_handshake_key(&mut tcp).await;
+            let response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n{extra}\r\n"
+            );
+            tcp.write_all(response.as_bytes()).await.unwrap();
+        });
+        let url = reqwest::Url::parse(&format!("http://{addr}/responses")).unwrap();
+        let error = super::upgrade::connect(&url, &reqwest::header::HeaderMap::new())
+            .await
+            .err()
+            .expect("upgrade must fail");
+        assert!(
+            error.contains("extension") || error.contains("Sec-WebSocket-Accept"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ping_only_websocket_still_hits_idle_timeout() {
+    let (client_io, server_io) = tokio::io::duplex(4096);
+    let mut client = Box::new(
+        WebSocketStream::from_raw_socket(
+            Box::new(client_io) as Box<dyn super::upgrade::Io>,
+            Role::Client,
+            None,
+        )
+        .await,
+    );
+    let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+    let pinger = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            if server.send(WsMessage::Ping(vec![1].into())).await.is_err() {
+                break;
+            }
+        }
+    });
+    let outcome =
+        tokio::time::timeout(super::IDLE_TIMEOUT, super::next_incoming(&mut client)).await;
+    assert!(
+        outcome.is_err(),
+        "periodic Pings must not reset IDLE_TIMEOUT"
+    );
+    pinger.abort();
 }

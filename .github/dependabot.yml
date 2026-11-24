@@ -2,9 +2,6 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
-    ignore:
-      - dependency-name: flate2
-        versions: ["1.1.11"]
     schedule:
       interval: weekly
     groups:

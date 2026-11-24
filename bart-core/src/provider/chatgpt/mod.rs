@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 
+use futures_util::{SinkExt as _, StreamExt as _};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, time};
+use tokio_tungstenite::tungstenite::{Error as WsError, Message, Utf8Bytes, error::ProtocolError};
 
 use reqwest::Client;
 
@@ -40,8 +42,7 @@ struct State {
 }
 
 struct Connection {
-    sender: soketto::connection::Sender<upgrade::Stream>,
-    receiver: soketto::connection::Receiver<upgrade::Stream>,
+    stream: upgrade::Stream,
     cache: Option<(String, u64)>,
     last: Option<Last>,
 }
@@ -198,10 +199,10 @@ async fn receive(
         if let Some(trace) = &mut trace {
             trace.body(prepared.text.len());
         }
-        let sent = time::timeout(IDLE_TIMEOUT, async {
-            connection.sender.send_text_owned(prepared.text).await?;
-            connection.sender.flush().await
-        })
+        let sent = time::timeout(
+            IDLE_TIMEOUT,
+            connection.stream.send(Message::text(prepared.text)),
+        )
         .await
         .map_err(|_| Error::Interrupted("websocket send timed out".into()))?;
         let read = match sent {
@@ -347,12 +348,8 @@ async fn connect(
         .await
         .map_err(|_| Error::Interrupted("websocket connection timed out".into()))?
         .map_err(Error::Interrupted)?;
-    let (sender, receiver, headers) = match upgrade {
-        upgrade::Upgrade::Open {
-            sender,
-            receiver,
-            headers,
-        } => (sender, receiver, headers),
+    let (stream, headers) = match upgrade {
+        upgrade::Upgrade::Open { stream, headers } => (stream, headers),
         upgrade::Upgrade::Refused {
             status,
             headers,
@@ -374,11 +371,32 @@ async fn connect(
         *turn_state = Some(value.to_owned());
     }
     Ok(Some(Connection {
-        sender,
-        receiver,
+        stream,
         cache: owned(request.cache),
         last: None,
     }))
+}
+
+enum Incoming {
+    Text(Utf8Bytes),
+    Binary,
+    Closed,
+}
+
+async fn next_incoming(stream: &mut upgrade::Stream) -> Result<Incoming, WsError> {
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(text))) => return Ok(Incoming::Text(text)),
+            Some(Ok(Message::Binary(_))) => return Ok(Incoming::Binary),
+            Some(Ok(Message::Close(_))) => {
+                let _ = stream.flush().await;
+                return Ok(Incoming::Closed);
+            }
+            None => return Ok(Incoming::Closed),
+            Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {}
+            Some(Err(error)) => return Err(error),
+        }
+    }
 }
 
 async fn read(
@@ -393,26 +411,40 @@ async fn read(
     let mut response_id = String::new();
     let mut first = true;
     loop {
-        let mut data = Vec::new();
         let received = observe(
-            time::timeout(IDLE_TIMEOUT, connection.receiver.receive_data(&mut data)),
+            time::timeout(IDLE_TIMEOUT, next_incoming(&mut connection.stream)),
             trace.as_deref_mut(),
         )
         .await
         .map_err(|_| Error::Interrupted(format!("no data for {}s", IDLE_TIMEOUT.as_secs())))?;
         let text = match received {
-            Ok(soketto::Data::Text(_)) => String::from_utf8(data)
-                .map_err(|_| Error::Invalid("websocket text is not UTF-8".into()))?,
-            Ok(soketto::Data::Binary(_)) => {
+            Ok(Incoming::Text(text)) => text,
+            Ok(Incoming::Binary) => {
                 return Err(Error::Invalid("binary websocket event".into()));
             }
-            Err(error) if first => {
-                return Ok(Read::Lost(format!("failed before any event: {error}")));
+            Err(WsError::Utf8(_)) => {
+                return Err(Error::Invalid("websocket text is not UTF-8".into()));
             }
-            Err(soketto::connection::Error::Closed) => {
+            Err(WsError::Capacity(error)) => {
+                return Err(Error::Limit(format!(
+                    "websocket message too large: {error}"
+                )));
+            }
+            Err(WsError::Protocol(error))
+                if !matches!(error, ProtocolError::ResetWithoutClosingHandshake) =>
+            {
+                return Err(Error::Invalid(format!("websocket protocol error: {error}")));
+            }
+            Ok(Incoming::Closed) if first => {
+                return Ok(Read::Lost("closed before any event".into()));
+            }
+            Ok(Incoming::Closed) => {
                 return Err(Error::Interrupted(
                     "websocket closed before the response completed".into(),
                 ));
+            }
+            Err(error) if first => {
+                return Ok(Read::Lost(format!("failed before any event: {error}")));
             }
             Err(error) => return Err(Error::Interrupted(format!("websocket failed: {error}"))),
         };

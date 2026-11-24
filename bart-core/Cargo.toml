@@ -30,8 +30,7 @@ workspace = true
 [dependencies]
 async-trait = "0.1"
 base64 = "0.23.1"
-bytes = "1.12.2"
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
 http = "1.5.0"
 httpdate = "1.0.3"
@@ -51,11 +50,11 @@ sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.1", default-features = false }
 signal-hook = { version = "0.4.6", default-features = false }
 similar = "3.2"
-soketto = { version = "0.8.1", features = ["deflate"] }
 tempfile = { version = "3.27.0", optional = true }
 tokio = { version = "1.54.1", features = ["process", "time", "net", "io-util", "macros", "rt", "signal", "sync"] }
 tokio-rustls = { version = "0.26.6", default-features = false }
-tokio-util = { version = "0.7.20", features = ["compat"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false }
+tokio-util = "0.7.20"
 uuid = "1.29.3"
 
 [dev-dependencies]
