@@ -46,50 +46,73 @@ pub(super) fn python(code: &str) -> Vec<Line<'static>> {
 }
 
 pub(super) fn highlight(code: &str, language: &str) -> Option<Vec<Line<'static>>> {
-    let syntax = SYNTAXES.find_syntax_by_token(language)?;
-    let theme = theme();
-    let style = |kind: Kind| match kind {
+    let mut syntax = Syntax::new(language)?;
+    code.split('\n').map(|line| syntax.line(line)).collect()
+}
+
+#[derive(Clone)]
+pub(super) struct Syntax {
+    state: ParseState,
+    stack: ScopeStack,
+}
+
+impl Syntax {
+    pub(super) fn new(language: &str) -> Option<Self> {
+        Some(Self {
+            state: ParseState::new(SYNTAXES.find_syntax_by_token(language)?),
+            stack: ScopeStack::new(),
+        })
+    }
+
+    pub(super) fn line(&mut self, text: &str) -> Option<Line<'static>> {
+        let theme = theme();
+        let mut spans = Vec::new();
+        let mut at = 0;
+        for (index, op) in self
+            .state
+            .parse_line(&format!("{text}\n"), &SYNTAXES)
+            .ok()?
+        {
+            let index = index.min(text.len());
+            if index > at {
+                spans.push(Span::styled(
+                    text[at..index].to_owned(),
+                    scope_style(&self.stack, theme),
+                ));
+                at = index;
+            }
+            self.stack.apply(&op).ok()?;
+        }
+        if at < text.len() {
+            spans.push(Span::styled(
+                text[at..].to_owned(),
+                scope_style(&self.stack, theme),
+            ));
+        }
+        Some(Line::from(spans))
+    }
+}
+
+fn scope_style(stack: &ScopeStack, theme: super::palette::Theme) -> Style {
+    let kind = stack
+        .as_slice()
+        .iter()
+        .rev()
+        .find_map(|scope| {
+            KINDS
+                .iter()
+                .find(|(prefix, _)| prefix.is_prefix_of(*scope))
+                .map(|&(_, kind)| kind)
+        })
+        .unwrap_or(Kind::Plain);
+    match kind {
         Kind::Comment => super::transcript::muted(Style::new().italic()),
         Kind::String => Style::new().fg(theme.success),
         Kind::Literal => Style::new().fg(theme.literal),
         Kind::Keyword => Style::new().fg(theme.keyword).bold(),
         Kind::Call => Style::new().fg(theme.code),
         Kind::Plain => Style::new(),
-    };
-    let current = |stack: &ScopeStack| {
-        stack
-            .as_slice()
-            .iter()
-            .rev()
-            .find_map(|&scope| {
-                KINDS
-                    .iter()
-                    .find(|(prefix, _)| prefix.is_prefix_of(scope))
-                    .map(|&(_, kind)| style(kind))
-            })
-            .unwrap_or_default()
-    };
-    let mut state = ParseState::new(syntax);
-    let mut stack = ScopeStack::new();
-    let mut lines = Vec::new();
-    for text in code.split('\n') {
-        let line = format!("{text}\n");
-        let mut spans = Vec::new();
-        let mut at = 0;
-        for (index, op) in state.parse_line(&line, &SYNTAXES).ok()? {
-            let index = index.min(text.len());
-            if index > at {
-                spans.push(Span::styled(text[at..index].to_owned(), current(&stack)));
-                at = index;
-            }
-            stack.apply(&op).ok()?;
-        }
-        if at < text.len() {
-            spans.push(Span::styled(text[at..].to_owned(), current(&stack)));
-        }
-        lines.push(Line::from(spans));
     }
-    Some(lines)
 }
 
 fn plain(code: &str) -> Vec<Line<'static>> {

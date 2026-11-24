@@ -1,7 +1,7 @@
 use super::{
     app::Effect,
     brand,
-    selection::{self, Point, Row, point_at},
+    selection::{self, Anchor, Point, Row, point_at},
     status::{Kind, Status},
     text::{self, Clean, Item},
     transcript::{Detail, DetailSequence, Highlight},
@@ -19,7 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use std::borrow::Cow;
+use std::{borrow::Cow, ops::Range};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Selection {
@@ -51,11 +51,13 @@ struct Search {
     selected: usize,
     seek: bool,
     matches: Vec<usize>,
+    marks: Vec<Vec<Range<usize>>>,
+    output_source: Option<u64>,
     output_key: Option<(Selection, u16, u64)>,
 }
 struct Pane {
     scroll: usize,
-    anchor: Option<Point>,
+    anchor: Option<Anchor>,
     lines: Vec<Row>,
     area: Rect,
     label: Rect,
@@ -64,7 +66,7 @@ impl Pane {
     fn new(follow: bool) -> Self {
         Self {
             scroll: 0,
-            anchor: (!follow).then_some((0, 0)),
+            anchor: (!follow).then_some((0, 0, 0)),
             lines: Vec::new(),
             area: Rect::default(),
             label: Rect::default(),
@@ -94,7 +96,7 @@ impl Pane {
         self.anchor = Some(
             self.lines
                 .get(self.scroll)
-                .map_or((0, 0), |row| point_at(row, row.indent)),
+                .map_or((0, 0, 0), |row| row.anchor),
         );
         true
     }
@@ -105,12 +107,19 @@ impl Pane {
             .saturating_sub(usize::from(self.area.height));
         self.scroll = self.anchor.map_or(bottom, |anchor| {
             self.lines
-                .partition_point(|row| (row.block, row.byte) <= anchor)
+                .partition_point(|row| row.anchor <= anchor)
                 .saturating_sub(1)
                 .min(bottom)
         });
     }
-    fn draw(&self, frame: &mut Frame, heading: &str, focused: bool, range: Option<(Point, Point)>) {
+    fn draw(
+        &self,
+        frame: &mut Frame,
+        heading: &str,
+        focused: bool,
+        range: Option<(Point, Point)>,
+        marks: &[Vec<Range<usize>>],
+    ) {
         for (index, row) in self
             .lines
             .iter()
@@ -121,10 +130,13 @@ impl Pane {
             let line = if let Some(range) = range {
                 selection::highlight(row, range)
             } else {
-                selection::borrowed(&row.line)
+                selection::borrowed(row.line())
             };
             frame.render_widget(
-                line,
+                match marks.get(self.scroll + index) {
+                    Some(ranges) if !ranges.is_empty() => highlighted(&line, ranges),
+                    _ => selection::borrowed(&line),
+                },
                 Rect::new(self.area.x, self.area.y + index as u16, self.area.width, 1),
             );
         }
@@ -145,7 +157,6 @@ pub(super) struct Viewer {
     has_code: bool,
     empty: bool,
     waiting: bool,
-    table: bool,
     painted: Option<FrameStamp>,
     code_key: Option<(Selection, u16, usize, Option<String>)>,
 }
@@ -208,7 +219,6 @@ impl Viewer {
             has_code: false,
             empty: true,
             waiting: false,
-            table: false,
             painted: None,
             code_key: None,
         }
@@ -224,19 +234,6 @@ impl Viewer {
         self.focus = Focus::Output;
     }
 
-    pub(super) fn resize(&mut self, width: u16, status: &mut Status) {
-        if self.size.width != width
-            && self.table
-            && self.drag.is_some_and(|drag| drag.focus == Focus::Output)
-        {
-            self.drag = None;
-            status.set(
-                Kind::Info,
-                Clean::literal("Table selection cleared"),
-                Some(std::time::Duration::from_secs(3)),
-            );
-        }
-    }
     pub(super) fn painted(&mut self, stamp: Option<FrameStamp>) {
         self.painted = stamp;
     }
@@ -476,7 +473,6 @@ impl Viewer {
         live: &Live,
         status: &mut Status,
     ) {
-        self.resize(size.width, status);
         if self.size.width != size.width && !self.search.prompt && !self.search.query.is_empty() {
             self.search.seek = true;
         }
@@ -530,7 +526,7 @@ impl Viewer {
                     .into_iter()
                     .enumerate()
                     .flat_map(|(number, line)| {
-                        selection::wrap_line(line, number as u64, 0, usize::from(size.width))
+                        selection::wrap_line(&line, number as u64, 0, usize::from(size.width))
                     })
                     .collect()
             } else {
@@ -538,109 +534,44 @@ impl Viewer {
             };
         }
         let query = self.search.query.to_ascii_lowercase();
-        let output_hash = {
+        let (source_hash, output_hash) = {
             use std::hash::{Hash as _, Hasher as _};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             content.markdown.hash(&mut hasher);
             content.output.hash(&mut hasher);
+            let source_hash = hasher.finish();
             for highlight in content.highlights.iter() {
                 highlight.range.hash(&mut hasher);
                 highlight.style.hash(&mut hasher);
             }
             query.hash(&mut hasher);
-            hasher.finish()
+            (source_hash, hasher.finish())
         };
-        let output_cached = self
-            .search
-            .output_key
-            .is_some_and(|key| key == (self.selected, size.width, output_hash));
-        if !output_cached {
-            self.search.output_key = Some((self.selected, size.width, output_hash));
-            self.table = content.markdown && super::markdown::contains_table(&content.output);
+        let key = (self.selected, size.width, output_hash);
+        if self.search.output_key != Some(key) {
             let output = if content.markdown {
-                super::markdown::render_detail(&content.output, size.width).lines
+                super::markdown::render_detail(&content.output, size.width)
             } else {
-                let mut offset = 0;
-                let mut highlights = content.highlights.iter().peekable();
-                content
-                    .output
-                    .split_inclusive('\n')
-                    .map(|segment| {
-                        let line = segment.trim_end_matches(['\n', '\r']);
-                        let line_end = offset + line.len();
-                        let mut spans = Vec::new();
-                        let mut line_bg = None;
-                        let mut at = offset;
-                        while at < line_end {
-                            while highlights.peek().is_some_and(|span| span.range.end <= at) {
-                                highlights.next();
-                            }
-                            let (to, style) = match highlights.peek() {
-                                Some(span) if span.range.start <= at => {
-                                    if span.range.start <= offset && span.range.end >= line_end {
-                                        line_bg = line_bg.or(span.style.bg);
-                                    }
-                                    (line_end.min(span.range.end), span.style)
-                                }
-                                Some(span) => (line_end.min(span.range.start), Style::new()),
-                                None => (line_end, Style::new()),
-                            };
-                            spans.push(Span::styled(
-                                line[at - offset..to - offset].to_owned(),
-                                style,
-                            ));
-                            at = to;
-                        }
-                        if spans.is_empty() {
-                            while highlights
-                                .peek()
-                                .is_some_and(|span| span.range.end <= offset)
-                            {
-                                highlights.next();
-                            }
-                            if let Some(span) = highlights.peek().filter(|span| {
-                                span.range.start <= offset && span.range.end > offset
-                            }) {
-                                line_bg = span.style.bg;
-                            }
-                        }
-                        offset += segment.len();
-                        Line::from(spans).style(Style {
-                            bg: line_bg,
-                            ..Style::new()
-                        })
-                    })
-                    .collect()
+                output_rows(&content, size.width)
             };
-            let selected = self
-                .drag
-                .filter(|drag| drag.focus == Focus::Output)
-                .map(Drag::range);
-            let selected_text =
-                selected.and_then(|range| selection::text(&self.output.lines, range));
-            self.search.matches.clear();
-            self.output.lines.clear();
-            for (number, line) in output.into_iter().enumerate() {
-                let (line, starts) = highlighted(line, &query);
-                let first = self.output.lines.len();
-                let rows = selection::wrap_line(line, number as u64, 0, usize::from(size.width));
-                let mut starts = starts.into_iter().peekable();
-                for (index, row) in rows.iter().enumerate() {
-                    while starts
-                        .peek()
-                        .is_some_and(|start| *start < row.byte + row.len)
-                    {
-                        self.search.matches.push(first + index);
-                        starts.next();
-                    }
-                }
-                self.output.lines.extend(rows);
-            }
-            if selected
-                .is_some_and(|range| selected_text != selection::text(&self.output.lines, range))
+            if self
+                .search
+                .output_source
+                .is_some_and(|hash| hash != source_hash)
+                && let Some(drag) = self.drag.filter(|drag| drag.focus == Focus::Output)
+                && !selection::unchanged(
+                    &self.output.lines,
+                    &output,
+                    Some(drag.start),
+                    Some(drag.end),
+                )
             {
                 self.drag = None;
             }
+            self.search.output_key = Some(key);
+            self.search.output_source = Some(source_hash);
+            (self.search.matches, self.search.marks) = selection::search(&output, &query);
+            self.output.lines = output;
         }
         if self.search.selected >= self.search.matches.len() {
             self.search.selected = 0;
@@ -684,10 +615,7 @@ impl Viewer {
         }
         if std::mem::take(&mut self.search.seek) {
             if let Some(&row) = self.search.matches.get(self.search.selected) {
-                self.output.anchor = Some(point_at(
-                    &self.output.lines[row],
-                    self.output.lines[row].indent,
-                ));
+                self.output.anchor = Some(self.output.lines[row].anchor);
             } else if !query.is_empty() {
                 status.set(
                     Kind::Info,
@@ -773,15 +701,20 @@ impl Viewer {
                 selection::borrowed(&self.heading)
             };
             frame.render_widget(heading, Rect::new(0, 0, body.width, 1));
-            for (focus, pane, heading) in [
-                (Focus::Code, &self.code, "CODE"),
-                (Focus::Output, &self.output, &self.output_heading),
+            for (focus, pane, heading, marks) in [
+                (Focus::Code, &self.code, "CODE", &[][..]),
+                (
+                    Focus::Output,
+                    &self.output,
+                    &self.output_heading,
+                    self.search.marks.as_slice(),
+                ),
             ] {
                 let range = self
                     .drag
                     .filter(|drag| drag.focus == focus && drag.moved)
                     .map(Drag::range);
-                pane.draw(frame, heading, focus == self.focus, range);
+                pane.draw(frame, heading, focus == self.focus, range, marks);
             }
             if self.waiting {
                 frame.render_widget(Paragraph::new("[no output yet]"), self.output.area);
@@ -917,63 +850,93 @@ fn pane_heading(name: &str, pane: &Pane, focused: bool) -> Line<'static> {
         Span::styled(format!(" {}", "─".repeat(rest)), rule),
     ])
 }
-fn highlighted(line: Line<'static>, query: &str) -> (Line<'static>, Vec<usize>) {
-    if query.is_empty() {
-        return (line, Vec::new());
-    }
-    let source: String = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    let starts: Vec<_> = source
-        .to_ascii_lowercase()
-        .match_indices(query)
-        .map(|(start, _)| start)
-        .collect();
-    let mut spans = Vec::new();
+fn output_rows(content: &Content<'_>, width: u16) -> Vec<Row> {
     let mut offset = 0;
-    let mut matches = starts.iter().copied().peekable();
-    for span in line.spans {
-        let end = offset + span.content.len();
-        let mut at = offset;
-        while at < end {
-            while matches
-                .peek()
-                .is_some_and(|start| start + query.len() <= at)
-            {
+    let mut highlights = content.highlights.iter().peekable();
+    content
+        .output
+        .split_inclusive('\n')
+        .map(|segment| {
+            let line = segment.trim_end_matches(['\n', '\r']);
+            let line_end = offset + line.len();
+            let mut spans = Vec::new();
+            let mut line_bg = None;
+            let mut at = offset;
+            while at < line_end {
+                while highlights.peek().is_some_and(|span| span.range.end <= at) {
+                    highlights.next();
+                }
+                let (to, style) = match highlights.peek() {
+                    Some(span) if span.range.start <= at => {
+                        if span.range.start <= offset && span.range.end >= line_end {
+                            line_bg = line_bg.or(span.style.bg);
+                        }
+                        (line_end.min(span.range.end), span.style)
+                    }
+                    Some(span) => (line_end.min(span.range.start), Style::new()),
+                    None => (line_end, Style::new()),
+                };
+                spans.push(Span::styled(
+                    line[at - offset..to - offset].to_owned(),
+                    style,
+                ));
+                at = to;
+            }
+            if spans.is_empty() {
+                while highlights
+                    .peek()
+                    .is_some_and(|span| span.range.end <= offset)
+                {
+                    highlights.next();
+                }
+                if let Some(span) = highlights
+                    .peek()
+                    .filter(|span| span.range.start <= offset && span.range.end > offset)
+                {
+                    line_bg = span.style.bg;
+                }
+            }
+            offset += segment.len();
+            Line::from(spans).style(Style {
+                bg: line_bg,
+                ..Style::new()
+            })
+        })
+        .enumerate()
+        .flat_map(|(number, line)| {
+            selection::wrap_line(&line, number as u64, 0, usize::from(width))
+        })
+        .collect()
+}
+
+fn highlighted<'a>(line: &'a Line<'_>, ranges: &[Range<usize>]) -> Line<'a> {
+    use unicode_segmentation::UnicodeSegmentation as _;
+
+    let mut offset = 0;
+    let mut matches = ranges.iter().peekable();
+    let mut spans = Vec::new();
+    for span in &line.spans {
+        spans.extend(span.content.graphemes(true).map(|glyph| {
+            let start = offset;
+            offset += glyph.len();
+            while matches.peek().is_some_and(|range| range.end <= start) {
                 matches.next();
             }
-            let inside = matches.peek().is_some_and(|start| *start <= at);
-            let to = matches.peek().map_or(end, |start| {
-                if inside {
-                    (start + query.len()).min(end)
-                } else {
-                    (*start).min(end)
-                }
-            });
-            let style = line.style.patch(span.style);
-            spans.push(Span::styled(
-                span.content[at - offset..to - offset].to_owned(),
-                if inside {
-                    style.bold().reversed()
-                } else {
-                    style
-                },
-            ));
-            at = to;
-        }
-        offset = end;
+            let style = if matches.peek().is_some_and(|range| range.start < offset) {
+                span.style.bold().reversed()
+            } else {
+                span.style
+            };
+            Span::styled(glyph, style)
+        }));
     }
-    (
-        Line {
-            spans,
-            style: line.style,
-            alignment: line.alignment,
-        },
-        starts,
-    )
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
 }
+
 fn selections(details: &[Detail], live: &Live) -> Vec<Selection> {
     let mut jobs = live.jobs();
     jobs.retain(|job| {
@@ -1128,6 +1091,194 @@ fn output_excerpt<'a>(
 mod tests {
     use super::*;
 
+    fn mouse(
+        viewer: &mut Viewer,
+        kind: MouseEventKind,
+        (column, row): (u16, u16),
+    ) -> Option<String> {
+        let stamp = Some(FrameStamp {
+            seq: 1,
+            size: (viewer.size.width, viewer.size.height),
+        });
+        viewer.painted(stamp);
+        viewer.mouse(
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            stamp,
+        )
+    }
+    fn locate(viewer: &Viewer, token: &str) -> (u16, u16) {
+        let pane = &viewer.output;
+        pane.lines
+            .iter()
+            .skip(pane.scroll)
+            .enumerate()
+            .find_map(|(row, projected)| {
+                let rendered = projected.line().to_string();
+                rendered.find(token).map(|byte| {
+                    (
+                        pane.area.x + u16::try_from(text::width(&rendered[..byte])).unwrap(),
+                        pane.area.y + u16::try_from(row).unwrap(),
+                    )
+                })
+            })
+            .expect(token)
+    }
+
+    #[test]
+    fn live_plain_output_append_keeps_mouse_drag() {
+        let runtime = std::sync::Arc::new(Live::default());
+        let mut job = runtime.start("test", "", Some(1));
+        job.result("retained line\n");
+        let mut viewer = Viewer::new(&[], &runtime, true);
+        let size = Size::new(30, 16);
+        let mut status = Status::default();
+        viewer.prepare(size, &[], &runtime, &mut status);
+        let (column, row) = locate(&viewer, "retained line");
+        let button = MouseButton::Left;
+        mouse(&mut viewer, MouseEventKind::Down(button), (column, row));
+        mouse(
+            &mut viewer,
+            MouseEventKind::Drag(button),
+            (column + 12, row),
+        );
+        job.result("a new line\n");
+        viewer.prepare(size, &[], &runtime, &mut status);
+        locate(&viewer, "a new line");
+        assert_eq!(
+            mouse(&mut viewer, MouseEventKind::Up(button), (column, row)).as_deref(),
+            Some("retained line")
+        );
+    }
+
+    #[test]
+    fn live_viewer_discards_a_drag_before_reusing_table_offsets() {
+        let mut transcript = crate::tui::transcript::Transcript::default();
+        let runtime = Live::default();
+        let mut status = Status::default();
+        transcript.apply(super::super::session::UiEvent::Compacting, 24);
+        transcript.apply(
+            super::super::session::UiEvent::CompactionText(
+                "| Key | Data |\n| --- | --- |\n| x | ab |".into(),
+            ),
+            24,
+        );
+        let mut viewer = Viewer::new(transcript.details(), &runtime, true);
+        let size = Size::new(24, 16);
+        viewer.prepare(size, transcript.details(), &runtime, &mut status);
+        let (column, row) = locate(&viewer, "ab");
+        let button = MouseButton::Left;
+        mouse(&mut viewer, MouseEventKind::Down(button), (column + 1, row));
+        mouse(&mut viewer, MouseEventKind::Drag(button), (column, row));
+        transcript.apply(
+            super::super::session::UiEvent::Compacted(
+                "| Key | Data |\n| --- | --- |\n| x | 界 |".into(),
+            ),
+            24,
+        );
+        viewer.prepare(size, transcript.details(), &runtime, &mut status);
+        assert_eq!(
+            mouse(&mut viewer, MouseEventKind::Up(button), (column, row)),
+            None
+        );
+        let wide = locate(&viewer, "界");
+        mouse(&mut viewer, MouseEventKind::Down(button), wide);
+        mouse(
+            &mut viewer,
+            MouseEventKind::Drag(button),
+            (wide.0 + 1, wide.1),
+        );
+        assert_eq!(
+            mouse(&mut viewer, MouseEventKind::Up(button), wide).as_deref(),
+            Some("界")
+        );
+    }
+
+    #[test]
+    fn partial_grapheme_search_preserves_painted_columns_and_mouse_copy() {
+        use ratatui::style::Modifier;
+
+        for (glyph, query, width) in [("👩‍💻", "👩", 2), ("e\u{301}", "e", 1)] {
+            let mut transcript = crate::tui::transcript::Transcript::default();
+            transcript.compaction_note(&format!("> {glyph}xy"));
+            let runtime = Live::default();
+            let details = transcript.details();
+            let mut viewer = Viewer::new(details, &runtime, true);
+            let mut status = Status::default();
+            viewer.key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                details,
+                &runtime,
+                &mut status,
+            );
+            viewer.paste(query).unwrap();
+            viewer.prepare(Size::new(18, 12), details, &runtime, &mut status);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(18, 12)).unwrap();
+            terminal.draw(|frame| viewer.draw(frame, &status)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let (column, row) = locate(&viewer, glyph);
+            assert_eq!(buffer[(column, row)].symbol(), glyph);
+            assert!(buffer[(column, row)].modifier.contains(Modifier::REVERSED));
+            let after = column + width;
+            assert_eq!(buffer[(after, row)].symbol(), "x");
+            assert!(!buffer[(after, row)].modifier.contains(Modifier::REVERSED));
+            let button = MouseButton::Left;
+            mouse(&mut viewer, MouseEventKind::Down(button), (after, row));
+            mouse(&mut viewer, MouseEventKind::Drag(button), (after + 1, row));
+            assert_eq!(
+                mouse(&mut viewer, MouseEventKind::Up(button), (after + 1, row)).as_deref(),
+                Some("xy")
+            );
+        }
+    }
+
+    #[test]
+    fn table_search_counts_cells_not_wrapped_fragments_or_labels() {
+        let mut transcript = crate::tui::transcript::Transcript::default();
+        transcript.compaction_note(
+            "| Key | Data |\n| --- | --- |\n| x | abcdefg   hij klm |\n| y | other |",
+        );
+        let runtime = Live::default();
+        let details = transcript.details();
+        for (query, expected) in [("data", "Data"), ("abcdefg   hij", "abcdefghij")] {
+            let mut viewer = Viewer::new(details, &runtime, true);
+            let mut status = Status::default();
+            viewer.key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                details,
+                &runtime,
+                &mut status,
+            );
+            viewer.paste(query).unwrap();
+            for width in [32, 21, 16] {
+                viewer.prepare(Size::new(width, 18), details, &runtime, &mut status);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 18)).unwrap();
+                terminal.draw(|frame| viewer.draw(frame, &status)).unwrap();
+                let buffer = terminal.backend().buffer();
+                let marked: String = (viewer.output.area.y..viewer.output.area.bottom())
+                    .flat_map(|row| (0..width).map(move |column| (column, row)))
+                    .map(|at| &buffer[at])
+                    .filter(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+                    .map(ratatui::buffer::Cell::symbol)
+                    .filter(|glyph| *glyph != " ")
+                    .collect();
+                assert_eq!(marked, expected);
+                let painted: String = buffer
+                    .content
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
+                assert!(painted.contains("1 match") || painted.contains("1/1"));
+            }
+        }
+    }
+
     #[test]
     fn editing_back_to_the_painted_query_preserves_count_and_navigation() {
         let mut transcript = crate::tui::transcript::Transcript::default();
@@ -1161,6 +1312,76 @@ mod tests {
         key(&mut viewer, &mut status, KeyCode::Enter);
         key(&mut viewer, &mut status, KeyCode::Char('n'));
         assert!(draw(&mut viewer, &mut status).contains("[2/2]"));
+    }
+
+    #[test]
+    fn viewer_search_finds_text_across_a_soft_wrap() {
+        let mut transcript = crate::tui::transcript::Transcript::default();
+        transcript.compaction_note("> First alpha beta gamma");
+        let live = Live::default();
+        let details = transcript.details();
+        let mut viewer = Viewer::new(details, &live, true);
+        let mut status = Status::default();
+        viewer.key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+            details,
+            &live,
+            &mut status,
+        );
+        viewer.paste("alpha beta").unwrap();
+        viewer.prepare(Size::new(14, 12), details, &live, &mut status);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(14, 12)).unwrap();
+        terminal.draw(|frame| viewer.draw(frame, &status)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let area = viewer.output.area;
+        let selected: String = (area.y..area.bottom())
+            .flat_map(|row| (area.x..area.right()).map(move |col| (col, row)))
+            .map(|at| &buffer[at])
+            .filter(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert_eq!(selected, "alpha beta");
+    }
+
+    #[test]
+    fn compaction_summary_mouse_copy_survives_reflow() {
+        let mut transcript = crate::tui::transcript::Transcript::default();
+        transcript.compaction_note("> Summary\n\n| Name | Data |\n| --- | ---: |\n| x | abcdefg   hij klm |\n\n```\n    print(value)\n```");
+        let details = transcript.details();
+        let live = Live::default();
+        let mut viewer = Viewer::new(details, &live, true);
+        let mut status = Status::default();
+        viewer.prepare(Size::new(21, 40), details, &live, &mut status);
+        let first = locate(&viewer, "abcdefg");
+        let last = locate(&viewer, "klm");
+        let button = MouseButton::Left;
+        mouse(&mut viewer, MouseEventKind::Down(button), first);
+        mouse(
+            &mut viewer,
+            MouseEventKind::Drag(button),
+            (last.0 + 2, last.1),
+        );
+        viewer.prepare(Size::new(14, 40), details, &live, &mut status);
+        let last = locate(&viewer, "klm");
+        assert_eq!(
+            mouse(&mut viewer, MouseEventKind::Up(button), last).as_deref(),
+            Some("abcdefg   hij klm")
+        );
+        let start = locate(&viewer, "Summary");
+        let last = locate(&viewer, "e)");
+        mouse(&mut viewer, MouseEventKind::Down(button), (0, start.1));
+        mouse(
+            &mut viewer,
+            MouseEventKind::Drag(button),
+            (last.0 + 1, last.1),
+        );
+        assert_eq!(
+            mouse(&mut viewer, MouseEventKind::Up(button), last).as_deref(),
+            Some(
+                "Summary\n\n| Name | Data |\n| --- | ---: |\n| x | abcdefg   hij klm |\n\n    print(value)"
+            )
+        );
     }
 
     #[test]

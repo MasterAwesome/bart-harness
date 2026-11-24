@@ -43,7 +43,7 @@ impl Transcript {
         let mut done = Vec::new();
         let message = match entry {
             Entry::Compact(summary) => {
-                self.flush_text(&mut done, width);
+                self.flush_text(&mut done);
                 self.compaction_note(summary);
                 done.push(self.compaction_block(summary));
                 return done;
@@ -58,11 +58,11 @@ impl Transcript {
             Message::Assistant(assistant) => {
                 for part in &assistant.parts {
                     match &part.content {
-                        Content::Reasoning(text) => self.stream_reasoning(text, &mut done, width),
+                        Content::Reasoning(text) => self.stream_reasoning(text, &mut done),
                         Content::Text(text) => {
-                            self.flush_text(&mut done, width);
-                            self.stream_text(text, &mut done, width);
-                            self.flush_text(&mut done, width);
+                            self.flush_text(&mut done);
+                            self.stream_text(text, &mut done);
+                            self.flush_text(&mut done);
                         }
                         Content::ToolCall(call) => {
                             done.extend(self.apply(
@@ -127,7 +127,7 @@ impl Transcript {
                 ) = self.blocks.back_mut().map(|entry| &mut entry.block)
                 {
                     let before = block.bytes();
-                    Arc::make_mut(&mut block.rows).push(RenderRow::Literal(Line::styled(
+                    Arc::make_mut(&mut block.rows).push(RenderRow::literal(Line::styled(
                         Clean::new(&format!("  {}", skill.label())),
                         muted(Style::new()),
                     )));

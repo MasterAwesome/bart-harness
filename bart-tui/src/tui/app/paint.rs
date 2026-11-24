@@ -8,7 +8,7 @@ impl App {
         }
         self.status.expire();
         if self.drawable() {
-            let completed = self.transcript.flush_frame(self.geometry.size.width);
+            let completed = self.transcript.flush_frame();
             self.append_display(completed);
             if let Some(line) = crate::terminal_text::pending_line() {
                 self.set_status(StatusKind::Warning, line);
@@ -23,11 +23,8 @@ impl App {
             } else if !matches!(self.surface, Some(Surface::Picker(_))) {
                 self.transcript
                     .prepare_tail(self.geometry.size.width, self.animation().tick);
-                self.scrollback.prepare(
-                    self.geometry.size.width,
-                    &self.transcript,
-                    &mut self.status,
-                );
+                self.scrollback
+                    .prepare(self.geometry.size.width, &self.transcript);
             }
         } else {
             self.animation_mut().visible = false;
@@ -61,12 +58,8 @@ impl App {
     pub(super) fn resized(&mut self, size: ratatui::layout::Size) {
         if size != self.geometry.size {
             self.geometry.size = size;
-            self.scrollback
-                .resize(size.width, &self.transcript, &mut self.status);
+            self.scrollback.resize(size.width, &self.transcript);
             self.animation_mut().visible = false;
-            if let Some(Surface::Viewer(viewer, _)) = &mut self.surface {
-                viewer.resize(size.width, &mut self.status);
-            }
             self.geometry.resized_at = Some(Instant::now());
         }
     }

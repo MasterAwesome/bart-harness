@@ -38,7 +38,7 @@ pub(super) fn draw_composer(
             let line = if let Some(range) = selected {
                 selection::highlight(text, range)
             } else {
-                selection::borrowed(&text.line)
+                selection::borrowed(text.line())
             };
             spans.extend(line.spans);
             Line::from(spans)

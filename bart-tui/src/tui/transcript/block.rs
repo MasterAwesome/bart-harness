@@ -30,6 +30,10 @@ impl Block {
         }
     }
 
+    pub(in crate::tui) fn layout_dependent(&self) -> bool {
+        matches!(&self.kind, Kind::Tools(calls) if !calls.is_empty())
+    }
+
     pub(in crate::tui) fn rows(
         &self,
         width: u16,
@@ -40,14 +44,14 @@ impl Block {
         {
             let mut rows = Vec::new();
             if self.rows.first().is_some_and(RenderRow::is_blank) {
-                rows.push(RenderRow::Literal(Line::default()));
+                rows.push(RenderRow::literal(Line::default()));
             }
             let lines = if ui == crate::preferences::Ui::Cells {
                 tools(calls, None, width, 0)
             } else {
                 tools::activities(calls, None, width, 0)
             };
-            rows.extend(lines.into_iter().map(RenderRow::Literal));
+            rows.extend(lines.into_iter().map(RenderRow::literal));
             return rows.into();
         }
         std::borrow::Cow::Borrowed(&self.rows)

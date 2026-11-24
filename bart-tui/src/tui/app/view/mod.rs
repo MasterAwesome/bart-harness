@@ -480,7 +480,7 @@ impl App {
                 Span::raw("  ")
             };
             row.insert(0, marker);
-            lines.push(super::super::markdown::RenderRow::Literal(Line::from(row)));
+            lines.push(Line::from(row));
         }
         let lines = if !selecting {
             self.geometry.conversation = area;
@@ -488,9 +488,6 @@ impl App {
                 .view(usize::from(area.height), &self.transcript)
         } else {
             lines
-                .into_iter()
-                .flat_map(|line| line.project(area.width))
-                .collect()
         };
         let paragraph = Paragraph::new(lines);
         let height = u16::try_from(paragraph.line_count(area.width)).unwrap_or(u16::MAX);

@@ -277,13 +277,12 @@ impl Task {
                 match tokio::task::spawn_blocking(move || {
                     sources
                         .iter()
-                        .map(|source| match source {
-                            super::transcript::CopySource::Text(text) => text.to_string(),
+                        .flat_map(|source| match source {
+                            super::transcript::CopySource::Text(text) => vec![text.to_string()],
                             super::transcript::CopySource::Rows(rows) => rows
                                 .iter()
                                 .map(super::markdown::RenderRow::source)
-                                .collect::<Vec<_>>()
-                                .join("\n"),
+                                .collect(),
                         })
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -562,6 +561,30 @@ impl Tasks {
 mod tests {
     use super::*;
     use crate::agent::Event;
+
+    #[tokio::test]
+    async fn copy_conversation_formats_tables_and_keeps_code_indent() {
+        let mut transcript = super::super::transcript::Transcript::default();
+        let message = transcript.user("Show an example.", &[], false);
+        transcript.append([message], None);
+        let blocks = transcript.apply(super::super::session::UiEvent::Text(
+            "> Example\n\n| Name | Value |\n| :--- | ---: |\n| a \\| b | 2 |\n\n```text\n    one two three    \n      four\n```".into(),
+        ), 18);
+        transcript.append(blocks, None);
+        let blocks = transcript.end(None, 18);
+        transcript.append(blocks, None);
+        let TaskResult::ConversationCopied(text) =
+            Task::CopyConversation(transcript.copy_sources())
+                .run()
+                .await
+        else {
+            panic!("conversation copy failed");
+        };
+        assert_eq!(
+            text,
+            "Show an example.\n\nExample\n\n| Name | Value |\n| :--- | ---: |\n| a \\| b | 2 |\n\n    one two three    \n      four"
+        );
+    }
 
     #[tokio::test]
     async fn close_reports_record_io_errors() {

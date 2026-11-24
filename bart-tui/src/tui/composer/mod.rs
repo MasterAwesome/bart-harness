@@ -475,7 +475,7 @@ impl Composer {
             .as_ref()
             .is_none_or(|cached| cached.width != width)
         {
-            let rows = selection::wrap_line(Line::from(Span::raw(self.text.clone())), 0, 0, width);
+            let rows = selection::wrap_line(&Line::from(Span::raw(self.text.clone())), 0, 0, width);
             self.layout = Some(DraftLayout { width, rows });
         }
     }
@@ -574,12 +574,17 @@ impl DraftLayout {
     fn walk(&self, text: &str, mut visit: impl FnMut(usize, usize, usize, &str)) {
         let (mut index, mut byte, mut cells) = (0, 0, 0);
         for (row, source) in self.rows.iter().enumerate() {
-            cells = source.indent;
+            cells = source.indent();
             for (_, _, grapheme, _) in selection::graphemes(source) {
                 visit(index, row, cells, grapheme);
                 index += grapheme.chars().count();
                 byte += grapheme.len();
                 cells += super::text::width(grapheme);
+            }
+            for gap in source.skipped().graphemes(true) {
+                visit(index, row, cells.min(self.width.saturating_sub(1)), gap);
+                index += gap.chars().count();
+                byte += gap.len();
             }
             if text[byte..].starts_with('\n') {
                 visit(index, row, cells, "\n");
@@ -600,5 +605,39 @@ impl DraftLayout {
             }
         });
         at
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_boundary_space_has_no_display_row_but_is_copied_and_keeps_cursor_position() {
+        let mut composer = Composer::default();
+        assert!(composer.set("hello world".into()));
+        let (rows, cursor) = composer.layout(5);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.line().to_string())
+                .collect::<Vec<_>>(),
+            ["hello", "world"]
+        );
+        assert_eq!(cursor, (2, 0));
+        composer.painted(Rect::new(0, 0, 5, 2), 0);
+        composer.select(0, 0, false);
+        composer.select(4, 1, true);
+        assert_eq!(composer.finish_selection().as_deref(), Some("hello world"));
+    }
+    #[test]
+    fn selection_starting_on_a_separator_survives_reflow() {
+        let mut composer = Composer::default();
+        assert!(composer.set("hello world".into()));
+        composer.layout(12);
+        composer.painted(Rect::new(0, 0, 12, 1), 0);
+        composer.select(5, 0, false);
+        composer.select(10, 0, true);
+        composer.layout(5);
+        assert_eq!(composer.finish_selection().as_deref(), Some(" world"));
     }
 }

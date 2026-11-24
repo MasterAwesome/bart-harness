@@ -24,7 +24,7 @@ impl Transcript {
     }
     fn push(&mut self, mut block: Block) {
         for row in Arc::make_mut(&mut block.rows) {
-            row.bound_table(row.bytes());
+            row.bound_table();
         }
         self.bytes += block.bytes();
         self.rows += block.rows.len();
@@ -46,10 +46,7 @@ impl Transcript {
     pub(in crate::tui) fn ui(&self) -> crate::preferences::Ui {
         self.ui
     }
-    pub(in crate::tui) fn revision(&self) -> u64 {
-        self.revision
-    }
-    pub(in crate::tui) fn tail(&self) -> &[RenderRow] {
+    pub(in crate::tui) fn tail(&self) -> &Arc<[RenderRow]> {
         &self.tail
     }
     pub(in crate::tui) fn copy_sources(&self) -> Vec<CopySource> {

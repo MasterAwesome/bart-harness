@@ -459,15 +459,16 @@ impl App {
                 let area = self.geometry.conversation;
                 let row = mouse.row.saturating_sub(area.y);
                 let column = usize::from(mouse.column.saturating_sub(area.x));
+                let fresh = self.geometry.resized_at.is_none();
                 match mouse.kind {
                     MouseEventKind::ScrollUp => self.scrollback.scroll_line(false),
                     MouseEventKind::ScrollDown => self.scrollback.scroll_line(true),
-                    MouseEventKind::Down(MouseButton::Left) => {
+                    MouseEventKind::Down(MouseButton::Left) if fresh => {
                         if area.contains((mouse.column, mouse.row).into()) {
                             self.scrollback.select(usize::from(row), column, false);
                         }
                     }
-                    MouseEventKind::Drag(MouseButton::Left) => {
+                    MouseEventKind::Drag(MouseButton::Left) if fresh => {
                         if mouse.row < area.y || mouse.row >= area.bottom() {
                             self.scrollback.select_beyond(mouse.row < area.y, column);
                         } else {
@@ -475,7 +476,7 @@ impl App {
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(text) = self.scrollback.selected_text(&self.transcript) {
+                        if let Some(text) = self.scrollback.selected_text(&mut self.transcript) {
                             let chars = format!("{} chars", text.chars().count());
                             self.effects.push(Effect::Copy(text, chars));
                         }

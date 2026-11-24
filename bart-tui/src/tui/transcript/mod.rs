@@ -229,7 +229,7 @@ impl Spacing {
             let distinct = self.last != Some(element)
                 || matches!(kind, Kind::User(_) | Kind::Notice) && lines.is_empty();
             if self.last.is_some() && (distinct || self.blank) {
-                lines.push(RenderRow::Literal(
+                lines.push(RenderRow::literal(
                     Line::default().style(Style::new().bg(Color::Reset)),
                 ));
             }
@@ -250,12 +250,19 @@ pub(super) struct StoredBlock {
     pub(super) block: Block,
 }
 
+#[derive(Clone, Copy, Default)]
+enum ReasoningPreview {
+    #[default]
+    Pending,
+    Shown,
+}
+
 #[derive(Default)]
 pub(super) struct Transcript {
     spacing: Spacing,
     prose: u64,
     reasoning: markdown::Stream,
-    reasoning_shown: bool,
+    reasoning_preview: ReasoningPreview,
     reasoning_detail: Option<(DetailSequence, crate::terminal_text::Display)>,
     text: markdown::Stream,
     responded: bool,
@@ -273,8 +280,8 @@ pub(super) struct Transcript {
     bytes: usize,
     rows: usize,
     next: u64,
-    revision: u64,
-    tail: Vec<RenderRow>,
+    tail: Arc<[RenderRow]>,
+    tail_tick: usize,
 }
 
 impl Transcript {
@@ -285,9 +292,6 @@ impl Transcript {
         &self.last_answer
     }
     pub(super) fn set_ui(&mut self, ui: crate::preferences::Ui) {
-        if self.ui != ui {
-            self.revision += 1;
-        }
         self.ui = ui;
     }
 
@@ -343,20 +347,16 @@ impl Transcript {
         skills: &[crate::history::Skill],
         steered: bool,
     ) -> Block {
-        self.revision += 1;
         let text = Clean::new(text);
         let mut rendered = user(&text, steered, &self.pastes);
         for skill in skills {
-            rendered.lines.push(Line::styled(
+            rendered.lines.push(RenderRow::literal(Line::styled(
                 Clean::new(&format!("  {}", skill.label())),
                 muted(Style::new()),
-            ));
+            )));
         }
         let kind = Kind::User(Arc::new(text));
-        let rows = self
-            .spacing
-            .render(&kind, rendered.into())
-            .expect("user rows");
+        let rows = self.spacing.render(&kind, rendered).expect("user rows");
         Block::new(kind, rows)
     }
 
@@ -393,7 +393,6 @@ impl Transcript {
     }
 
     pub(super) fn notice(&mut self, text: Text<'static>) -> Block {
-        self.revision += 1;
         Block::new(
             Kind::Notice,
             self.spacing
@@ -403,24 +402,9 @@ impl Transcript {
     }
 
     pub(super) fn apply(&mut self, activity: UiEvent, width: u16) -> Vec<Block> {
-        if matches!(
-            &activity,
-            UiEvent::Text(_)
-                | UiEvent::Reasoning(_)
-                | UiEvent::MessageBoundary
-                | UiEvent::ToolStarted { .. }
-                | UiEvent::ToolFinished { .. }
-                | UiEvent::Image(_)
-                | UiEvent::Steered(_)
-                | UiEvent::Notification(_)
-                | UiEvent::Responded
-                | UiEvent::Compacted(..)
-        ) {
-            self.revision += 1;
-        }
         let mut done = Vec::new();
         match activity {
-            UiEvent::MessageBoundary => self.flush_text(&mut done, width),
+            UiEvent::MessageBoundary => self.flush_text(&mut done),
             UiEvent::Review(review) => {
                 if let Some(detail) = self
                     .details
@@ -468,16 +452,16 @@ impl Transcript {
                 {
                     self.compaction_note(&summary);
                 }
-                self.flush_text(&mut done, width);
+                self.flush_text(&mut done);
                 done.push(self.compaction_block(&summary));
             }
-            UiEvent::Reasoning(delta) => self.stream_reasoning(&delta, &mut done, width),
-            UiEvent::Text(delta) => self.stream_text(&delta, &mut done, width),
+            UiEvent::Reasoning(delta) => self.stream_reasoning(&delta, &mut done),
+            UiEvent::Text(delta) => self.stream_text(&delta, &mut done),
             UiEvent::ToolBytes(_) | UiEvent::Approval(_) | UiEvent::CompactingBytes(_) => {}
             UiEvent::Responded => self.responded = true,
             UiEvent::Image(path) => {
                 let target = crate::tui::links::file(&path);
-                self.flush_text(&mut done, width);
+                self.flush_text(&mut done);
                 let path = crate::terminal_text::safe_text(
                     &path.to_string_lossy(),
                     crate::terminal_text::TextMode::Diagnostic,
@@ -524,7 +508,7 @@ impl Transcript {
                 arguments,
                 live,
             } => {
-                self.flush_text(&mut done, width);
+                self.flush_text(&mut done);
                 let code = match arguments.get("code").unwrap_or(&serde_json::Value::Null) {
                     serde_json::Value::String(code) => code.clone(),
                     other => other.to_string(),
@@ -573,17 +557,17 @@ impl Transcript {
             )),
             UiEvent::Notification(notification) => self.notify(notification, &mut done, width),
             UiEvent::Steered(input) => {
-                self.flush_text(&mut done, width);
+                self.flush_text(&mut done);
                 done.push(self.user(&input.text, &input.skills, true));
             }
             UiEvent::WaitingForReset { message, .. } => {
-                self.flush_text(&mut done, width);
+                self.flush_text(&mut done);
                 done.push(self.notice(Text::from(Clean::new(&format!(
                     "  {message} · waiting for reset · Esc cancels"
                 )))));
             }
             UiEvent::RecordingStopped(message) => {
-                self.flush_text(&mut done, width);
+                self.flush_text(&mut done);
                 done.push(self.notice(Text::from(Clean::new(&format!("  {message}")))));
             }
             UiEvent::Retrying { .. }
@@ -717,7 +701,7 @@ impl Transcript {
         );
         let Notification { text, kind } = notification;
         let text = Clean::new(&text);
-        self.flush_text(done, width);
+        self.flush_text(done);
         let (heading, body) = text.split_once('\n').unwrap_or((&text, ""));
         let heading = heading.trim_start_matches('[').trim_end_matches(']');
         let title = &heading[..heading.floor_char_boundary(heading.len().min(500))];
@@ -808,7 +792,6 @@ impl Transcript {
     }
 
     pub(super) fn end(&mut self, note: Option<&str>, width: u16) -> Vec<Block> {
-        self.revision += 1;
         let mut done = Vec::new();
         if self.compaction.is_some() {
             if let Some(reason) = note.filter(|note| *note != "interrupted")
@@ -827,7 +810,7 @@ impl Transcript {
                 "failed"
             });
         }
-        self.flush_text(&mut done, width);
+        self.flush_text(&mut done);
         if !self.calls.is_empty() {
             for call in &mut self.calls {
                 if call.result.is_none()
@@ -855,15 +838,15 @@ impl Transcript {
         done
     }
 
-    fn start_response(&mut self, done: &mut Vec<Block>, width: u16) {
+    fn start_response(&mut self, done: &mut Vec<Block>) {
         if self.responded {
-            self.flush_text(done, width);
+            self.flush_text(done);
         }
     }
 
-    fn flush_text(&mut self, done: &mut Vec<Block>, width: u16) {
+    fn flush_text(&mut self, done: &mut Vec<Block>) {
         self.responded = false;
-        self.end_reasoning(done, width);
+        self.end_reasoning(done);
         let lines = self.text.finish();
         if !lines.is_empty() {
             self.emit(
@@ -877,29 +860,29 @@ impl Transcript {
         self.answer_ended = true;
     }
 
-    fn end_reasoning(&mut self, done: &mut Vec<Block>, width: u16) {
+    fn end_reasoning(&mut self, done: &mut Vec<Block>) {
         let lines = self.reasoning.finish();
-        let lines = reasoning(&lines, &mut self.reasoning_shown, width);
+        let lines = reasoning(&lines, &mut self.reasoning_preview);
         if !lines.is_empty() {
             self.emit(Kind::Reasoning, Text::from(lines), done);
         }
-        self.reasoning_shown = false;
+        self.reasoning_preview = ReasoningPreview::Pending;
         self.reasoning_detail = None;
     }
 
-    pub(super) fn stream_reasoning(&mut self, delta: &str, done: &mut Vec<Block>, width: u16) {
-        self.start_response(done, width);
+    pub(super) fn stream_reasoning(&mut self, delta: &str, done: &mut Vec<Block>) {
+        self.start_response(done);
         if !self.text.is_empty() {
-            self.flush_text(done, width);
+            self.flush_text(done);
         }
         self.project_reasoning(delta);
         self.reasoning.append(delta);
     }
 
-    pub(super) fn stream_text(&mut self, delta: &str, done: &mut Vec<Block>, width: u16) {
-        self.start_response(done, width);
+    pub(super) fn stream_text(&mut self, delta: &str, done: &mut Vec<Block>) {
+        self.start_response(done);
         if self.reasoning_detail.is_some() {
-            self.end_reasoning(done, width);
+            self.end_reasoning(done);
         }
         self.project_text(delta);
         self.text.append(delta);
@@ -946,10 +929,10 @@ impl Transcript {
         self.bound_details();
     }
 
-    pub(super) fn flush_frame(&mut self, width: u16) -> Vec<Block> {
+    pub(super) fn flush_frame(&mut self) -> Vec<Block> {
         let mut done = Vec::new();
         let lines = self.reasoning.flush();
-        let lines = reasoning(lines.iter(), &mut self.reasoning_shown, width);
+        let lines = reasoning(lines.iter(), &mut self.reasoning_preview);
         if !lines.is_empty() {
             self.emit(Kind::Reasoning, Text::from(lines), &mut done);
         }
@@ -961,19 +944,24 @@ impl Transcript {
                 &mut done,
             );
         }
-        if !done.is_empty() {
-            self.revision += 1;
-        }
         done
     }
 
     pub(super) fn prepare_tail(&mut self, width: u16, tick: usize) {
-        self.tail = self.live(width, tick);
+        self.tail_tick = tick;
+        let tail = self.live(width, tick);
+        if self.tail.as_ref() != tail {
+            self.tail = tail.into();
+        }
+    }
+
+    pub(super) fn sync_tail(&mut self, width: u16) {
+        self.prepare_tail(width, self.tail_tick);
     }
 
     fn live(&mut self, width: u16, tick: usize) -> Vec<RenderRow> {
         let mut spacing = self.spacing;
-        let mut shown = self.reasoning_shown;
+        let mut shown = self.reasoning_preview;
         let mut lines = Vec::new();
         for (element, text) in [
             (
@@ -981,7 +969,6 @@ impl Transcript {
                 RenderText::from(Text::from(reasoning(
                     self.reasoning.live().iter(),
                     &mut shown,
-                    width,
                 ))),
             ),
             (
@@ -1013,34 +1000,41 @@ fn indented(lines: Vec<RenderRow>) -> Vec<RenderRow> {
 
 fn reasoning<'a>(
     lines: impl IntoIterator<Item = &'a RenderRow>,
-    shown: &mut bool,
-    width: u16,
+    shown: &mut ReasoningPreview,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    for row in lines {
-        for line in row.project(width) {
-            let content: Vec<_> = line
-                .spans
-                .iter()
-                .filter(|span| !span.content.trim().is_empty())
-                .collect();
-            if content.is_empty() {
-                continue;
-            }
-            let heading = content
-                .iter()
-                .all(|span| span.style.add_modifier.contains(Modifier::BOLD));
-            if heading || !*shown {
-                let title = line.to_string().replace('\n', " ⏎ ");
-                out.push(Line::from(format!("◆ {title}")).style(muted(Style::new())));
-                *shown = true;
+    let mut emit = |title: &str, heading| {
+        if !title.trim().is_empty() && (heading || matches!(*shown, ReasoningPreview::Pending)) {
+            out.push(Line::from(format!("◆ {title}")).style(muted(Style::new())));
+            *shown = ReasoningPreview::Shown;
+        }
+    };
+    let mut title = String::new();
+    for line in lines.into_iter().map(RenderRow::logical_line) {
+        let mut heading = true;
+        for span in &line.spans {
+            let bold = line
+                .style
+                .patch(span.style)
+                .add_modifier
+                .contains(Modifier::BOLD);
+            for (index, part) in span.content.split('\n').enumerate() {
+                if index != 0 {
+                    emit(&title, heading);
+                    title.clear();
+                    heading = true;
+                }
+                heading &= bold || part.trim().is_empty();
+                title.push_str(part);
             }
         }
+        emit(&title, heading);
+        title.clear();
     }
     out
 }
 
-fn user(text: &str, steer: bool, pastes: &super::paste::Previews) -> Text<'static> {
+fn user(text: &str, steer: bool, pastes: &super::paste::Previews) -> RenderText {
     let parts = super::paste::display(text, pastes);
     let marker = if steer { "↳ " } else { "› " };
     let mut body = vec![Line::default()];
@@ -1065,24 +1059,22 @@ fn user(text: &str, steer: bool, pastes: &super::paste::Previews) -> Text<'stati
     }
     let background = theme().band;
     let accent = Style::new().fg(brand()).bold();
+    let style = background.map_or(Style::new().bold(), |color| Style::new().bg(color));
     let mut lines = Vec::new();
     for (index, line) in body.into_iter().enumerate() {
-        let mut spans = Vec::new();
-        if background.is_none() {
-            spans.push(Span::styled("▌ ", accent));
-        }
-        spans.push(if index == 0 {
+        let mut row = RenderRow::literal(line.style(style));
+        let first = if index == 0 {
             Span::styled(marker, accent)
         } else {
             Span::raw("  ")
-        });
-        spans.extend(line.spans);
-        lines.push(Line::from(spans));
+        };
+        row.prefixes(first, Span::raw("  "));
+        if background.is_none() {
+            row.prefix(Span::styled("▌ ", accent));
+        }
+        lines.push(row);
     }
-    match background {
-        Some(background) => Text::from(lines).style(Style::new().bg(background)),
-        None => Text::from(lines).style(Style::new().bold()),
-    }
+    lines.into()
 }
 
 pub(super) fn muted(style: Style) -> Style {

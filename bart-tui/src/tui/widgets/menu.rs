@@ -215,7 +215,7 @@ impl Menu {
             span
         };
         let limit = height.saturating_sub(2).min(3);
-        let (feedback, _) = text::wrap(&[span], width, limit, text::Wrap::Prose);
+        let (feedback, _) = text::wrap(&[span], [width; 2], limit, text::Wrap::Prose);
         let feedback_rows = if value.is_empty() {
             limit.min(1)
         } else {
@@ -358,12 +358,7 @@ impl Menu {
         }
         frame.render_widget(Paragraph::new(lines), area);
         frame.render_widget(
-            Paragraph::new(
-                feedback
-                    .into_iter()
-                    .map(|(line, _)| line)
-                    .collect::<Vec<_>>(),
-            ),
+            Paragraph::new(feedback.into_iter().map(|row| row.line).collect::<Vec<_>>()),
             Rect::new(
                 area.x,
                 area.y.saturating_add(1),

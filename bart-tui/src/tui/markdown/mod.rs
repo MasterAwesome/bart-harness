@@ -1,5 +1,5 @@
 use crate::tui::text::Clean;
-use crate::tui::text::Wrap::{Prose, Table};
+use crate::tui::text::Wrap::{self, Plain, Table, Verbatim};
 mod math;
 
 use std::{
@@ -10,16 +10,26 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::text;
+use super::{
+    selection::{self, CellBox, Point, Row},
+    text,
+};
 use pulldown_cmark::{Alignment, BrokenLink, CodeBlockKind, Event, LinkType, Options, Parser, Tag};
 use ratatui::{
-    style::Style,
+    style::{Style, Stylize},
     text::{Line, Span, Text},
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum RenderRow {
-    Literal(Line<'static>),
+pub(super) struct RenderRow {
+    kind: RowKind,
+    prefix: Vec<Span<'static>>,
+    wrap_prefix: Vec<Span<'static>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RowKind {
+    Text(Line<'static>, Wrap),
     Table(Box<TableRow>),
     TableClipped,
 }
@@ -29,136 +39,174 @@ pub(super) struct TableRow {
     header: Arc<TableHeader>,
     cells: Vec<Vec<Span<'static>>>,
     kind: TableKind,
-    prefix: Vec<Span<'static>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct TableHeader {
     cells: Vec<Vec<Span<'static>>>,
     alignments: Vec<Alignment>,
+    geometry: Arc<TableGeometry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TableKind {
     Header,
+    FirstBody,
     Body,
-    Footer,
+}
+
+#[derive(Debug, PartialEq)]
+struct TableGeometry {
+    preferred: Box<[usize]>,
 }
 
 impl RenderRow {
-    pub(super) fn source(&self) -> String {
-        match self {
-            Self::Literal(line) => line.to_string(),
-            Self::Table(row) => row
-                .cells
-                .iter()
-                .map(|cell| {
-                    cell.iter()
-                        .map(|span| span.content.as_ref())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>()
-                .join(" | "),
-            Self::TableClipped => "table clipped: display limit exceeded".into(),
+    fn new(kind: RowKind) -> Self {
+        Self {
+            kind,
+            prefix: Vec::new(),
+            wrap_prefix: Vec::new(),
         }
     }
+    fn text(line: Line<'static>, wrap: Wrap) -> Self {
+        Self::new(RowKind::Text(line, wrap))
+    }
+    pub(super) fn literal(line: Line<'static>) -> Self {
+        Self::text(line, Wrap::Prose)
+    }
+    pub(super) fn source(&self) -> String {
+        match &self.kind {
+            RowKind::Text(line, _) => span_text(&line.spans),
+            RowKind::Table(_) if self.table_clipped() => TABLE_BYTES_NOTICE.into(),
+            RowKind::Table(row) => row.source(0).markdown(true),
+            RowKind::TableClipped => TABLE_BYTES_NOTICE.into(),
+        }
+    }
+    pub(super) fn logical_line(&self) -> Cow<'_, Line<'static>> {
+        match &self.kind {
+            RowKind::Text(line, _) => Cow::Borrowed(line),
+            RowKind::Table(_) | RowKind::TableClipped => {
+                Cow::Owned(Line::from(Span::raw(self.source())))
+            }
+        }
+    }
+    #[cfg(test)]
     pub(super) fn project(&self, width: u16) -> Vec<Line<'static>> {
-        match self {
-            Self::Literal(line) => vec![line.clone()],
-            Self::TableClipped => vec![table_notice(
-                "table clipped: display limit exceeded",
-                usize::from(width.max(1)),
-            )],
-            Self::Table(row) => {
-                if self.bytes() > MAX_TABLE_ROW_BYTES {
-                    return vec![table_notice(
-                        "table clipped: display limit exceeded",
-                        usize::from(width.max(1)),
-                    )];
+        selectable(std::slice::from_ref(self), 0, width)
+            .into_iter()
+            .map(Row::into_line)
+            .collect()
+    }
+    fn table_clipped(&self) -> bool {
+        match &self.kind {
+            RowKind::Table(_) => self.bytes() > MAX_TABLE_ROW_BYTES,
+            RowKind::TableClipped => true,
+            RowKind::Text(..) => false,
+        }
+    }
+    pub(super) fn source_extent(&self) -> usize {
+        let len = match &self.kind {
+            RowKind::Text(line, _) => line.spans.iter().map(|span| span.content.len()).sum(),
+            RowKind::Table(_) if self.table_clipped() => TABLE_BYTES_NOTICE.len(),
+            RowKind::Table(row) => row.source_len(),
+            RowKind::TableClipped => TABLE_BYTES_NOTICE.len(),
+        };
+        len + 1
+    }
+    fn selectable(&self, at: Point, width: usize, budget: &mut TableBudget) -> Vec<Row> {
+        match &self.kind {
+            RowKind::Text(line, mode) => {
+                selection::wrap_prefixed(line, &self.prefix, &self.wrap_prefix, at, width, *mode)
+            }
+            RowKind::Table(_) if self.table_clipped() => {
+                if budget.remaining() > 0 {
+                    budget.used += 1;
+                    vec![Row::notice(
+                        (at.0, at.1, 0),
+                        table_notice(TABLE_BYTES_NOTICE, width),
+                        TABLE_BYTES_NOTICE,
+                    )]
+                } else {
+                    budget.clip(at, 0, width).into_iter().collect()
                 }
-                row.project(usize::from(width.max(1)))
+            }
+            RowKind::Table(row) => row.project(at, width, &self.prefix, budget),
+            RowKind::TableClipped => {
+                if budget.remaining() > 0 {
+                    budget.used += 1;
+                    vec![Row::notice(
+                        (at.0, at.1, 0),
+                        table_notice(TABLE_BYTES_NOTICE, width),
+                        TABLE_BYTES_NOTICE,
+                    )]
+                } else {
+                    budget.clip(at, 0, width).into_iter().collect()
+                }
             }
         }
     }
     pub(super) fn bytes(&self) -> usize {
-        fn spans(spans: &[Span<'static>]) -> usize {
-            size_of_val(spans)
+        fn spans(spans: &Vec<Span<'static>>) -> usize {
+            spans.capacity() * size_of::<Span<'static>>()
                 + spans
                     .iter()
-                    .map(|s| match &s.content {
+                    .map(|span| match &span.content {
                         Cow::Borrowed(text) => text.len(),
                         Cow::Owned(text) => text.capacity(),
                     })
                     .sum::<usize>()
         }
-        match self {
-            Self::Literal(line) => {
-                size_of_val(line)
-                    + spans(&line.spans)
-                    + line.spans.capacity().saturating_sub(line.spans.len())
-                        * size_of::<Span<'static>>()
-            }
-            Self::TableClipped => 0,
-            Self::Table(row) => {
-                size_of_val(row.as_ref())
-                    + size_of::<TableHeader>()
-                    + row.cells.capacity().saturating_sub(row.cells.len())
-                        * size_of::<Vec<Span<'static>>>()
-                    + row
-                        .header
-                        .cells
-                        .capacity()
-                        .saturating_sub(row.header.cells.len())
-                        * size_of::<Vec<Span<'static>>>()
-                    + spans(&row.prefix)
-                    + row.prefix.capacity().saturating_sub(row.prefix.len())
-                        * size_of::<Span<'static>>()
-                    + row
-                        .cells
-                        .iter()
-                        .map(|cell| {
-                            size_of_val(cell)
-                                + spans(cell)
-                                + cell.capacity().saturating_sub(cell.len())
-                                    * size_of::<Span<'static>>()
-                        })
-                        .sum::<usize>()
-                    + row
-                        .header
-                        .cells
-                        .iter()
-                        .map(|cell| {
-                            size_of_val(cell)
-                                + spans(cell)
-                                + cell.capacity().saturating_sub(cell.len())
-                                    * size_of::<Span<'static>>()
-                        })
-                        .sum::<usize>()
-                    + row.header.alignments.capacity() * size_of::<Alignment>()
-            }
+        fn cells(cells: &Vec<Vec<Span<'static>>>) -> usize {
+            cells.capacity() * size_of::<Vec<Span<'static>>>()
+                + cells.iter().map(spans).sum::<usize>()
         }
+        size_of::<Self>()
+            + spans(&self.prefix)
+            + spans(&self.wrap_prefix)
+            + match &self.kind {
+                RowKind::Text(line, _) => spans(&line.spans),
+                RowKind::TableClipped => 0,
+                RowKind::Table(row) => {
+                    size_of::<TableRow>()
+                        + size_of::<TableHeader>()
+                        + cells(&row.cells)
+                        + cells(&row.header.cells)
+                        + row.header.geometry.bytes()
+                        + row.header.alignments.capacity() * size_of::<Alignment>()
+                }
+            }
     }
-    pub(super) fn is_table(&self) -> bool {
-        matches!(self, Self::Table(_) | Self::TableClipped)
-    }
-    pub(super) fn bound_table(&mut self, bytes: usize) -> bool {
-        if matches!(self, Self::Table(_)) && bytes > MAX_TABLE_ROW_BYTES {
-            *self = Self::TableClipped;
-            true
-        } else {
-            false
+    pub(super) fn bound_table(&mut self) {
+        if self.table_clipped() {
+            *self = Self::new(RowKind::TableClipped);
         }
     }
     pub(super) fn prefix(&mut self, prefix: Span<'static>) {
-        match self {
-            Self::Literal(line) => line.spans.insert(0, prefix),
-            Self::Table(row) => row.prefix.insert(0, prefix),
-            Self::TableClipped => {}
-        }
+        self.prefixes(prefix.clone(), prefix);
+    }
+    pub(super) fn prefixes(&mut self, first: Span<'static>, rest: Span<'static>) {
+        self.prefix.insert(0, first);
+        self.wrap_prefix.insert(0, rest);
     }
     pub(super) fn is_blank(&self) -> bool {
-        matches!(self, Self::Literal(line) if line.spans.iter().all(|span| span.content.trim().is_empty()))
+        matches!(&self.kind, RowKind::Text(line, Wrap::Prose | Plain) if line.spans.iter().all(|span| span.content.trim().is_empty()))
     }
+}
+
+fn span_text(spans: &[Span<'static>]) -> String {
+    spans.iter().map(|span| span.content.as_ref()).collect()
+}
+
+pub(super) fn selectable(rows: &[RenderRow], block: u64, width: u16) -> Vec<Row> {
+    let mut byte = 0;
+    let mut budget = TableBudget::default();
+    rows.iter()
+        .flat_map(|row| {
+            let lines = row.selectable((block, byte), usize::from(width.max(1)), &mut budget);
+            byte += row.source_extent();
+            lines
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -174,7 +222,7 @@ impl From<Text<'static>> for RenderText {
                 .into_iter()
                 .map(|mut line| {
                     line.style = text.style.patch(line.style);
-                    RenderRow::Literal(line)
+                    RenderRow::literal(line)
                 })
                 .collect(),
         }
@@ -187,10 +235,6 @@ impl From<Vec<RenderRow>> for RenderText {
     }
 }
 
-fn literals(lines: impl IntoIterator<Item = Line<'static>>) -> Vec<RenderRow> {
-    lines.into_iter().map(RenderRow::Literal).collect()
-}
-
 struct Reference {
     url: String,
     title: String,
@@ -200,6 +244,34 @@ type References = HashMap<unicase::UniCase<String>, Reference>;
 const MAX_TABLE_COLUMNS: usize = 120;
 const MAX_TABLE_ROW_BYTES: usize = 64 * 1024;
 const MAX_TABLE_RENDERED_ROWS: usize = 32 * 1024;
+const MAX_TABLE_PREFIX_BYTES: usize = 512;
+const TABLE_BYTES_NOTICE: &str = "table clipped: display limit exceeded";
+const TABLE_ROWS_NOTICE: &str = "table clipped: display row limit exceeded";
+
+#[derive(Default)]
+struct TableBudget {
+    used: usize,
+    clipped: bool,
+}
+
+impl TableBudget {
+    fn remaining(&self) -> usize {
+        if self.clipped {
+            0
+        } else {
+            MAX_TABLE_RENDERED_ROWS - 1 - self.used
+        }
+    }
+    fn clip(&mut self, (block, byte): Point, ordinal: usize, width: usize) -> Option<Row> {
+        (!std::mem::replace(&mut self.clipped, true)).then(|| {
+            Row::notice(
+                (block, byte, ordinal),
+                table_notice(TABLE_ROWS_NOTICE, width),
+                TABLE_ROWS_NOTICE,
+            )
+        })
+    }
+}
 
 const OPTIONS: Options = Options::ENABLE_STRIKETHROUGH
     .union(Options::ENABLE_TASKLISTS)
@@ -229,43 +301,26 @@ fn nodes<'a>(events: &mut impl Iterator<Item = Event<'a>>, depth: usize) -> Opti
     Some(out)
 }
 
-pub(super) fn render_detail(markdown: &str, width: u16) -> Text<'static> {
-    Text::from(
-        render_filtered(markdown, u16::MAX, &References::new())
-            .iter()
-            .flat_map(|row| row.project(width))
-            .collect::<Vec<_>>(),
-    )
+pub(super) fn render_detail(markdown: &str, width: u16) -> Vec<Row> {
+    selectable(&render_filtered(markdown, &References::new()), 0, width)
 }
 
-pub(super) fn contains_table(markdown: &str) -> bool {
-    Parser::new_ext(markdown, OPTIONS).any(|event| matches!(event, Event::Start(Tag::Table(_))))
-}
-
-fn render_filtered(markdown: &str, width: u16, references: &References) -> Vec<RenderRow> {
+fn render_filtered(markdown: &str, references: &References) -> Vec<RenderRow> {
     let (normalized, _) = latex_delimiters(markdown);
-    render_events(markdown, width, parser(&normalized, markdown, references))
+    render_events(markdown, parser(&normalized, markdown, references))
 }
 
 fn render_events<'a>(
     markdown: &str,
-    width: u16,
     mut events: impl Iterator<Item = Event<'a>>,
 ) -> Vec<RenderRow> {
     let Some(nodes) = nodes(&mut events, 0) else {
-        return literals(
-            text::wrap(
-                &[Span::raw(markdown.to_owned())],
-                usize::from(width).max(1),
-                usize::MAX,
-                Prose,
-            )
-            .0
-            .into_iter()
-            .map(|(line, _)| line),
-        );
+        return vec![RenderRow::text(
+            Line::from(Span::raw(markdown.to_owned())),
+            Plain,
+        )];
     };
-    blocks(&nodes, usize::from(width).max(1))
+    block_lines(&nodes, false)
 }
 
 fn inline(nodes: &[Node<'_>], style: Style, out: &mut Vec<Span<'static>>) {
@@ -328,56 +383,37 @@ fn inline(nodes: &[Node<'_>], style: Style, out: &mut Vec<Span<'static>>) {
     }
 }
 
-fn prefixed(
-    lines: Vec<Line<'static>>,
-    first: &str,
-    rest: &str,
-    style: Style,
-) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(index, mut line)| {
-            line.spans.insert(
-                0,
-                Span::styled(
-                    if index == 0 {
-                        first.to_owned()
-                    } else {
-                        rest.to_owned()
-                    },
-                    style,
-                ),
-            );
-            line
-        })
-        .collect()
-}
-
-fn prefixed_rows(
-    mut lines: Vec<RenderRow>,
-    first: &str,
-    rest: &str,
-    style: Style,
-) -> Vec<RenderRow> {
-    for (index, line) in lines.iter_mut().enumerate() {
-        line.prefix(Span::styled(
-            if index == 0 {
-                first.to_owned()
-            } else {
-                rest.to_owned()
-            },
-            style,
-        ));
+fn marked(mut lines: Vec<RenderRow>, marker: String) -> Vec<RenderRow> {
+    let indent = Span::raw(" ".repeat(text::width(&marker)));
+    match lines.first_mut() {
+        Some(RenderRow {
+            kind: RowKind::Text(line, Plain),
+            prefix,
+            wrap_prefix,
+        }) if prefix.is_empty() => {
+            line.spans.insert(0, Span::raw(marker));
+            wrap_prefix.insert(0, indent.clone());
+            for row in &mut lines[1..] {
+                row.prefix(indent.clone());
+            }
+        }
+        _ => {
+            for row in &mut lines {
+                row.prefix(indent.clone());
+            }
+            lines.insert(0, RenderRow::text(Line::raw(marker), Plain));
+        }
     }
     lines
 }
 
-fn blocks(nodes: &[Node<'_>], width: usize) -> Vec<RenderRow> {
-    block_lines(nodes, width, false)
+fn push_prose(out: &mut Vec<RenderRow>, pending: &mut Vec<Span<'static>>) {
+    if !pending.is_empty() {
+        out.push(RenderRow::text(Line::from(std::mem::take(pending)), Plain));
+    }
 }
 
-fn block_lines(nodes: &[Node<'_>], width: usize, compact: bool) -> Vec<RenderRow> {
+fn block_lines(nodes: &[Node<'_>], compact: bool) -> Vec<RenderRow> {
     let mut out = Vec::new();
     let mut pending = Vec::new();
     for node in nodes {
@@ -399,45 +435,28 @@ fn block_lines(nodes: &[Node<'_>], width: usize, compact: bool) -> Vec<RenderRow
         }
         let Node::Element(tag, children) = node else {
             if matches!(node, Node::Leaf(Event::Rule)) {
-                if !pending.is_empty() {
-                    out.extend(literals(
-                        text::wrap(&std::mem::take(&mut pending), width, usize::MAX, Prose)
-                            .0
-                            .into_iter()
-                            .map(|(line, _)| line),
-                    ));
-                }
+                push_prose(&mut out, &mut pending);
                 if !out.is_empty() {
-                    out.push(RenderRow::Literal(Line::default()));
+                    out.push(RenderRow::literal(Line::default()));
                 }
-                out.push(RenderRow::Literal(
-                    Line::from("─".repeat(width.min(3))).style(Style::new().dim()),
-                ));
+                out.push(RenderRow::literal(Line::styled("───", Style::new().dim())));
             } else {
                 inline(std::slice::from_ref(node), Style::new(), &mut pending);
             }
             continue;
         };
         let tight = !pending.is_empty() && matches!(tag, Tag::List(_));
-        if !pending.is_empty() {
-            out.extend(literals(
-                text::wrap(&std::mem::take(&mut pending), width, usize::MAX, Prose)
-                    .0
-                    .into_iter()
-                    .map(|(line, _)| line),
-            ));
-        }
+        push_prose(&mut out, &mut pending);
         let lines = match tag {
-            Tag::Paragraph | Tag::Heading { .. } | Tag::HtmlBlock => {
-                literals(prose(tag, children, width))
+            Tag::Paragraph | Tag::Heading { .. } | Tag::HtmlBlock => prose(tag, children),
+            Tag::CodeBlock(kind) => code(children, kind),
+            Tag::BlockQuote(_) => {
+                let mut rows = block_lines(children, false);
+                for row in &mut rows {
+                    row.prefix(Span::styled("│ ", super::transcript::muted(Style::new())));
+                }
+                rows
             }
-            Tag::CodeBlock(kind) => literals(code(children, kind, width)),
-            Tag::BlockQuote(_) => prefixed_rows(
-                blocks(children, width.saturating_sub(2).max(1)),
-                "│ ",
-                "│ ",
-                super::transcript::muted(Style::new()),
-            ),
             Tag::List(start) => {
                 let mut number = start.unwrap_or(1);
                 let mut lines = Vec::new();
@@ -448,17 +467,7 @@ fn block_lines(nodes: &[Node<'_>], width: usize, compact: bool) -> Vec<RenderRow
                         } else {
                             "- ".to_owned()
                         };
-                        let indent = " ".repeat(text::width(&marker));
-                        lines.extend(prefixed_rows(
-                            block_lines(
-                                body,
-                                width.saturating_sub(text::width(&marker)).max(1),
-                                true,
-                            ),
-                            &marker,
-                            &indent,
-                            Style::new(),
-                        ));
+                        lines.extend(marked(block_lines(body, true), marker));
                         number += 1;
                     }
                 }
@@ -466,34 +475,21 @@ fn block_lines(nodes: &[Node<'_>], width: usize, compact: bool) -> Vec<RenderRow
             }
             Tag::FootnoteDefinition(label) => {
                 let marker = Clean::new(&format!("[^{label}]: ")).to_string();
-                let indent = " ".repeat(text::width(&marker));
-                prefixed_rows(
-                    blocks(children, width.saturating_sub(text::width(&marker)).max(1)),
-                    &marker,
-                    &indent,
-                    Style::new(),
-                )
+                marked(block_lines(children, false), marker)
             }
             Tag::Table(alignments) => table(children, alignments),
-            _ => blocks(children, width),
+            _ => block_lines(children, false),
         };
         if !out.is_empty() && !tight && !compact && !matches!(tag, Tag::Item) {
-            out.push(RenderRow::Literal(Line::default()));
+            out.push(RenderRow::literal(Line::default()));
         }
         out.extend(lines);
     }
-    if !pending.is_empty() {
-        out.extend(literals(
-            text::wrap(&pending, width, usize::MAX, Prose)
-                .0
-                .into_iter()
-                .map(|(line, _)| line),
-        ));
-    }
+    push_prose(&mut out, &mut pending);
     out
 }
 
-fn prose(tag: &Tag<'_>, children: &[Node<'_>], width: usize) -> Vec<Line<'static>> {
+fn prose(tag: &Tag<'_>, children: &[Node<'_>]) -> Vec<RenderRow> {
     let style = match tag {
         Tag::Heading {
             level: pulldown_cmark::HeadingLevel::H1,
@@ -506,105 +502,77 @@ fn prose(tag: &Tag<'_>, children: &[Node<'_>], width: usize) -> Vec<Line<'static
     let mut lines = Vec::new();
     for child in children {
         if let Node::Leaf(Event::DisplayMath(text)) = child {
-            if !spans.is_empty() {
-                lines.extend(
-                    text::wrap(&std::mem::take(&mut spans), width, usize::MAX, Prose)
-                        .0
-                        .into_iter()
-                        .map(|(line, _)| line),
-                );
-            }
+            push_prose(&mut lines, &mut spans);
             let style = Style::new().fg(super::theme().code);
-            lines.extend(prefixed(
-                text::wrap(
-                    &[Span::styled(math::present(text.trim_matches('\n')), style)],
-                    width.saturating_sub(2).max(1),
-                    usize::MAX,
-                    Prose,
-                )
-                .0
-                .into_iter()
-                .map(|(line, _)| line)
-                .collect::<Vec<_>>(),
-                "  ",
-                "  ",
-                style,
-            ));
+            let mut row = RenderRow::text(
+                Line::from(Span::styled(math::present(text.trim_matches('\n')), style)),
+                Plain,
+            );
+            row.prefix(Span::styled("  ", style));
+            lines.push(row);
         } else {
             inline(std::slice::from_ref(child), style, &mut spans);
         }
     }
-    if !spans.is_empty() || lines.is_empty() {
-        lines.extend(
-            text::wrap(&spans, width, usize::MAX, Prose)
-                .0
-                .into_iter()
-                .map(|(line, _)| line),
-        );
+    if matches!(tag, Tag::HtmlBlock)
+        && let Some(last) = spans.last_mut()
+    {
+        let trimmed = last.content.strip_suffix('\n');
+        if let Some(trimmed) = trimmed {
+            last.content = trimmed.to_owned().into();
+        }
     }
-    if matches!(tag, Tag::HtmlBlock) && lines.last().is_some_and(|line| line.spans.is_empty()) {
-        lines.pop();
-    }
+    push_prose(&mut lines, &mut spans);
     lines
 }
 
-fn code(children: &[Node<'_>], kind: &CodeBlockKind<'_>, width: usize) -> Vec<Line<'static>> {
+fn code(children: &[Node<'_>], kind: &CodeBlockKind<'_>) -> Vec<RenderRow> {
     let mut spans = Vec::new();
     inline(children, Style::new(), &mut spans);
-    let code: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    let code = span_text(&spans);
     let code = code.strip_suffix('\n').unwrap_or(&code);
-    code_lines(code, kind, width)
+    let mut style = CodeStyle::new(kind);
+    code.split('\n').map(|line| style.row(line)).collect()
 }
 
-fn code_lines(code: &str, kind: &CodeBlockKind<'_>, width: usize) -> Vec<Line<'static>> {
-    let language = match kind {
-        CodeBlockKind::Fenced(lang) => lang.split_whitespace().next(),
-        CodeBlockKind::Indented => None,
-    };
-    let lines = language
-        .and_then(|language| super::highlight::highlight(code, language))
-        .unwrap_or_else(|| {
-            code.split('\n')
-                .map(|line| Line::from(line.to_owned()).style(Style::new().fg(super::theme().code)))
-                .collect()
-        });
-    lines
-        .into_iter()
-        .flat_map(|line| {
-            let spans: Vec<_> = line
-                .spans
-                .into_iter()
-                .map(|span| Span::styled(span.content, line.style.patch(span.style)))
-                .collect();
-            text::wrap(&spans, width, usize::MAX, Prose)
-                .0
-                .into_iter()
-                .map(|(line, _)| line)
-        })
-        .collect()
+#[derive(Clone)]
+struct CodeStyle(Option<super::highlight::Syntax>);
+
+impl CodeStyle {
+    fn new(kind: &CodeBlockKind<'_>) -> Self {
+        let syntax = match kind {
+            CodeBlockKind::Fenced(lang) => lang
+                .split_whitespace()
+                .next()
+                .and_then(super::highlight::Syntax::new),
+            CodeBlockKind::Indented => None,
+        };
+        Self(syntax)
+    }
+    fn row(&mut self, text: &str) -> RenderRow {
+        if let Some(line) = self.0.as_mut().and_then(|syntax| syntax.line(text)) {
+            return RenderRow::text(line, Verbatim);
+        }
+        self.0 = None;
+        RenderRow::text(
+            Line::styled(text.to_owned(), Style::new().fg(super::theme().code)),
+            Verbatim,
+        )
+    }
 }
 
 fn table_cell(
     spans: &[Span<'static>],
     header: bool,
-    width: usize,
+    widths: [usize; 2],
     limit: usize,
-) -> (Vec<Line<'static>>, bool) {
-    let spans: Vec<_> = spans
-        .iter()
-        .map(|span| {
-            Span::styled(
-                span.content.clone(),
-                if header {
-                    span.style.bold()
-                } else {
-                    span.style
-                },
-            )
-        })
-        .collect();
-    let (rows, clipped) = text::wrap(&spans, width, limit, Table);
-    (rows.into_iter().map(|(line, _)| line).collect(), clipped)
+) -> (Vec<text::Wrapped>, bool) {
+    if header {
+        let spans: Vec<_> = spans.iter().cloned().map(Stylize::bold).collect();
+        text::wrap(&spans, widths, limit, Table)
+    } else {
+        text::wrap(spans, widths, limit, Table)
+    }
 }
 
 fn table_notice(text: &str, width: usize) -> Line<'static> {
@@ -636,193 +604,379 @@ fn table(nodes: &[Node<'_>], alignments: &[Alignment]) -> Vec<RenderRow> {
     if rows.is_empty() || alignments.is_empty() {
         return Vec::new();
     }
+    let geometry = Arc::new(TableGeometry::new(&rows, alignments.len()));
     let header = Arc::new(TableHeader {
         cells: rows[0].clone(),
         alignments: alignments.to_vec(),
+        geometry: Arc::clone(&geometry),
     });
-    let mut out: Vec<_> = rows
-        .drain(..)
+    rows.drain(..)
         .enumerate()
         .map(|(index, cells)| {
-            RenderRow::Table(Box::new(TableRow {
+            RenderRow::new(RowKind::Table(Box::new(TableRow {
                 header: Arc::clone(&header),
                 cells,
-                kind: if index == 0 {
-                    TableKind::Header
-                } else {
-                    TableKind::Body
+                kind: match index {
+                    0 => TableKind::Header,
+                    1 => TableKind::FirstBody,
+                    _ => TableKind::Body,
                 },
-                prefix: Vec::new(),
-            }))
+            })))
         })
-        .collect();
-    out.push(RenderRow::Table(Box::new(TableRow {
-        header,
-        cells: Vec::new(),
-        kind: TableKind::Footer,
-        prefix: Vec::new(),
-    })));
-    out
+        .collect()
 }
 
-impl TableRow {
-    fn project(&self, width: usize) -> Vec<Line<'static>> {
-        self.project_with_prefix(width, false)
+const TABLE_GUTTER: usize = 2;
+const MIN_TABLE_COLUMN: usize = 4;
+
+impl TableGeometry {
+    fn new(rows: &[Vec<Vec<Span<'static>>>], count: usize) -> Self {
+        let preferred = if count > 0 && count <= MAX_TABLE_COLUMNS.div_ceil(1 + TABLE_GUTTER) {
+            (0..count)
+                .map(|column| {
+                    rows.iter()
+                        .filter_map(|row| row.get(column))
+                        .map(|spans| spans.iter().map(Span::width).sum::<usize>())
+                        .max()
+                        .unwrap_or(1)
+                        .clamp(1, MAX_TABLE_COLUMNS + 1)
+                })
+                .collect()
+        } else {
+            Box::default()
+        };
+        Self { preferred }
     }
 
-    fn project_with_prefix(&self, width: usize, force_collapse: bool) -> Vec<Line<'static>> {
-        let prefix_width: usize = self.prefix.iter().map(Span::width).sum();
-        let collapsed = force_collapse || prefix_width > width.saturating_sub(2);
-        let prefix = if !collapsed {
-            self.prefix.clone()
-        } else if width >= 3 {
-            vec![Span::styled("…", Style::new().dim())]
-        } else {
-            Vec::new()
-        };
-        let used: usize = prefix.iter().map(Span::width).sum();
-        let available_width = width.saturating_sub(used).clamp(1, MAX_TABLE_COLUMNS);
-        let count = self.header.alignments.len();
-        let mut out = Vec::new();
-        if collapsed && prefix.is_empty() {
-            out.push(table_notice("…", width));
-        }
-        let mut clipped = false;
-        if available_width < count.saturating_mul(9).saturating_add(1) {
-            let columns = if self.kind == TableKind::Header {
-                self.cells.len()
-            } else if self.kind == TableKind::Body {
-                count.max(self.cells.len())
-            } else {
-                0
-            };
-            for column in 0..columns {
-                let (lines, lost) = if self.kind == TableKind::Header {
-                    table_cell(
-                        &self.cells[column],
-                        true,
-                        available_width,
-                        MAX_TABLE_RENDERED_ROWS.saturating_sub(out.len()),
-                    )
-                } else {
-                    let mut spans = self.header.cells.get(column).cloned().unwrap_or_default();
-                    if spans.is_empty() {
-                        spans.push(Span::raw(format!("Column {}", column + 1)));
-                    }
-                    for span in &mut spans {
-                        span.style = span.style.bold();
-                    }
-                    spans.push(Span::raw(": "));
-                    if let Some(cell) = self.cells.get(column) {
-                        spans.extend(cell.clone());
-                    }
-                    {
-                        let (rows, clipped) = text::wrap(
-                            &spans,
-                            available_width,
-                            MAX_TABLE_RENDERED_ROWS.saturating_sub(out.len()),
-                            Table,
-                        );
-                        (rows.into_iter().map(|(line, _)| line).collect(), clipped)
-                    }
-                };
-                out.extend(lines);
-                if lost {
-                    clipped = true;
-                    break;
-                }
-            }
-        } else {
-            let available = available_width.saturating_sub(count * 3 + 1).max(count);
-            let mut widths: Vec<_> = (0..count)
-                .map(|i| {
-                    self.header.cells.get(i).map_or(12, |spans| {
-                        spans.iter().map(Span::width).sum::<usize>().max(12)
-                    })
-                })
-                .collect();
-            if widths.iter().sum::<usize>() > available {
-                widths = (0..count)
-                    .map(|column| available / count + usize::from(column < available % count))
-                    .collect();
-            } else {
-                let extra = available - widths.iter().sum::<usize>();
-                for (column, width) in widths.iter_mut().enumerate() {
-                    *width += extra / count + usize::from(column < extra % count);
-                }
-            }
-            let rule = |left: char, mid: char, right: char| {
-                let body = widths
-                    .iter()
-                    .map(|width| "─".repeat(width + 2))
-                    .collect::<Vec<_>>()
-                    .join(&mid.to_string());
-                Line::from(format!("{left}{body}{right}")).style(Style::new().dim())
-            };
-            match self.kind {
-                TableKind::Header => out.push(rule('┌', '┬', '┐')),
-                TableKind::Body => out.push(rule('├', '┼', '┤')),
-                TableKind::Footer => out.push(rule('└', '┴', '┘')),
-            }
-            if self.kind != TableKind::Footer {
-                let cells: Vec<_> = widths
-                    .iter()
-                    .enumerate()
-                    .map(|(i, width)| {
-                        table_cell(
-                            self.cells.get(i).map_or(&[], Vec::as_slice),
-                            self.kind == TableKind::Header,
-                            *width,
-                            MAX_TABLE_RENDERED_ROWS,
-                        )
-                    })
-                    .collect();
-                let height = cells.iter().map(|(rows, _)| rows.len()).max().unwrap_or(0);
-                let room = MAX_TABLE_RENDERED_ROWS.saturating_sub(out.len());
-                clipped = height > room || cells.iter().any(|(_, lost)| *lost);
-                for y in 0..height.min(room) {
-                    let mut spans = vec![Span::styled("│", Style::new().dim())];
-                    for (column, (cell, _)) in cells.iter().enumerate() {
-                        let line = cell.get(y).cloned().unwrap_or_default();
-                        let gap = widths[column].saturating_sub(line.width());
-                        let left = match self.header.alignments[column] {
-                            Alignment::Right => gap,
-                            Alignment::Center => gap / 2,
-                            _ => 0,
-                        };
-                        spans.push(Span::raw(" ".repeat(left + 1)));
-                        spans.extend(line.spans);
-                        spans.push(Span::raw(" ".repeat(gap - left + 1)));
-                        spans.push(Span::styled("│", Style::new().dim()));
-                    }
-                    out.push(Line::from(spans));
-                }
-            }
-        }
-        let prefix_bytes: usize = prefix
+    fn bytes(&self) -> usize {
+        size_of::<Self>() + size_of_val(self.preferred.as_ref())
+    }
+
+    fn layout<'a>(prefix: &'a [Span<'static>], width: usize) -> (&'a [Span<'static>], usize) {
+        const COLLAPSED: &[Span<'static>] = &[Span {
+            content: Cow::Borrowed("…"),
+            style: Style::new().dim(),
+        }];
+        let room = width.min(2);
+        let prefix = selection::fit_prefix(prefix, width, room);
+        let bytes: usize = prefix
             .iter()
             .map(|span| size_of::<Span<'static>>() + span.content.len())
             .sum();
-        if !collapsed && out.len().saturating_mul(prefix_bytes) > 2 * 1024 * 1024 {
-            return self.project_with_prefix(width, true);
+        let prefix = if bytes > MAX_TABLE_PREFIX_BYTES {
+            selection::fit_prefix(COLLAPSED, width, room)
+        } else {
+            prefix
+        };
+        let available =
+            (width - prefix.iter().map(Span::width).sum::<usize>()).min(MAX_TABLE_COLUMNS);
+        (prefix, available)
+    }
+
+    fn columns(&self, width: usize) -> Option<Vec<usize>> {
+        let count = self.preferred.len();
+        if count == 0 {
+            return None;
         }
-        for line in &mut out {
-            line.spans.splice(0..0, prefix.clone());
+        let gutters = count.saturating_sub(1) * TABLE_GUTTER;
+        let mins: Vec<usize> = self
+            .preferred
+            .iter()
+            .map(|&pref| pref.clamp(1, MIN_TABLE_COLUMN))
+            .collect();
+        let min_total: usize = mins.iter().sum();
+        if width < min_total + gutters {
+            return None;
         }
-        if clipped {
-            if out.len() == MAX_TABLE_RENDERED_ROWS {
-                out.pop();
+        let available = width - gutters;
+        let total: usize = self.preferred.iter().sum();
+        if total <= available {
+            return Some(self.preferred.to_vec());
+        }
+        let mut widths = mins;
+        let mut remaining = available - min_total;
+        while remaining > 0 {
+            let unfinished: Vec<usize> = (0..count)
+                .filter(|&col| widths[col] < self.preferred[col])
+                .collect();
+            if unfinished.is_empty() {
+                break;
             }
-            out.push(table_notice(
-                "table clipped: display row limit exceeded",
-                width,
-            ));
+            let share = (remaining / unfinished.len()).max(1);
+            for col in unfinished {
+                if remaining == 0 {
+                    break;
+                }
+                let need = self.preferred[col] - widths[col];
+                let grant = need.min(share).min(remaining);
+                widths[col] += grant;
+                remaining -= grant;
+            }
         }
-        out
+        Some(widths)
     }
 }
 
-const STREAM_WIDTH: u16 = u16::MAX;
+fn table_rule(widths: &[usize], glyph: char) -> Span<'static> {
+    let total = widths.iter().sum::<usize>() + widths.len().saturating_sub(1) * TABLE_GUTTER;
+    Span::styled(glyph.to_string().repeat(total), Style::new().dim())
+}
+
+impl TableRow {
+    fn source(&self, byte: usize) -> selection::Table {
+        let alignments = &self.header.alignments;
+        let separator = (self.kind == TableKind::Header).then(|| {
+            let rules = alignments
+                .iter()
+                .map(|alignment| match alignment {
+                    Alignment::None => "---",
+                    Alignment::Left => ":---",
+                    Alignment::Center => ":---:",
+                    Alignment::Right => "---:",
+                })
+                .collect::<Vec<_>>();
+            format!("| {} |", rules.join(" | "))
+        });
+        selection::Table::new(
+            byte,
+            (0..alignments.len()).map(|index| span_text(self.cell(index))),
+            separator,
+        )
+    }
+
+    fn cell(&self, index: usize) -> &[Span<'static>] {
+        self.cells.get(index).map_or(&[], Vec::as_slice)
+    }
+
+    fn source_len(&self) -> usize {
+        let count = self.header.alignments.len();
+        count
+            + 1
+            + self
+                .cells
+                .iter()
+                .take(count)
+                .flatten()
+                .map(|span| span.content.len())
+                .sum::<usize>()
+    }
+
+    fn project(
+        &self,
+        at: Point,
+        width: usize,
+        prefix: &[Span<'static>],
+        budget: &mut TableBudget,
+    ) -> Vec<Row> {
+        let limit = budget.remaining();
+        if limit == 0 {
+            return budget.clip(at, 0, width).into_iter().collect();
+        }
+        let geometry = &self.header.geometry;
+        let (prefix, available) = TableGeometry::layout(prefix, width);
+        let mut projection = TableProjection {
+            rows: Vec::new(),
+            prefix,
+            source: Arc::new(self.source(at.1)),
+            limit,
+        };
+        let lost = match geometry.columns(available) {
+            Some(widths) => self.boxed(&mut projection, &widths),
+            None => self.stacked(&mut projection, available),
+        };
+        let mut rows = projection.finish(at);
+        budget.used += rows.len();
+        if lost
+            && let Some(notice) = budget.clip((at.0, at.1 + self.source_len()), rows.len(), width)
+        {
+            rows.push(notice);
+        }
+        rows
+    }
+
+    fn stacked(&self, projection: &mut TableProjection<'_>, width: usize) -> bool {
+        for column in 0..self.header.alignments.len() {
+            if projection.rows.len() == projection.limit {
+                return true;
+            }
+            let (start, _) = projection.source.cell(column);
+            let mut label = if self.kind == TableKind::Header {
+                Vec::new()
+            } else {
+                self.label(column)
+            };
+            let mut label_width: usize = label.iter().map(Span::width).sum();
+            if !label.is_empty()
+                && label_width + text::glyph_room(self.cell(column), width).max(2) > width
+            {
+                let clipped = text::clip_end(span_text(&label).trim_end(), width);
+                let end = 1;
+                projection.push(
+                    Line::from(Span::raw(clipped).bold()),
+                    vec![CellBox::new(width, column, start, end..end)],
+                );
+                label.clear();
+                label_width = 0;
+            }
+            let (lines, lost) = table_cell(
+                self.cell(column),
+                self.kind == TableKind::Header,
+                [width - label_width, width],
+                projection.limit.saturating_sub(projection.rows.len()),
+            );
+            for (i, wrapped) in lines.into_iter().enumerate() {
+                let mut spans = if i == 0 {
+                    std::mem::take(&mut label)
+                } else {
+                    Vec::new()
+                };
+                let first = spans.len();
+                spans.extend(wrapped.line.spans);
+                let end = spans.len();
+                projection.push(
+                    Line::from(spans),
+                    vec![CellBox::new(
+                        width,
+                        column,
+                        start + wrapped.byte,
+                        first..end,
+                    )],
+                );
+            }
+            if lost {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn label(&self, column: usize) -> Vec<Span<'static>> {
+        let mut label = self.header.cells.get(column).cloned().unwrap_or_default();
+        if label.iter().all(|span| span.content.trim().is_empty()) {
+            label = vec![Span::raw(format!("Column {}", column + 1))];
+        } else {
+            for span in &mut label {
+                span.content = span.content.replace('\n', " ").into();
+                span.style = Style::new();
+            }
+        }
+        label.push(Span::raw(": "));
+        label.into_iter().map(Stylize::bold).collect()
+    }
+
+    fn boxed(&self, projection: &mut TableProjection<'_>, widths: &[usize]) -> bool {
+        let wraps = self
+            .header
+            .geometry
+            .preferred
+            .iter()
+            .zip(widths)
+            .any(|(&pref, &width)| pref > width);
+        if self.kind == TableKind::Body && wraps && projection.limit > 1 {
+            projection.push_rule(Line::from(table_rule(widths, '╌')), false);
+        }
+        let reserve_rule = usize::from(self.kind == TableKind::Header && projection.limit > 1);
+        let room = projection.limit - projection.rows.len() - reserve_rule;
+        let cells: Vec<_> = widths
+            .iter()
+            .enumerate()
+            .map(|(column, width)| {
+                let (rows, lost) = table_cell(
+                    self.cell(column),
+                    self.kind == TableKind::Header,
+                    [*width; 2],
+                    room,
+                );
+                (rows.into_iter(), lost)
+            })
+            .collect();
+        let height = cells.iter().map(|(rows, _)| rows.len()).max().unwrap_or(0);
+        let lost = cells.iter().any(|(_, lost)| *lost);
+        let mut cells: Vec<_> = cells.into_iter().map(|(rows, _)| rows).collect();
+        let count = widths.len();
+        for _ in 0..height {
+            let mut spans = Vec::new();
+            let mut col_start = 0;
+            let mut boxes = Vec::with_capacity(count);
+            for (column, (lines, width)) in cells.iter_mut().zip(widths).enumerate() {
+                if column > 0 {
+                    spans.push(Span::raw(" ".repeat(TABLE_GUTTER)));
+                }
+                let (start, end) = projection.source.cell(column);
+                let (line, byte) = lines.next().map_or((Line::default(), end), |wrapped| {
+                    (wrapped.line, start + wrapped.byte)
+                });
+                let gap = width.saturating_sub(line.width());
+                let left = match self.header.alignments[column] {
+                    Alignment::Right => gap,
+                    Alignment::Center => gap / 2,
+                    _ => 0,
+                };
+                if left > 0 {
+                    spans.push(Span::raw(" ".repeat(left)));
+                }
+                let first = spans.len();
+                spans.extend(line.spans);
+                let end = spans.len();
+                if column + 1 < count && gap > left {
+                    spans.push(Span::raw(" ".repeat(gap - left)));
+                }
+                let right = col_start + width + usize::from(column + 1 < count);
+                col_start += width + TABLE_GUTTER;
+                boxes.push(CellBox::new(right, column, byte, first..end));
+            }
+            projection.push(Line::from(spans), boxes);
+        }
+        if self.kind == TableKind::Header && projection.rows.len() < projection.limit {
+            projection.push_rule(Line::from(table_rule(widths, '─')), true);
+        }
+        lost
+    }
+}
+
+enum ProjectedRow {
+    Cells(Line<'static>, Vec<CellBox>),
+    Rule { line: Line<'static>, at_end: bool },
+}
+
+struct TableProjection<'a> {
+    rows: Vec<ProjectedRow>,
+    prefix: &'a [Span<'static>],
+    source: Arc<selection::Table>,
+    limit: usize,
+}
+
+impl TableProjection<'_> {
+    fn push(&mut self, line: Line<'static>, boxes: Vec<CellBox>) {
+        self.rows.push(ProjectedRow::Cells(line, boxes));
+    }
+
+    fn push_rule(&mut self, line: Line<'static>, at_end: bool) {
+        self.rows.push(ProjectedRow::Rule { line, at_end });
+    }
+
+    fn finish(self, (block, byte): Point) -> Vec<Row> {
+        let end = self.source.end() + 1;
+        self.rows
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, row)| match row {
+                ProjectedRow::Cells(line, boxes) => Row::table(
+                    (block, byte, ordinal),
+                    line,
+                    self.prefix,
+                    &self.source,
+                    boxes,
+                ),
+                ProjectedRow::Rule { mut line, at_end } => {
+                    line.spans.splice(..0, self.prefix.iter().cloned());
+                    let point = (block, if at_end { end } else { byte });
+                    Row::chrome_at((block, byte, ordinal), point, line)
+                }
+            })
+            .collect()
+    }
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct ByteOffset(usize);
@@ -832,7 +986,7 @@ struct LineCount(usize);
 
 struct Fence {
     marker: char,
-    language: String,
+    style: CodeStyle,
     scanned_to: ByteOffset,
     rendered_to: ByteOffset,
     stable_lines: LineCount,
@@ -858,11 +1012,11 @@ impl Fence {
         };
         Some(Self {
             marker,
-            language: language.to_string(),
+            style: CodeStyle::new(&CodeBlockKind::Fenced(language)),
             scanned_to: ByteOffset(opening.len() + 1),
             rendered_to: ByteOffset(opening.len() + 1),
             stable_lines: LineCount(1),
-            lines: vec![RenderRow::Literal(Line::default())],
+            lines: vec![RenderRow::literal(Line::default())],
         })
     }
 
@@ -877,24 +1031,19 @@ impl Fence {
 
     fn live(&mut self, text: &str) {
         self.lines.truncate(self.stable_lines.0);
-        let kind = CodeBlockKind::Fenced(self.language.as_str().into());
-        let width = usize::from(STREAM_WIDTH);
         let rendered = self.rendered_to.0;
         if let Some(end) = text.rfind('\n').filter(|&at| at >= rendered) {
-            self.lines
-                .extend(literals(code_lines(&text[rendered..end], &kind, width)));
+            self.lines.extend(
+                text[rendered..end]
+                    .split('\n')
+                    .map(|line| self.style.row(line)),
+            );
             self.rendered_to = ByteOffset(end + 1);
             self.stable_lines = LineCount(self.lines.len());
         }
-        if self.rendered_to.0 < text.len() {
-            self.lines.extend(literals(code_lines(
-                &text[self.rendered_to.0..],
-                &kind,
-                width,
-            )));
-        }
-        if self.lines.len() == 1 {
-            self.lines.push(RenderRow::Literal(Line::default()));
+        if self.rendered_to.0 < text.len() || self.lines.len() == 1 {
+            self.lines
+                .push(self.style.clone().row(&text[self.rendered_to.0..]));
         }
     }
 }
@@ -942,7 +1091,6 @@ impl Stream {
             return Vec::new();
         }
         self.checked = self.revision;
-        let width = STREAM_WIDTH;
         let needs_layout = self.needs_layout();
         let fence = &mut self.fence;
         if fence.is_none() {
@@ -969,17 +1117,18 @@ impl Stream {
             tail_events,
         } = partition_committable(&self.block, &mut self.references);
         let tail = self.block[commit_end.0..].trim_matches(['\n', '\r']);
-        let lines = render_events(tail, width, tail_events.into_iter());
+        let lines = render_events(tail, tail_events.into_iter());
         let lines = separate(lines);
         self.live = Some((self.revision, lines));
         if commit_end == ByteOffset(0) {
             let complete = self.block.rfind('\n').map_or("", |at| &self.block[..at]);
             let candidate = complete.rfind('\n').map_or("", |at| &complete[..=at]);
-            if Fence::establish(candidate).is_none() && unstable_inline(candidate, &self.references)
+            if !Fence::establish(candidate).is_some_and(|mut open| open.extend(candidate))
+                && unstable_inline(candidate, &self.references)
             {
                 return Vec::new();
             }
-            let stable = separated_with(candidate, width, &self.references);
+            let stable = separated_with(candidate, &self.references);
             let live = &self.live.as_ref().expect("set above").1;
             self.emitted_lines = self.emitted_lines.min(LineCount(live.len()));
             let end = LineCount(stable.iter().zip(live).take_while(|(a, b)| a == b).count());
@@ -991,13 +1140,13 @@ impl Stream {
         let finished = self.block[..commit_end.0].to_owned();
         self.block = Clean::new(&self.block[commit_end.0..]);
         self.layout_bytes = self.block.len();
-        separated_with(&finished, width, &self.references)
+        separated_with(&finished, &self.references)
             .into_iter()
             .skip(std::mem::take(&mut self.emitted_lines).0)
             .collect()
     }
     pub(super) fn finish(&mut self) -> Vec<RenderRow> {
-        let lines = separated_with(&self.block, STREAM_WIDTH, &self.references)
+        let lines = separated_with(&self.block, &self.references)
             .into_iter()
             .skip(self.emitted_lines.0)
             .collect();
@@ -1018,10 +1167,7 @@ impl Stream {
         let revision = self.live.as_ref().map(|(revision, _)| *revision);
         if revision.is_none() || revision != Some(self.revision) && needs_layout {
             self.layout_bytes = self.block.len();
-            self.live = Some((
-                self.revision,
-                separated_with(&self.block, STREAM_WIDTH, &self.references),
-            ));
+            self.live = Some((self.revision, separated_with(&self.block, &self.references)));
         }
         let lines = &self.live.as_ref().expect("prepared above").1;
         &lines[self.emitted_lines.0.min(lines.len())..]
@@ -1031,7 +1177,6 @@ impl Stream {
 fn unstable_inline(text: &str, references: &References) -> bool {
     enum Context {
         Prose,
-        Table,
         Code,
     }
     if text.contains("[^") || latex_delimiters(text).1.is_some() {
@@ -1039,20 +1184,16 @@ fn unstable_inline(text: &str, references: &References) -> bool {
     }
     let mut context = Context::Prose;
     parser(text, text, references).any(|event| match event {
-        Event::Start(Tag::Table(_)) => {
-            context = Context::Table;
-            false
-        }
+        Event::Start(Tag::Table(_)) => true,
         Event::Start(Tag::CodeBlock(_)) => {
             context = Context::Code;
             false
         }
-        Event::End(pulldown_cmark::TagEnd::Table | pulldown_cmark::TagEnd::CodeBlock) => {
+        Event::End(pulldown_cmark::TagEnd::CodeBlock) => {
             context = Context::Prose;
             false
         }
         Event::Text(_) if matches!(context, Context::Code) => false,
-        Event::Text(text) if matches!(context, Context::Table) => text.contains('['),
         Event::Text(text) => {
             text.contains(['*', '`', '[', '~', '$'])
                 || text.match_indices('_').any(|(at, _)| {
@@ -1076,15 +1217,15 @@ fn unstable_inline(text: &str, references: &References) -> bool {
     })
 }
 
-fn separated_with(text: &str, width: u16, references: &References) -> Vec<RenderRow> {
-    separate(render_filtered(text, width, references))
+fn separated_with(text: &str, references: &References) -> Vec<RenderRow> {
+    separate(render_filtered(text, references))
 }
 
 fn separate(lines: Vec<RenderRow>) -> Vec<RenderRow> {
     if lines.is_empty() {
         return lines;
     }
-    std::iter::once(RenderRow::Literal(Line::default()))
+    std::iter::once(RenderRow::literal(Line::default()))
         .chain(lines)
         .collect()
 }

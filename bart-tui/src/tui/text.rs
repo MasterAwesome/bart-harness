@@ -75,33 +75,47 @@ pub(super) fn width(text: &str) -> usize {
     text.width()
 }
 
-#[derive(Clone, Copy)]
+pub(super) fn glyph_room(spans: &[Span<'_>], width: usize) -> usize {
+    let source: String = spans.iter().map(|span| span.content.as_ref()).collect();
+    source
+        .graphemes(true)
+        .map(str::width)
+        .max()
+        .unwrap_or(1)
+        .clamp(1, width.max(1))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Wrap {
     Prose,
+    Plain,
     Table,
+    Verbatim,
+}
+
+#[derive(Default)]
+pub(super) struct Wrapped {
+    pub(super) line: Line<'static>,
+    pub(super) padding: usize,
+    pub(super) byte: usize,
+    pub(super) skipped: String,
 }
 
 pub(super) fn wrap(
     spans: &[Span<'static>],
-    width: usize,
+    widths: [usize; 2],
     limit: usize,
     mode: Wrap,
-) -> (Vec<(Line<'static>, usize)>, bool) {
-    if limit == 0 || width == 0 {
+) -> (Vec<Wrapped>, bool) {
+    if limit == 0 {
         return (Vec::new(), !spans.is_empty());
     }
     let annotated = super::links::annotated(spans);
     let spans = annotated.as_deref().unwrap_or(spans);
-    let indent = if matches!(mode, Wrap::Prose) {
-        spans
-            .iter()
-            .flat_map(|s| s.content.graphemes(true))
-            .take_while(|g| !g.chars().any(char::is_alphanumeric) && *g != "\n")
-            .map(str::width)
-            .sum::<usize>()
-            .min(width / 2)
-    } else {
-        0
+    let [mut width, continuation] = widths.map(|width| width.max(1));
+    let indent = match mode {
+        Wrap::Prose => prose_indent(spans).min(continuation / 2),
+        _ => 0,
     };
     let source: String = spans.iter().map(|span| span.content.as_ref()).collect();
     let mut offset = 0;
@@ -112,108 +126,129 @@ pub(super) fn wrap(
             (offset, span.style)
         })
         .collect();
-    let mut rows = vec![(Line::default(), 0)];
+    let mut rows = vec![Wrapped::default()];
     let mut used = 0;
-    let mut padding_spans = 0;
-    let mut at = 0;
+    let mut pad = 0;
     let mut style = 0;
     let mut word_end = 0;
+    let mut word_width = 0;
     let mut split_word = false;
-    while at < source.len() {
-        let rest = &source[at..];
-        let first = rest.chars().next().expect("non-empty source");
-        let whitespace = first.is_whitespace();
-        if !whitespace && at >= word_end {
-            word_end = at + rest.find(char::is_whitespace).unwrap_or(rest.len());
-            split_word = source[at..word_end].width() > width.saturating_sub(indent);
+    let mut has_word = false;
+    let mut graphemes = source.grapheme_indices(true).peekable();
+    while let Some(&(start, grapheme)) = graphemes.peek() {
+        let rest = &source[start..];
+        let newline = grapheme == "\n";
+        let whitespace = grapheme.starts_with(char::is_whitespace);
+        let verbatim = matches!(mode, Wrap::Verbatim);
+        if !whitespace && !verbatim && start >= word_end {
+            word_end = start + rest.find(char::is_whitespace).unwrap_or(rest.len());
+            word_width = source[start..word_end].width();
+            split_word = word_width > width.min(continuation.saturating_sub(indent));
         }
-        let mut len = first.len_utf8();
-        let mut cells = source[at..at + len].width();
-        if !whitespace {
-            len = word_end - at;
-            if split_word {
-                len = 0;
-                cells = 0;
-                for grapheme in source[at..word_end].graphemes(true) {
-                    let next = grapheme.width();
-                    if len > 0 && cells + next > width.saturating_sub(used) {
-                        break;
-                    }
-                    len += grapheme.len();
-                    cells += next;
-                    if cells >= width.saturating_sub(used) {
-                        break;
-                    }
-                }
-            } else {
-                cells = source[at..word_end].width();
-            }
-        }
-        if matches!(mode, Wrap::Table)
-            && whitespace
-            && first != '\n'
-            && (used == 0 || used >= width)
-        {
-            at += len;
+        let (end, cells) = if whitespace || verbatim || split_word {
+            (start + grapheme.len(), grapheme.width())
+        } else {
+            (word_end.max(start + grapheme.len()), word_width)
+        };
+        if matches!(mode, Wrap::Table) && whitespace && !newline && (used == 0 || used >= width) {
+            graphemes.next();
             continue;
         }
-        let start = rows.last().expect("one row").1;
-        let newline = first == '\n';
-        if newline || used > start && used + cells > width && !whitespace {
+        let row = rows.last_mut().expect("one row");
+        let has_skipped = !row.skipped.is_empty();
+        if matches!(mode, Wrap::Prose | Wrap::Plain)
+            && has_word
+            && whitespace
+            && !newline
+            && (used + cells > width || has_skipped)
+        {
+            row.skipped.push_str(grapheme);
+            graphemes.next();
+            continue;
+        }
+        if newline || has_skipped || used > pad && used + cells > width {
             if rows.len() == limit {
                 return (rows, true);
             }
-            let pad = if newline {
+            width = continuation;
+            pad = if newline {
                 0
             } else {
                 indent.min(width.saturating_sub(cells))
             };
-            let mut fill = Vec::new();
-            let mut left = pad;
-            for span in spans {
-                if left == 0 {
-                    break;
-                }
-                let cells = span.content.width().min(left);
-                if cells == 0 {
-                    continue;
-                }
-                let bg = span.style.bg;
-                fill.push(Span::styled(
-                    " ".repeat(cells),
-                    Style { bg, ..Style::new() },
-                ));
-                left -= cells;
-            }
-            padding_spans = fill.len();
-            rows.push((Line::from(fill), pad));
+            let fill = continuation_padding(spans, pad);
+            rows.push(Wrapped {
+                padding: fill.len(),
+                line: Line::from(fill),
+                byte: if newline { end } else { start },
+                ..Wrapped::default()
+            });
             used = pad;
+            has_word = false;
         }
-        let end = at + len;
         if newline {
-            at = end;
+            graphemes.next();
             continue;
         }
-        while at < end {
+        let row = rows.last_mut().expect("one row");
+        if row.line.spans.len() == row.padding {
+            row.byte = start;
+        }
+        while graphemes.peek().is_some_and(|(next, _)| *next < end) {
+            let (at, grapheme) = graphemes.next().expect("peeked grapheme");
             while styles[style].0 <= at {
                 style += 1;
             }
-            let to = end.min(styles[style].0);
-            let (line, _) = rows.last_mut().expect("one row");
-            if line.spans.len() > padding_spans
-                && let Some(last) = line.spans.last_mut()
-                && last.style == styles[style].1
-            {
-                last.content.to_mut().push_str(&source[at..to]);
-            } else {
-                line.spans
-                    .push(Span::styled(source[at..to].to_owned(), styles[style].1));
-            }
-            at = to;
+            row.push(grapheme, styles[style].1);
         }
         used += cells;
+        has_word |= !whitespace;
     }
     (rows, false)
+}
+
+impl Wrapped {
+    fn push(&mut self, grapheme: &str, style: Style) {
+        let spans = &mut self.line.spans;
+        if spans.len() > self.padding
+            && let Some(last) = spans.last_mut()
+            && last.style == style
+        {
+            last.content.to_mut().push_str(grapheme);
+        } else {
+            spans.push(Span::styled(grapheme.to_owned(), style));
+        }
+    }
+}
+
+fn prose_indent(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .flat_map(|span| span.content.graphemes(true))
+        .take_while(|g| !g.chars().any(char::is_alphanumeric) && *g != "\n")
+        .map(str::width)
+        .sum()
+}
+
+fn continuation_padding(spans: &[Span<'static>], mut left: usize) -> Vec<Span<'static>> {
+    let mut fill = Vec::new();
+    for span in spans {
+        if left == 0 {
+            break;
+        }
+        let cells = span.width().min(left);
+        if cells > 0 {
+            fill.push(Span::styled(
+                " ".repeat(cells),
+                Style {
+                    bg: span.style.bg,
+                    ..Style::new()
+                },
+            ));
+            left -= cells;
+        }
+    }
+    fill
 }
 
 pub(super) fn clip_end(text: &str, room: usize) -> String {
@@ -309,10 +344,10 @@ mod tests {
             Span::raw("  "),
             Span::raw("alpha beta gamma delta"),
         ];
-        let (rows, _) = wrap(&spans, 10, usize::MAX, Wrap::Prose);
+        let (rows, _) = wrap(&spans, [10; 2], usize::MAX, Wrap::Prose);
         assert!(rows.len() >= 2, "expected wrapping into >= 2 rows");
-        for (line, indent) in &rows[1..] {
-            assert_eq!(*indent, 2);
+        for row in &rows[1..] {
+            let line = &row.line;
             assert!(
                 line.to_string().starts_with("  "),
                 "wrapped continuation missing indent padding: {:?}",
