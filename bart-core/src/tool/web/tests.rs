@@ -201,12 +201,12 @@ async fn batch_runs_concurrently_and_keeps_failures_with_their_queries() {
             };
             let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
             if headers.starts_with("get ") {
-                let body = r#"{"data":[{"id":"m","max_tokens":32000}]}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 500 Reply\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
                 continue;
             }
             let length: usize = headers
@@ -281,7 +281,47 @@ async fn batch_runs_concurrently_and_keeps_failures_with_their_queries() {
         first.contains("[Bart web_search: first query]") && first.contains("first answer"),
         "{output}"
     );
-    assert!(second.contains("failed;"), "{output}");
+    assert!(
+        second.contains("failed; web search failed: HTTP 500"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn web_search_reports_missing_credentials_without_contacting_the_provider() {
+    let dir = crate::tool::test_support::TempDir::new("web-search-missing-key");
+    let (provider, requests, _, headers) = serve_catalog(
+        dir.path(),
+        vec![Reply::text("unexpected answer")],
+        json!({"data": [{"id": "m"}]}),
+    )
+    .await;
+    let provider = Provider::custom(
+        provider.name(),
+        &Custom {
+            protocol: HttpProtocol::Chat,
+            url: provider.endpoint().unwrap().to_string(),
+            key: true,
+        },
+    )
+    .unwrap();
+    let route = Route {
+        client: Client::new(),
+        store: Store::new(dir.path().join("auth.json")),
+        provider,
+        model: "m".into(),
+        effort: None,
+        diagnostics: None,
+    };
+    let live = std::sync::Arc::new(crate::tool::Live::default());
+    let run = live.start("python", "", None);
+    let result = search(&route, &["q".into()], run.progress()).await;
+    assert!(
+        result.contains("failed; no credentials for mock; run `bart login 'mock' < key-file`"),
+        "{result}"
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(headers.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

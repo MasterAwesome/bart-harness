@@ -1,10 +1,11 @@
 use reqwest::Client;
 
 use super::{
-    Error, HttpEndpoint, Observer, Request, Tools, Trace, chatgpt, claude_code, finish, http,
+    Error, HttpEndpoint, Observer, Request, Tools, chatgpt, claude_code, credential, finish, http,
 };
 use crate::{
-    auth::Credential,
+    auth::Store,
+    diagnostics::Attempts,
     history::{Assistant, ToolCall, ToolResult},
 };
 
@@ -35,17 +36,17 @@ impl Transport {
     pub(crate) async fn stream(
         &self,
         client: &Client,
-        credential: Option<&Credential>,
+        store: &Store,
         request: &Request<'_>,
         on_delta: impl Observer,
-        trace: Option<Trace>,
+        attempts: Option<&mut Attempts<'_>>,
     ) -> Result<Assistant, Error> {
         self.send(
             client,
-            credential,
+            store,
             request,
             on_delta,
-            trace,
+            attempts,
             Scope::Conversation,
         )
         .await
@@ -54,24 +55,17 @@ impl Transport {
     pub(crate) async fn isolated(
         &self,
         client: &Client,
-        credential: Option<&Credential>,
+        store: &Store,
         request: &Request<'_>,
         on_delta: impl Observer,
-        trace: Option<Trace>,
+        attempts: Option<&mut Attempts<'_>>,
     ) -> Result<Assistant, Error> {
         let transport = Self {
             claude: self.claude.isolated(),
             ..Self::default()
         };
         let result = transport
-            .send(
-                client,
-                credential,
-                request,
-                on_delta,
-                trace,
-                Scope::Isolated,
-            )
+            .send(client, store, request, on_delta, attempts, Scope::Isolated)
             .await;
         transport.close().await;
         result
@@ -80,12 +74,21 @@ impl Transport {
     async fn send(
         &self,
         client: &Client,
-        credential: Option<&Credential>,
+        store: &Store,
         request: &Request<'_>,
         mut on_delta: impl Observer,
-        mut trace: Option<Trace>,
+        attempts: Option<&mut Attempts<'_>>,
         scope: Scope,
     ) -> Result<Assistant, Error> {
+        let credential = credential(client, store, request.provider).await?;
+        let credential = credential.as_ref();
+        let mut trace = attempts.map(|attempts| {
+            attempts.start(
+                request.provider.name(),
+                request.model,
+                matches!(request.tools, Tools::WebSearch),
+            )
+        });
         let result = match request.provider.http() {
             None => {
                 self.claude
@@ -125,9 +128,12 @@ impl Transport {
 
     pub(crate) async fn prewarm(
         &self,
-        credential: Option<&Credential>,
+        client: &Client,
+        store: &Store,
         request: &Request<'_>,
     ) -> Result<(), Error> {
+        let credential = credential(client, store, request.provider).await?;
+        let credential = credential.as_ref();
         match request.provider.http() {
             None => self.claude.prewarm(request).await,
             Some(endpoint) if self.persistent(endpoint, request) => {
@@ -172,12 +178,12 @@ impl Transport {
 
 pub(crate) async fn stream(
     client: &Client,
-    credential: Option<&Credential>,
+    store: &Store,
     request: &Request<'_>,
     on_delta: impl Observer,
-    trace: Option<Trace>,
+    attempts: Option<&mut Attempts<'_>>,
 ) -> Result<Assistant, Error> {
     Transport::default()
-        .isolated(client, credential, request, on_delta, trace)
+        .isolated(client, store, request, on_delta, attempts)
         .await
 }

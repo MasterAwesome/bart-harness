@@ -1,8 +1,7 @@
-use crate::{
-    auth::{self, Credential, Store},
-    provider::{self, Custom, HttpProtocol, Provider},
-};
 use reqwest::Client;
+
+use crate::auth::{self, Credential, Store};
+
 async fn seed(store: &Store, provider_name: &str) {
     store
         .update(async |credentials| {
@@ -31,21 +30,12 @@ async fn provider_and_mcp_logout_never_cross_namespaces() {
     for provider_name in ["docs", "mcp-docs"] {
         seed(&store, provider_name).await;
         assert!(super::logout("docs", &store).await.unwrap());
-        let provider = Provider::custom(
-            provider_name,
-            &Custom {
-                protocol: HttpProtocol::Chat,
-                url: "https://example.invalid/v1".into(),
-                key: true,
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            provider::credential(&store, &Client::new(), &provider)
-                .await
-                .unwrap(),
-            Some(Credential::ApiKey { .. })
-        ));
+        assert_eq!(
+            store.load().unwrap().providers.get(provider_name),
+            Some(&Credential::ApiKey {
+                key: auth::api_key("provider-secret").unwrap()
+            }),
+        );
         crate::provider::logout(dir.path(), &store, provider_name)
             .await
             .unwrap();

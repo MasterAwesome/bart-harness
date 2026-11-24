@@ -498,7 +498,7 @@ fn finish(
             Err(Error::Failed { .. }) => Outcome::ProviderFailed,
             Err(Error::Incomplete(_)) => Outcome::Incomplete,
             Err(Error::ContextOverflow(_)) => Outcome::ContextOverflow,
-            Err(Error::WrongCredential) => Outcome::CredentialError,
+            Err(Error::Credential(_)) => Outcome::CredentialError,
         });
     }
     result.map_err(|error| error.sanitized(credential))
@@ -583,26 +583,28 @@ fn unix_now() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs().cast_signed())
 }
 
-pub async fn credential(
-    store: &Store,
+async fn credential(
     client: &Client,
+    store: &Store,
     provider: &Provider,
-) -> Result<Option<Credential>, String> {
+) -> Result<Option<Credential>, Error> {
     if matches!(provider.auth(), Auth::None | Auth::External) {
         return Ok(None);
     }
     let key = provider.name();
     let missing = || format!("no credentials for {key}; run `{}`", provider.login_hint());
-    let loaded = store.load().map_err(|error| error.to_string())?;
+    let loaded = store
+        .load()
+        .map_err(|error| Error::Credential(error.to_string()))?;
     let credential = match (provider.auth(), loaded.providers.get(key)) {
         (Auth::Chatgpt, Some(Credential::Chatgpt(tokens))) if tokens.needs_refresh() => {
             auth::chatgpt::credential(store, client, key, missing())
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| Error::Credential(error.to_string()))
         }
         (Auth::Chatgpt, Some(credential @ Credential::Chatgpt(_)))
         | (Auth::ApiKey, Some(credential @ Credential::ApiKey { .. })) => Ok(credential.clone()),
-        _ => Err(missing()),
+        _ => Err(Error::Credential(missing())),
     };
     credential.map(Some)
 }

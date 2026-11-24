@@ -74,22 +74,12 @@ impl Routing {
             || matches!(self.catalog, Catalog::Failed { retry_at, .. } if Instant::now() >= retry_at)
         {
             let provider = &self.settings.provider;
-            let lookup = async {
-                let credential = provider::credential(&self.store, &self.client, provider).await?;
-                provider::model(
-                    &self.client,
-                    provider,
-                    credential.as_ref(),
-                    &self.settings.model,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            }
-            .await;
+            let lookup =
+                provider::model(&self.client, &self.store, provider, &self.settings.model).await;
             self.catalog = match lookup {
                 Ok(model) => Catalog::Looked(model),
-                Err(reason) => Catalog::Failed {
-                    reason,
+                Err(error) => Catalog::Failed {
+                    reason: error.to_string(),
                     retry_at: Instant::now() + CATALOG_RETRY_INTERVAL,
                 },
             };

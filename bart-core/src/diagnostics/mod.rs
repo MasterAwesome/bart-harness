@@ -58,6 +58,41 @@ enum Phase {
     ErrorBody,
 }
 
+pub(crate) struct Attempts<'a> {
+    log: &'a Arc<Log>,
+    next: u32,
+    previous: Option<u64>,
+}
+
+impl<'a> Attempts<'a> {
+    pub(crate) fn new(log: &'a Arc<Log>, attempt: u32) -> Self {
+        Self {
+            log,
+            next: attempt,
+            previous: None,
+        }
+    }
+
+    pub(crate) fn start(&mut self, provider: &str, model: &str, web: bool) -> Trace {
+        let trace = self
+            .log
+            .start(provider, model, web, self.next, self.previous);
+        self.next = self.next.saturating_add(1);
+        self.previous = Some(trace.id);
+        trace
+    }
+
+    pub(crate) fn retry(&self, delay: std::time::Duration, reset: bool) {
+        if let Some(id) = self.previous {
+            self.log.retry(id, delay, reset);
+        }
+    }
+
+    pub(crate) fn renumber_next(&mut self, attempt: u32) {
+        self.next = attempt;
+    }
+}
+
 pub(crate) struct Trace {
     log: Arc<Log>,
     id: u64,
@@ -120,7 +155,7 @@ impl Log {
         })
     }
 
-    pub(crate) fn start(
+    fn start(
         self: &Arc<Self>,
         provider: &str,
         model: &str,
@@ -156,7 +191,7 @@ impl Log {
         trace
     }
 
-    pub(crate) fn retry(&self, id: u64, delay: std::time::Duration, reset: bool) {
+    fn retry(&self, id: u64, delay: std::time::Duration, reset: bool) {
         self.write(
             id,
             "retry",
@@ -194,10 +229,6 @@ impl Log {
 }
 
 impl Trace {
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
-
     fn elapsed(&self) -> u64 {
         u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
     }

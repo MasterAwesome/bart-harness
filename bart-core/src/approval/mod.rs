@@ -232,7 +232,6 @@ fn reviewer_key(session_key: &str) -> String {
 
 struct Route {
     provider: Provider,
-    credential: Option<crate::auth::Credential>,
     max_output_tokens: Option<u64>,
 }
 
@@ -242,8 +241,7 @@ async fn resolve(
     route: &crate::choice::Choice,
 ) -> Result<Route, String> {
     let provider = Provider::named(&route.provider, store.config_dir())?;
-    let credential = provider::credential(store, client, &provider).await?;
-    let models = provider::models(client, &provider, credential.as_ref())
+    let models = provider::models(client, store, &provider)
         .await
         .map_err(|e| e.to_string())?;
     let model = models
@@ -264,7 +262,6 @@ async fn resolve(
     }
     Ok(Route {
         provider,
-        credential,
         max_output_tokens: model.max_output_tokens,
     })
 }
@@ -551,7 +548,7 @@ impl Gate<'_> {
             let response = tokio::select! {
                 biased;
                 () = limit.notified() => return Err("review response exceeds 8 KiB".into()),
-                response = provider::stream(client, route.credential.as_ref(), &request, |delta: crate::provider::Delta<'_>| {
+                response = provider::stream(client, store, &request, |delta: crate::provider::Delta<'_>| {
                     bytes += match delta { provider::Delta::Text(s) => s.len(), provider::Delta::ToolBytes(n) => n, provider::Delta::Reasoning(_) | provider::Delta::MessageBoundary => 0 };
                     if bytes > 8192 { limit.notify_one(); }
                 }, None) => response.map_err(|e| e.to_string())?,

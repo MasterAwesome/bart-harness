@@ -125,7 +125,6 @@ pub enum Event<'a> {
 
 #[derive(Debug)]
 pub enum Error {
-    Credential(String),
     Model(provider::Error),
     Unsupported(String),
     Context(String),
@@ -140,10 +139,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Credential(problem)
-            | Self::Unsupported(problem)
-            | Self::Context(problem)
-            | Self::UnknownWindow(problem) => f.write_str(problem),
+            Self::Unsupported(problem) | Self::Context(problem) | Self::UnknownWindow(problem) => {
+                f.write_str(problem)
+            }
             Self::NotApproved => f.write_str("turn stopped: an action was not approved"),
             Self::Model(error) => error.fmt(f),
             Self::Overflow { error, .. } => write!(
@@ -811,15 +809,10 @@ impl Session {
             self.instructions.as_str(),
             Some(self.cache()),
         );
-        let Ok(credential) =
-            provider::credential(&self.routing.store, &self.routing.client, request.provider).await
-        else {
-            return;
-        };
         let _ = self
             .routing
             .transport
-            .prewarm(credential.as_ref(), &request)
+            .prewarm(&self.routing.client, &self.routing.store, &request)
             .await;
     }
 

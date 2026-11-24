@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::{Error, Event, Reporter, routing::Routing};
 use crate::{
-    diagnostics::{Log, Trace},
+    diagnostics::{Attempts, Log},
     history::{Assistant, Content},
     provider::{self, Delta, Request, Retry},
 };
@@ -17,33 +17,20 @@ pub(super) async fn respond(
     on_event: &mut impl Reporter,
 ) -> Result<Assistant, Error> {
     let mut retries = 0;
-    let mut retry_of = None;
+    let mut attempts = diagnostics.map(|log| Attempts::new(log, 1));
     loop {
-        let credential = provider::credential(&routing.store, &routing.client, request.provider)
-            .await
-            .map_err(Error::Credential)?;
-        let trace = diagnostics.map(|log| {
-            log.start(
-                request.provider.name(),
-                request.model,
-                matches!(request.tools, provider::Tools::WebSearch),
-                retries + 1,
-                retry_of,
-            )
-        });
-        let request_id = trace.as_ref().map(Trace::id);
         let mut streamed = false;
         let result = routing
             .transport
             .stream(
                 &routing.client,
-                credential.as_ref(),
+                &routing.store,
                 request,
                 ResponseReporter {
                     reporter: on_event,
                     streamed: &mut streamed,
                 },
-                trace,
+                attempts.as_mut(),
             )
             .await;
         let error = match result {
@@ -70,6 +57,9 @@ pub(super) async fn respond(
                 return Err(Error::Model(error));
             }
             retries = 0;
+            if let Some(attempts) = &mut attempts {
+                attempts.renumber_next(2);
+            }
         }
         let delay = match retry {
             Retry::Reset(delay) => {
@@ -90,14 +80,11 @@ pub(super) async fn respond(
             }
             Retry::No => unreachable!("checked above"),
         };
-        if let Some(log) = diagnostics
-            && let Some(id) = request_id
-        {
-            log.retry(id, delay, matches!(error.retry(), Retry::Reset(_)));
+        if let Some(attempts) = &attempts {
+            attempts.retry(delay, matches!(retry, Retry::Reset(_)));
         }
-        retry_of = request_id;
         on_event.flush().await;
-        if matches!(error.retry(), Retry::Reset(_)) {
+        if matches!(retry, Retry::Reset(_)) {
             let until = std::time::SystemTime::now() + delay;
             while let Ok(remaining) = until.duration_since(std::time::SystemTime::now()) {
                 if remaining.is_zero() {
@@ -125,18 +112,15 @@ pub(super) async fn name(
         .map(|_| "low");
     request.summaries = false;
     request.verbosity = None;
-    let credential =
-        provider::credential(&routing.store, &routing.client, request.provider).await?;
-    let trace =
-        diagnostics.map(|log| log.start(request.provider.name(), request.model, false, 1, None));
+    let mut attempts = diagnostics.map(|log| Attempts::new(log, 1));
     let assistant = routing
         .transport
         .isolated(
             &routing.client,
-            credential.as_ref(),
+            &routing.store,
             &request,
             StatusReporter(on_event),
-            trace,
+            attempts.as_mut(),
         )
         .await
         .map_err(|error| error.to_string())?;

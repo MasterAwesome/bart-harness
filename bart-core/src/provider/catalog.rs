@@ -10,10 +10,10 @@ use sha2::{Digest as _, Sha256};
 use tokio::time;
 
 use super::{
-    ERROR_BODY_TIMEOUT, Error, Protocol, Provider, authorize, gemini, http_error, messages,
-    responses,
+    ERROR_BODY_TIMEOUT, Error, Protocol, Provider, authorize, credential, gemini, http_error,
+    messages, responses,
 };
-use crate::auth::Credential;
+use crate::auth::{Credential, Store};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Visibility {
@@ -127,11 +127,15 @@ fn entry(provider: &Provider, credential: Option<&Credential>) -> Arc<Entry> {
     }
 }
 
+/// # Errors
+/// Returns an error if credentials or the provider catalog cannot be loaded.
 pub async fn models(
     client: &Client,
+    store: &Store,
     provider: &Provider,
-    credential: Option<&Credential>,
 ) -> Result<Vec<Model>, Error> {
+    let credential = credential(client, store, provider).await?;
+    let credential = credential.as_ref();
     let entry = entry(provider, credential);
     let mut models = entry.models.lock().await;
     Ok(loaded(&mut models, client, provider, credential, None)
@@ -139,12 +143,17 @@ pub async fn models(
         .clone())
 }
 
+/// # Errors
+/// Returns an error if credentials or the catalog cannot be loaded, or if Claude
+/// Code cannot report the selected model’s context window.
 pub async fn model(
     client: &Client,
+    store: &Store,
     provider: &Provider,
-    credential: Option<&Credential>,
     id: &str,
 ) -> Result<Option<Model>, Error> {
+    let credential = credential(client, store, provider).await?;
+    let credential = credential.as_ref();
     let entry = entry(provider, credential);
     let mut models = entry.models.lock().await;
     let Some(model) = loaded(&mut models, client, provider, credential, Some(id))
@@ -434,7 +443,20 @@ mod tests {
         let key = |key: &str| Credential::ApiKey {
             key: crate::auth::api_key(key).unwrap(),
         };
-        let (a, b) = (key("key-a"), key("key-b"));
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("auth.json"));
+        let save = async |value| {
+            store
+                .update(async |credentials| {
+                    credentials
+                        .providers
+                        .insert(provider.name().to_owned(), key(value));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        };
+        save("key-a").await;
         let ids = |models: Result<Vec<Model>, Error>| {
             models
                 .unwrap()
@@ -445,16 +467,17 @@ mod tests {
 
         let cancelled = time::timeout(
             std::time::Duration::from_millis(20),
-            models(&client, &provider, Some(&a)),
+            models(&client, &store, &provider),
         )
         .await;
         assert!(cancelled.is_err());
-        let loads = (0..8).map(|_| models(&client, &provider, Some(&a)));
+        let loads = (0..8).map(|_| models(&client, &store, &provider));
         for listed in futures_util::future::join_all(loads).await {
             assert_eq!(ids(listed), ["a"]);
         }
         assert_eq!(gets.load(Ordering::SeqCst), 2);
-        assert_eq!(ids(models(&client, &provider, Some(&b)).await), ["b"]);
+        save("key-b").await;
+        assert_eq!(ids(models(&client, &store, &provider).await), ["b"]);
         assert_eq!(gets.load(Ordering::SeqCst), 3);
         let alternate = Provider::custom(
             "catalog-owner",
@@ -464,9 +487,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(ids(models(&client, &alternate, Some(&b)).await), ["b"]);
+        assert_eq!(ids(models(&client, &store, &alternate).await), ["b"]);
         assert_eq!(gets.load(Ordering::SeqCst), 4);
-        assert_eq!(ids(models(&client, &provider, Some(&b)).await), ["b"]);
+        assert_eq!(ids(models(&client, &store, &provider).await), ["b"]);
         assert_eq!(gets.load(Ordering::SeqCst), 5);
     }
 

@@ -39,7 +39,7 @@ pub(super) fn authorize(
             }
         }
         (HttpAuth::None, _) => builder,
-        _ => return Err(Error::WrongCredential),
+        _ => return Err(Error::wrong_credential()),
     })
 }
 

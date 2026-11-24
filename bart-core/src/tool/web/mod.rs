@@ -4,6 +4,7 @@ use reqwest::Client;
 
 use crate::{
     auth::Store,
+    diagnostics::Attempts,
     history::Message,
     provider::{self, Provider, Request},
 };
@@ -35,9 +36,7 @@ pub(super) async fn search(
         let resolved = &resolved;
         async move {
             let result = match resolved {
-                Ok((credential, max_output_tokens)) => {
-                    search_with(route, credential.as_ref(), *max_output_tokens, query).await
-                }
+                Ok(max_output_tokens) => search_with(route, *max_output_tokens, query).await,
                 Err(error) => Err(error.clone()),
             };
             activity.finish(result.is_ok());
@@ -61,27 +60,25 @@ pub(super) async fn search(
     output
 }
 
-async fn resolve_search(
-    route: &Route,
-) -> Result<(Option<crate::auth::Credential>, Option<u64>), String> {
-    let credential = provider::credential(&route.store, &route.client, &route.provider).await?;
-    let catalog = provider::models(&route.client, &route.provider, credential.as_ref())
-        .await
-        .ok()
-        .and_then(|models| models.into_iter().find(|model| model.id == route.model));
-    let max_output_tokens = catalog.and_then(|model| model.max_output_tokens);
-    Ok((credential, max_output_tokens))
+async fn resolve_search(route: &Route) -> Result<Option<u64>, String> {
+    match provider::models(&route.client, &route.store, &route.provider).await {
+        Ok(models) => Ok(models
+            .into_iter()
+            .find(|model| model.id == route.model)
+            .and_then(|model| model.max_output_tokens)),
+        Err(provider::Error::Credential(problem)) => Err(problem),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
 async fn search_one(route: &Route, query: &str) -> Result<String, String> {
-    let (credential, max_output_tokens) = resolve_search(route).await?;
-    search_with(route, credential.as_ref(), max_output_tokens, query).await
+    let max_output_tokens = resolve_search(route).await?;
+    search_with(route, max_output_tokens, query).await
 }
 
 async fn search_with(
     route: &Route,
-    credential: Option<&crate::auth::Credential>,
     max_output_tokens: Option<u64>,
     query: &str,
 ) -> Result<String, String> {
@@ -106,18 +103,22 @@ async fn search_with(
             max_output_tokens,
             cache: None,
         };
+        let mut attempts = route
+            .diagnostics
+            .as_ref()
+            .map(|log| Attempts::new(log, attempt));
         let assistant = provider::stream(
             &route.client,
-            credential,
+            &route.store,
             &request,
             |_: crate::provider::Delta<'_>| {},
-            route
-                .diagnostics
-                .as_ref()
-                .map(|log| log.start(route.provider.name(), &route.model, true, attempt, None)),
+            attempts.as_mut(),
         )
         .await
-        .map_err(|error| format!("web search failed: {error}"))?;
+        .map_err(|error| match error {
+            provider::Error::Credential(problem) => problem,
+            _ => format!("web search failed: {error}"),
+        })?;
         let continues = assistant.continues;
         history.push(Message::Assistant(assistant));
         if !continues {

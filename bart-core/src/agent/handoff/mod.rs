@@ -486,17 +486,8 @@ pub(super) async fn summarize(
             .capabilities()
             .output_limit
             .then_some(output_tokens);
-        let credential = provider::credential(&routing.store, &routing.client, request.provider)
-            .await
-            .map_err(Error::Credential)?;
-        let trace = diagnostics.map(|log| {
-            log.start(
-                request.provider.name(),
-                request.model,
-                false,
-                u32::try_from(index + 1).unwrap_or(u32::MAX),
-                None,
-            )
+        let mut attempts = diagnostics.map(|log| {
+            crate::diagnostics::Attempts::new(log, u32::try_from(index + 1).unwrap_or(u32::MAX))
         });
         // Send the summary separately so the server doesn't treat it as the next turn
         // in the main conversation. Keep the same instructions, tools and cache key.
@@ -504,10 +495,10 @@ pub(super) async fn summarize(
             .transport
             .isolated(
                 &routing.client,
-                credential.as_ref(),
+                &routing.store,
                 &request,
                 SummaryObserver(on_event),
-                trace,
+                attempts.as_mut(),
             )
             .await
             .map_err(Error::Model)?;

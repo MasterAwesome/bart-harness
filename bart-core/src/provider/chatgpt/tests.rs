@@ -11,7 +11,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt as _;
 
 use super::super::{Cache, Kind, Provider, Request, Tools, Transport, mock::completed, responses};
 use crate::{
-    auth::Credential,
+    auth::{Credential, Store},
     history::{Assistant, Image, Message, ToolResult},
 };
 
@@ -23,11 +23,19 @@ fn provider(origin: &str) -> Provider {
     }
 }
 
-fn credential(account: &str) -> Credential {
-    serde_json::from_value(json!({"type":"chatgpt", "access":"local-test-access",
+async fn save_account(store: &Store, account: &str) {
+    let credential: Credential =
+        serde_json::from_value(json!({"type":"chatgpt", "access":"local-test-access",
         "refresh":"local-test-refresh", "expires_at":i64::MAX, "account_id":account,
         "residency":null, "installation_id":"5b0f3c1e-7a2d-4e8b-9c61-2f4d8a7e9b13"}))
-    .unwrap()
+        .unwrap();
+    store
+        .update(async |credentials| {
+            credentials.providers.insert("chatgpt".into(), credential);
+            Ok(())
+        })
+        .await
+        .unwrap();
 }
 
 fn request<'a>(provider: &'a Provider, history: &'a [Message]) -> Request<'a> {
@@ -202,8 +210,9 @@ async fn continuation_sends_only_appended_input_and_resets_on_any_doubt() {
     let provider = provider(&origin);
     let client = crate::http_client::new();
     let transport = Transport::default();
-    let (a, b) = (credential("account-A"), credential("account-B"));
     let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("auth.json"));
+    save_account(&store, "account-A").await;
     let path = dir.path().join("image.png");
     std::fs::write(&path, crate::history::test_support::PNG).unwrap();
     let image = Message::Image(Image {
@@ -213,17 +222,11 @@ async fn continuation_sends_only_appended_input_and_resets_on_any_doubt() {
         label: String::new(),
         byte_len: crate::history::test_support::PNG.len(),
     });
-    let stream = async |history: &[Message], effort, credential| -> Assistant {
+    let stream = async |history: &[Message], effort| -> Assistant {
         let mut request = request(&provider, history);
         request.reasoning_effort = effort;
         transport
-            .stream(
-                &client,
-                Some(credential),
-                &request,
-                |_: super::Delta<'_>| {},
-                None,
-            )
+            .stream(&client, &store, &request, |_: super::Delta<'_>| {}, None)
             .await
             .unwrap()
     };
@@ -238,10 +241,10 @@ async fn continuation_sends_only_appended_input_and_resets_on_any_doubt() {
     transport.begin_turn().await.unwrap();
     let mut history = vec![user("tool")];
     transport
-        .prewarm(Some(&a), &request(&provider, &history))
+        .prewarm(&client, &store, &request(&provider, &history))
         .await
         .unwrap();
-    let called = stream(&history, None, &a).await;
+    let called = stream(&history, None).await;
     history.extend([
         Message::Assistant(called),
         Message::ToolResult(ToolResult {
@@ -256,7 +259,7 @@ async fn continuation_sends_only_appended_input_and_resets_on_any_doubt() {
             cell: None,
         }),
     ]);
-    let answered = stream(&history, None, &a).await;
+    let answered = stream(&history, None).await;
     assert_eq!(frame(0)["generate"], false);
     assert_eq!(frame(1)["previous_response_id"], "resp1");
     assert_eq!(frame(1)["input"], json!([]));
@@ -267,19 +270,19 @@ async fn continuation_sends_only_appended_input_and_resets_on_any_doubt() {
     assert_eq!(Value::Array(held), full(&history, None));
 
     history.extend([Message::Assistant(answered), user("lost")]);
-    let recovered = stream(&history, None, &a).await;
+    let recovered = stream(&history, None).await;
     assert_eq!(frame(3)["previous_response_id"], "resp3");
     history.extend([Message::Assistant(recovered), user("effort")]);
-    stream(&history, Some("high"), &a).await;
+    stream(&history, Some("high")).await;
     let mut rewritten = vec![user("rewritten")];
-    let rewrite = stream(&rewritten, Some("high"), &a).await;
+    let rewrite = stream(&rewritten, Some("high")).await;
     rewritten.extend([Message::Assistant(rewrite), image, user("look")]);
-    let looked = stream(&rewritten, Some("high"), &a).await;
+    let looked = stream(&rewritten, Some("high")).await;
     assert_eq!(frame(7)["previous_response_id"], "resp6");
     assert_eq!(frame(7)["input"], full(&rewritten[2..], Some("high")));
     std::fs::write(&path, b"changed image bytes").unwrap();
     rewritten.extend([Message::Assistant(looked), user("again")]);
-    let again = stream(&rewritten, Some("high"), &a).await;
+    let again = stream(&rewritten, Some("high")).await;
     let restarts = [
         (4, &history[..history.len() - 2], None),
         (5, &history[..], Some("high")),
@@ -300,7 +303,8 @@ async fn continuation_sends_only_appended_input_and_resets_on_any_doubt() {
     );
 
     rewritten.extend([Message::Assistant(again), user("switched")]);
-    stream(&rewritten, Some("high"), &b).await;
+    save_account(&store, "account-B").await;
+    stream(&rewritten, Some("high")).await;
     let frames = frames.lock().unwrap();
     let connections: Vec<_> = frames.iter().map(|(connection, _)| *connection).collect();
     assert_eq!(connections, [0, 0, 0, 0, 1, 1, 1, 1, 1, 2]);
@@ -398,17 +402,14 @@ async fn proxy_child() {
     let provider = provider(&origin);
     let history = [Message::User("hello".into())];
     let request = request(&provider, &history);
-    let credential = credential("account");
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("auth.json"));
+    save_account(&store, "account").await;
     let transport = Transport::default();
-    let _ = transport.prewarm(Some(&credential), &request).await;
+    let client = crate::http_client::new();
+    let _ = transport.prewarm(&client, &store, &request).await;
     let _ = transport
-        .stream(
-            &crate::http_client::new(),
-            Some(&credential),
-            &request,
-            |_: super::Delta<'_>| {},
-            None,
-        )
+        .stream(&client, &store, &request, |_: super::Delta<'_>| {}, None)
         .await;
 }
 
@@ -455,12 +456,14 @@ async fn websocket_error_event_with_context_overflow_classifies_as_overflow() {
     let provider = provider(&origin);
     let history = [Message::User("hello".into())];
     let request = request(&provider, &history);
-    let credential = credential("account");
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("auth.json"));
+    save_account(&store, "account").await;
     let transport = Transport::default();
     let error = transport
         .stream(
             &crate::http_client::new(),
-            Some(&credential),
+            &store,
             &request,
             |_: super::Delta<'_>| {},
             None,
@@ -507,12 +510,14 @@ async fn websocket_upgrade_refusal_without_content_length_and_many_headers_prese
     let provider = provider(&origin);
     let history = [Message::User("hello".into())];
     let request = request(&provider, &history);
-    let credential = credential("account");
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("auth.json"));
+    save_account(&store, "account").await;
     let transport = Transport::default();
     let error = transport
         .stream(
             &crate::http_client::new(),
-            Some(&credential),
+            &store,
             &request,
             |_: super::Delta<'_>| {},
             None,
@@ -565,12 +570,14 @@ async fn truncated_websocket_upgrade_refusal_does_not_trigger_context_overflow()
     let provider = provider(&origin);
     let history = [Message::User("hello".into())];
     let request = request(&provider, &history);
-    let credential = credential("account");
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path().join("auth.json"));
+    save_account(&store, "account").await;
     let transport = Transport::default();
     let error = transport
         .stream(
             &crate::http_client::new(),
-            Some(&credential),
+            &store,
             &request,
             |_: super::Delta<'_>| {},
             None,

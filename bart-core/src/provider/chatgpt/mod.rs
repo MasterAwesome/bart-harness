@@ -151,7 +151,7 @@ async fn receive(
     mut trace: Option<&mut Trace>,
 ) -> Result<Outcome, Error> {
     let Some(Credential::Chatgpt(tokens)) = credential else {
-        return Err(Error::WrongCredential);
+        return Err(Error::wrong_credential());
     };
     let mut state = route.0.lock().await;
     let state = &mut *state;

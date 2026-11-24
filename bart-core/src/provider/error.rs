@@ -39,10 +39,14 @@ pub enum Error {
     Interrupted(String),
     Invalid(String),
     Limit(String),
-    WrongCredential,
+    Credential(String),
 }
 
 impl Error {
+    pub(super) fn wrong_credential() -> Self {
+        Self::Credential("the credential does not belong to this provider".into())
+    }
+
     // A server that echoes what it was sent would print the credential.
     pub(super) fn sanitized(mut self, credential: Option<&Credential>) -> Self {
         if let Self::Transport(error) = self {
@@ -67,7 +71,7 @@ impl Error {
                 clean(code);
                 clean(message);
             }
-            Self::Transport(_) | Self::WrongCredential => {}
+            Self::Transport(_) | Self::Credential(_) => {}
         }
         self
     }
@@ -88,7 +92,7 @@ impl fmt::Display for Error {
             Self::Interrupted(problem) => write!(f, "response interrupted: {problem}"),
             Self::Invalid(problem) => write!(f, "invalid provider response: {problem}"),
             Self::Limit(problem) => write!(f, "response exceeds a safety limit: {problem}"),
-            Self::WrongCredential => f.write_str("the credential does not belong to this provider"),
+            Self::Credential(problem) => f.write_str(problem),
         }
     }
 }
@@ -122,7 +126,7 @@ impl Error {
             | Self::ContextOverflow(_)
             | Self::Invalid(_)
             | Self::Limit(_)
-            | Self::WrongCredential => Retry::No,
+            | Self::Credential(_) => Retry::No,
         }
     }
 }

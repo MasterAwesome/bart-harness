@@ -53,8 +53,7 @@ impl CatalogLoader {
         &self,
         provider: &Provider,
     ) -> Result<Vec<crate::provider::Model>, String> {
-        let credential = provider::credential(&self.store, &self.client, provider).await?;
-        provider::models(&self.client, provider, credential.as_ref())
+        provider::models(&self.client, &self.store, provider)
             .await
             .map_err(|error| error.to_string())
     }

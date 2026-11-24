@@ -313,6 +313,8 @@ async fn a_response_cut_off_after_visible_text_is_retried_whole() {
     )
     .await;
     let mut session = session_on(provider, dir.path());
+    Arc::get_mut(&mut session.context).unwrap().diagnostics =
+        Some(Arc::new(crate::diagnostics::Log::open(dir.path()).unwrap()));
     let mut discarded = Vec::new();
     session
         .turn("go".to_owned().into(), |event: Event<'_>| {
@@ -335,6 +337,24 @@ async fn a_response_cut_off_after_visible_text_is_retried_whole() {
     assert!(
         history.contains("whole answer") && !history.contains("half an ans"),
         "{history}"
+    );
+    let rows: Vec<serde_json::Value> =
+        std::fs::read_to_string(dir.path().join("diagnostics.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+    let starts: Vec<_> = rows.iter().filter(|row| row["event"] == "start").collect();
+    let [first, second] = starts.as_slice() else {
+        panic!("expected two attempts, got {starts:?}");
+    };
+    assert_eq!(first["data"]["attempt"], 1);
+    assert_eq!(second["data"]["attempt"], 2);
+    assert_ne!(first["request_id"], second["request_id"]);
+    assert_eq!(second["data"]["retry_of"], first["request_id"]);
+    assert!(
+        rows.iter()
+            .any(|row| row["event"] == "retry" && row["request_id"] == first["request_id"])
     );
 }
 

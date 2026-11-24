@@ -169,8 +169,7 @@ async fn list_models(
     provider: &Provider,
     detailed: bool,
 ) -> Result<(), String> {
-    let credential = provider::credential(store, client, provider).await?;
-    let models = provider::models(client, provider, credential.as_ref())
+    let models = provider::models(client, store, provider)
         .await
         .map_err(|error| error.to_string())?;
     for model in models
