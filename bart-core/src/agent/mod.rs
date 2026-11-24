@@ -16,7 +16,7 @@ pub use open::Opener;
 use prompt::Instructions;
 use routing::Routing;
 
-use std::{fmt, path::Path, sync::Arc, time::Duration};
+use std::{fmt, num::NonZeroU64, path::Path, sync::Arc, time::Duration};
 
 use reqwest::Client;
 
@@ -66,9 +66,32 @@ impl<F: FnMut(Event<'_>) + Send> Reporter for F {
     async fn flush(&mut self) {}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextBudget {
+    window: NonZeroU64,
+}
+
+impl ContextBudget {
+    #[must_use]
+    pub const fn new(window: NonZeroU64) -> Self {
+        Self { window }
+    }
+
+    #[must_use]
+    pub const fn window(self) -> u64 {
+        self.window.get()
+    }
+
+    #[must_use]
+    pub fn compaction_threshold(self) -> u64 {
+        compact::threshold(self.window())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Accounting {
     pub context_tokens: u64,
+    pub context_budget: Option<ContextBudget>,
     pub usage: crate::conversation::UsageSummary,
 }
 
@@ -276,7 +299,7 @@ impl Session {
             title.to_owned()
         } else {
             self.settle_recording_with(&mut on_event).await;
-            self.refresh_model().await;
+            self.refresh_model(&mut on_event).await;
             let first = self
                 .journal
                 .history()
@@ -333,6 +356,7 @@ impl Session {
     pub fn accounting(&self) -> Accounting {
         Accounting {
             context_tokens: self.context_tokens,
+            context_budget: self.routing.context_budget().ok(),
             usage: self.journal.usage(),
         }
     }
@@ -346,6 +370,7 @@ impl Session {
             .describe(&settings.meta(&self.context.cwd))
             .await;
         self.apply_switch(settings);
+        self.resolve_model().await;
         on_event.event(Event::Accounting(self.accounting()));
         self.settle_recording_with(&mut on_event).await;
     }
@@ -354,9 +379,27 @@ impl Session {
         self.context.set_image_input(self.routing.image_input());
     }
 
-    async fn refresh_model(&mut self) {
+    async fn resolve_model(&mut self) {
         self.routing.entry().await;
         self.sync_image_input();
+    }
+
+    async fn refresh_model(&mut self, on_event: &mut impl Reporter) {
+        let before = self.routing.context_budget().ok();
+        self.resolve_model().await;
+        self.report_budget_change(before, on_event).await;
+    }
+
+    async fn report_budget_change(
+        &self,
+        before: Option<ContextBudget>,
+        on_event: &mut impl Reporter,
+    ) {
+        let accounting = self.accounting();
+        if accounting.context_budget != before {
+            on_event.event(Event::Accounting(accounting));
+            on_event.flush().await;
+        }
     }
 
     fn refresh_instructions(&mut self) {
@@ -431,10 +474,8 @@ impl Session {
         mut on_event: impl Reporter,
     ) -> Result<(Current, Option<String>), String> {
         self.settle_recording_with(&mut on_event).await;
-        let routing::Preferred {
-            confinement,
-            mut warning,
-        } = self
+        let before = self.routing.context_budget().ok();
+        let result = self
             .routing
             .prefer(
                 change,
@@ -442,7 +483,17 @@ impl Session {
                 self.context.confinement(),
                 self.context.mcp_pending(),
             )
-            .await?;
+            .await;
+        let routing::Preferred {
+            confinement,
+            mut warning,
+        } = match result {
+            Ok(preferred) => preferred,
+            Err(error) => {
+                self.report_budget_change(before, &mut on_event).await;
+                return Err(error);
+            }
+        };
         if let Some((confinement, mcp)) = confinement {
             self.apply_confinement(confinement, &mcp, &mut warning, &mut on_event)
                 .await;
@@ -558,8 +609,8 @@ impl Session {
                 return Err(Error::Context(INPUT_FULL.into()));
             }
         };
-        self.refresh_model().await;
-        if let Err(error) = self.compaction_threshold() {
+        self.refresh_model(&mut on_event).await;
+        if let Err(error) = self.routing.context_budget() {
             let rejected = held.release();
             on_event.event(Event::InputRejected(&rejected));
             on_event.flush().await;
@@ -569,10 +620,6 @@ impl Session {
         self.add_input(held, false, &mut on_event).await?;
         on_event.flush().await;
         self.respond(&mut on_event).await
-    }
-
-    fn compaction_threshold(&self) -> Result<u64, Error> {
-        self.routing.compaction_threshold()
     }
 
     async fn prepare_input(
@@ -652,9 +699,10 @@ impl Session {
         self.recover(on_event).await;
         self.report_jobs(on_event).await;
         on_event.flush().await;
-        self.refresh_model().await;
-        let limit = self.compaction_threshold()?;
-        let full_window = self.routing.window()?;
+        self.refresh_model(on_event).await;
+        let budget = self.routing.context_budget()?;
+        let full_window = budget.window();
+        let limit = budget.compaction_threshold();
         let context = self.route_context();
         let before = compact::tokens(context, self.instructions.as_str());
         if at_least == 0 && before <= full_window / 3 {
@@ -799,9 +847,11 @@ impl Session {
         self.respond(&mut on_event).await
     }
 
-    pub async fn prewarm(&mut self) {
-        self.refresh_model().await;
+    pub async fn prewarm(&mut self, mut on_event: impl Reporter) {
+        self.resolve_model().await;
         self.refresh_instructions();
+        on_event.event(Event::Accounting(self.accounting()));
+        on_event.flush().await;
         let definitions = tool::definitions(&self.context).await;
         let request = self.routing.request(
             self.journal.model_context().messages(),
@@ -826,7 +876,7 @@ impl Session {
         loop {
             self.recover(on_event).await;
             self.report_jobs(on_event).await;
-            self.refresh_model().await;
+            self.refresh_model(on_event).await;
             while let Some(held) = self.inbox.next() {
                 self.add_input(held, true, on_event).await?;
             }
@@ -850,7 +900,8 @@ impl Session {
                     Message::ToolResult(_) | Message::Notification(_) => None,
                 })
                 .unwrap_or(false);
-            if accounting.context_tokens >= self.compaction_threshold()? && !continuing {
+            let budget = self.routing.context_budget()?;
+            if accounting.context_tokens >= budget.compaction_threshold() && !continuing {
                 self.compact_with(on_event, 0).await?;
             }
             let definitions = tool::definitions(&self.context).await;
@@ -879,8 +930,7 @@ impl Session {
                         delay: Duration::ZERO,
                         discarded,
                     });
-                    let window = self.routing.window()?;
-                    self.compact_with(on_event, window).await?;
+                    self.compact_with(on_event, budget.window()).await?;
                     continue;
                 }
                 result => result?,

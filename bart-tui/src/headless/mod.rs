@@ -69,7 +69,7 @@ async fn one_turn(
     session
         .tool_context()
         .set_turn_mode(crate::tool::TurnMode::Prompt(jobs));
-    session.prewarm().await;
+    session.prewarm(|_: crate::agent::Event<'_>| {}).await;
     let output = Output::default();
     let mut display = HeadlessDisplay::new(&output);
     let turn = session.turn(prompt.into(), |event: crate::agent::Event<'_>| {

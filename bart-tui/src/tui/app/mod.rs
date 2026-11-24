@@ -896,6 +896,15 @@ mod tests {
         );
         let batch = tokio::time::timeout(Duration::from_secs(5), runtime.events.recv())
             .await
+            .expect("driver did not publish prewarm accounting")
+            .expect("driver exited early");
+        assert!(
+            matches!(batch.as_slice(), [UiEvent::Accounting(accounting)] if accounting.context_budget.is_none())
+        );
+        let effects = app.update(Msg::Events(batch));
+        run_runtime_effects(&mut app, &mut runtime, effects);
+        let batch = tokio::time::timeout(Duration::from_secs(5), runtime.events.recv())
+            .await
             .expect("driver did not reach idle after recall")
             .expect("driver exited early");
         assert!(matches!(batch.as_slice(), [UiEvent::Messages(messages)] if messages.is_empty()));
@@ -991,6 +1000,13 @@ mod tests {
                 break;
             }
         }
+        assert_eq!(
+            app.info
+                .accounting
+                .context_budget
+                .map(|budget| (budget.window(), budget.compaction_threshold())),
+            Some((100_000, 75_000))
+        );
 
         app.prepare_or_commit(Delivery::Send);
         let effects = std::mem::take(&mut app.effects);
@@ -1307,7 +1323,10 @@ mod tests {
         }
     }
 
-    async fn attached_fixture(dir: &std::path::Path, provider: Provider) -> (App, Runtime) {
+    pub(super) async fn attached_fixture(
+        dir: &std::path::Path,
+        provider: Provider,
+    ) -> (App, Runtime) {
         let mut preferences = Current::default();
         preferences
             .apply(&Change::ContextWindow {

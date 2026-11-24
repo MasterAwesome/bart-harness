@@ -92,6 +92,189 @@ async fn python(session: &Session, code: &str) -> Output {
     output
 }
 
+#[tokio::test]
+async fn accounting_tracks_catalog_budgets_before_the_next_turn() {
+    let dir = TempDir::new("accounting-context-budget");
+    let (provider, requests, _, _) = crate::provider::mock::serve_catalog(
+        dir.path(),
+        vec![crate::provider::mock::Reply::text("unused")],
+        json!({"data": [
+            {"id": "small", "context_window": 64_000},
+            {"id": "large", "context_window": 200_000}
+        ]}),
+    )
+    .await;
+    let settings = |model: &str| Settings {
+        provider: provider.clone(),
+        model: model.into(),
+        reasoning_effort: None,
+    };
+    let mut session = Session::new_ephemeral(
+        Client::new(),
+        Store::new(dir.path().join("auth.json")),
+        settings("small"),
+        Current::default(),
+        crate::tool::test_support::context(dir.path(), Confinement::Unrestricted, 400_000),
+        "fixture".into(),
+    );
+    assert_eq!(session.accounting().context_budget, None);
+
+    let mut snapshots = Vec::new();
+    let mut report = |event: Event<'_>| {
+        if let Event::Accounting(accounting) = event {
+            snapshots.push(
+                accounting
+                    .context_budget
+                    .map(|budget| (budget.window(), budget.compaction_threshold())),
+            );
+        }
+    };
+    session.prewarm(&mut report).await;
+    session.switch(settings("large"), &mut report).await;
+    session.switch(settings("unlisted"), &mut report).await;
+
+    assert_eq!(
+        snapshots,
+        [
+            Some((64_000, compact::threshold(64_000))),
+            Some((200_000, compact::threshold(200_000))),
+            None,
+        ]
+    );
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn catalog_retry_reports_accounting_before_compaction_noop() {
+    use crate::{
+        auth::Credential,
+        provider::{Custom, HttpProtocol, mock},
+    };
+
+    let dir = TempDir::new("catalog-retry-accounting");
+    let (local, requests, _, headers) = mock::serve_catalog(
+        dir.path(),
+        vec![mock::Reply::text("unused")],
+        json!({"data": [{"id": "m", "context_window": 200_000}]}),
+    )
+    .await;
+    let provider = Provider::custom(
+        "fixture",
+        &Custom {
+            protocol: HttpProtocol::Chat,
+            url: local.endpoint().unwrap().to_string(),
+            key: true,
+        },
+    )
+    .unwrap();
+    let store = Store::new(dir.path().join("auth.json"));
+    let mut session = Session::new_ephemeral(
+        Client::new(),
+        store.clone(),
+        Settings {
+            provider,
+            model: "m".into(),
+            reasoning_effort: None,
+        },
+        Current::default(),
+        crate::tool::test_support::context(dir.path(), Confinement::Unrestricted, 400_000),
+        "fixture".into(),
+    );
+    let mut prewarm = None;
+    session
+        .prewarm(|event: Event<'_>| {
+            if let Event::Accounting(accounting) = event {
+                prewarm = Some(accounting);
+            }
+        })
+        .await;
+    assert!(prewarm.unwrap().context_budget.is_none());
+
+    store
+        .update(async |credentials| {
+            credentials.providers.insert(
+                "fixture".into(),
+                Credential::ApiKey {
+                    key: crate::auth::api_key("fixture-key").unwrap(),
+                },
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    tokio::time::resume();
+
+    let mut observed = Vec::new();
+    let mut report = |event: Event<'_>| match event {
+        Event::Accounting(accounting) => observed.push(Some(accounting)),
+        Event::CompactionNoop => observed.push(None),
+        _ => {}
+    };
+    session.compact(&mut report).await.unwrap();
+    session.compact(&mut report).await.unwrap();
+
+    let accounting = session.accounting();
+    assert_eq!(
+        accounting.context_budget.map(ContextBudget::window),
+        Some(200_000)
+    );
+    assert_eq!(observed, [Some(accounting), None, None]);
+    assert_eq!(headers.lock().unwrap().len(), 1);
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rejected_window_preference_reports_catalog_budget() {
+    use crate::provider::mock::{Reply, serve_catalog};
+
+    let dir = TempDir::new("rejected-window-accounting");
+    let (provider, _, _, _) = serve_catalog(
+        dir.path(),
+        vec![Reply::text("unused")],
+        json!({"data": [{"id": "m", "context_window": 64_000, "max_context_window": 100_000}]}),
+    )
+    .await;
+    let change = Change::ContextWindow {
+        provider: provider.name().to_owned(),
+        model: "m".into(),
+        tokens: Some(200_000.try_into().unwrap()),
+    };
+    let preferences = Current::default();
+    let mut session = Session::new_ephemeral(
+        Client::new(),
+        Store::new(dir.path().join("auth.json")),
+        Settings {
+            provider,
+            model: "m".into(),
+            reasoning_effort: None,
+        },
+        preferences.clone(),
+        crate::tool::test_support::context(dir.path(), Confinement::Unrestricted, 400_000),
+        "fixture".into(),
+    );
+    assert_eq!(session.accounting().context_budget, None);
+
+    let mut snapshots = Vec::new();
+    let mut report = |event: Event<'_>| {
+        if let Event::Accounting(accounting) = event {
+            snapshots.push(accounting);
+        }
+    };
+    for _ in 0..2 {
+        let error = session.prefer(&change, &mut report).await.unwrap_err();
+        assert_eq!(error, "context window exceeds the maximum of 100000 tokens");
+    }
+    assert_eq!(session.preferences(), preferences);
+    let accounting = session.accounting();
+    assert_eq!(
+        accounting.context_budget.map(ContextBudget::window),
+        Some(64_000)
+    );
+    assert_eq!(snapshots, [accounting]);
+}
+
 fn known_window(provider: &str) -> Current {
     let mut current = Current::default();
     crate::preferences::Change::ContextWindow {
@@ -1739,7 +1922,12 @@ async fn entering_the_jail_keeps_the_configured_mcp_servers() {
 #[tokio::test]
 async fn model_switch_keeps_the_prefix_and_python_state_but_identity_is_live() {
     let dir = TempDir::new("identity-switch");
-    let mut session = session(dir.path());
+    let (provider, _) = crate::provider::mock::serve(
+        dir.path(),
+        vec![crate::provider::mock::Reply::text("unused")],
+    )
+    .await;
+    let mut session = session_on(provider, dir.path());
     let prefix = session.instructions.as_str().to_owned();
     let first = python(&session, "retained = 73; old = whoami(); assert old['model'] == 'm' and old['reasoning_effort'] is None").await;
     assert!(!first.is_error(), "{}", first.text);

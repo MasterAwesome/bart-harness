@@ -140,7 +140,7 @@ pub(super) async fn session(
     id: &str,
     terminations: &mut Terminations,
 ) -> Result<(), String> {
-    session.prewarm().await;
+    session.prewarm(|_: crate::agent::Event<'_>| {}).await;
     let output = Output::default();
     let mut writer = Writer {
         output: output.clone(),

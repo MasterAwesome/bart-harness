@@ -1,11 +1,9 @@
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{num::NonZeroU64, path::Path, time::Duration};
 
 use reqwest::Client;
+use tokio::time::Instant;
 
-use super::Settings;
+use super::{ContextBudget, Settings};
 use crate::{
     auth::Store,
     preferences::{Change, Current},
@@ -99,11 +97,7 @@ impl Routing {
             .map_or(crate::provider::ImageInput::Supported, |model| model.images)
     }
 
-    pub(super) fn compaction_threshold(&self) -> Result<u64, super::Error> {
-        Ok(super::compact::threshold(self.window()?))
-    }
-
-    pub(super) fn window(&self) -> Result<u64, super::Error> {
+    pub(super) fn context_budget(&self) -> Result<ContextBudget, super::Error> {
         let entry = self.cached();
         let preferences = &self.preferences.effective;
         let provider = self.settings.provider.name();
@@ -111,7 +105,8 @@ impl Routing {
         preferences
             .window(provider, model, entry)
             .map_err(super::Error::Context)?
-            .filter(|&tokens| tokens > 0)
+            .and_then(NonZeroU64::new)
+            .map(ContextBudget::new)
             .ok_or_else(|| {
                 let reason = match &self.catalog {
                     Catalog::Failed { reason, .. } => format!("its model list could not be loaded: {reason}"),

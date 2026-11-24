@@ -366,7 +366,7 @@ pub(super) async fn drive(
 ) -> io::Result<()> {
     let mut shutdown = updates.control.signal.subscribe();
     let drive = async {
-        session.prewarm().await;
+        session.prewarm(&mut Reporter::new(&updates)).await;
         drive_session(&mut session, commands, updates, state).await;
     };
     tokio::select! {

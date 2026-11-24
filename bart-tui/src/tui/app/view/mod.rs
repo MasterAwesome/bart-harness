@@ -1,6 +1,6 @@
 use crate::tui::text::clip_end;
-use crate::tui::text::{Item, fit};
-use std::{fmt::Write as _, io};
+use crate::tui::text::{Item, fit, width as text_width};
+use std::io;
 
 use ratatui::{
     Frame,
@@ -13,6 +13,9 @@ use ratatui::{
 use super::{App, MAX_COMPOSER_ROWS, Surface, parse_slash};
 use crate::tui::SPIN;
 use crate::tui::{Screen, brand, theme};
+
+const STATUS_SEPARATOR: &str = " · ";
+const WIDE_STATUS_WIDTH: usize = 100;
 
 #[derive(Clone, Copy)]
 enum HintContext {
@@ -181,25 +184,7 @@ impl App {
 
         let count = self.drafts.steers.len() + self.drafts.queued.len();
         let pending = if pending_rows == 0 { count } else { 0 };
-        let left = self.status_left(running_jobs, usize::from(status.width), pending);
-        let left_width = left.width().min(usize::from(status.width));
-        let right_x =
-            left_width.saturating_add(usize::from(left_width < usize::from(status.width)));
-        let right_width = usize::from(status.width).saturating_sub(right_x);
-        let left_area = Rect {
-            width: left_width as u16,
-            ..status
-        };
-        let right_area = Rect {
-            x: status.x.saturating_add(right_x as u16),
-            width: right_width as u16,
-            ..status
-        };
-        frame.render_widget(Paragraph::new(left), left_area);
-        frame.render_widget(
-            Paragraph::new(self.usage_line(right_width).right_aligned()),
-            right_area,
-        );
+        self.draw_status(frame, status, running_jobs, pending);
         if hint_rows > 0 {
             let hint = match self.status.text() {
                 Some(text) => {
@@ -249,7 +234,49 @@ impl App {
         );
     }
 
-    fn status_left(&self, running_jobs: usize, width: usize, pending: usize) -> Line<'static> {
+    fn draw_status(&self, frame: &mut Frame, area: Rect, running_jobs: usize, pending: usize) {
+        let wide = usize::from(area.width) >= WIDE_STATUS_WIDTH;
+        let prefix = self.usage_prefix(wide);
+        let reserved = joined_status_width(prefix.iter().flatten().map(Span::width));
+        let left = self.status_left(running_jobs, usize::from(area.width), pending, reserved);
+        let left_width = u16::try_from(left.width())
+            .unwrap_or(area.width)
+            .min(area.width);
+        let gap = u16::from(left_width > 0 && left_width < area.width);
+        let right_start = left_width + gap;
+        let right_width = area.width - right_start;
+        frame.render_widget(
+            Paragraph::new(left),
+            Rect {
+                width: left_width,
+                ..area
+            },
+        );
+        let right = if wide {
+            usage_line(
+                prefix.into_iter().flatten().chain(self.usage_details()),
+                usize::from(right_width),
+            )
+        } else {
+            usage_line(prefix.into_iter().flatten(), usize::from(right_width))
+        };
+        frame.render_widget(
+            Paragraph::new(right.right_aligned()),
+            Rect {
+                x: area.x.saturating_add(right_start),
+                width: right_width,
+                ..area
+            },
+        );
+    }
+
+    fn status_left(
+        &self,
+        running_jobs: usize,
+        width: usize,
+        pending: usize,
+        reserved: usize,
+    ) -> Line<'static> {
         let mut items = Vec::new();
         if self.info.recording_stopped {
             items.push(Item {
@@ -279,14 +306,20 @@ impl App {
         } else {
             "ready".into()
         };
-        items.push(Item {
+        let activity = Item {
             full: format!("{marker} {activity}").trim_start().to_owned(),
             short: self
                 .turn
                 .as_ref()
                 .map(|turn| format!("{marker} {}", turn.progress.compact())),
             priority: 80,
-        });
+        };
+        let minimum = joined_status_width(items.iter().map(|item| text_width(&item.full)).chain(
+            std::iter::once(text_width(
+                activity.short.as_deref().unwrap_or(&activity.full),
+            )),
+        ));
+        items.push(activity);
         if running_jobs > 0 {
             items.push(Item {
                 full: if running_jobs == 1 {
@@ -305,7 +338,7 @@ impl App {
                 priority: 60,
             });
         }
-        let left_room = if width >= 40 { width - 20 } else { width };
+        let left_room = width.saturating_sub(reserved + 1).max(minimum.min(width));
         let text = fit(items, left_room);
         Line::from(
             text.split(" · ")
@@ -548,76 +581,142 @@ impl App {
         )
     }
 
-    fn usage_line(&self, room: usize) -> Line<'static> {
-        let usage = fit(
-            self.usage().iter().enumerate().map(|(i, full)| Item {
-                full: full.clone(),
-                short: None,
-                priority: usize::MAX - i,
-            }),
-            room,
-        );
-        match usage.strip_prefix(self.info.confinement.label()) {
-            Some(rest) => Line::from(vec![
-                Span::raw(self.info.confinement.label()).bold(),
-                Span::raw(rest.to_owned()),
-            ]),
-            None => Line::from(usage),
-        }
+    fn usage_prefix(&self, wide: bool) -> [Option<Span<'static>>; 3] {
+        let accounting = &self.info.accounting;
+        let context = (accounting.context_tokens > 0).then(|| {
+            let Some(budget) = accounting.context_budget else {
+                return Span::raw(format!("~{}", compact_tokens(accounting.context_tokens)));
+            };
+            let used = u128::from(accounting.context_tokens) * 100;
+            let threshold = u128::from(budget.compaction_threshold());
+            let style = if used >= threshold * 95 {
+                Style::new().fg(theme().error).bold()
+            } else if used >= threshold * 80 {
+                Style::new().fg(theme().literal).bold()
+            } else if wide {
+                Style::new()
+            } else {
+                Style::new().fg(theme().success)
+            };
+            let label = if wide {
+                format!(
+                    "{}/{}",
+                    compact_tokens(accounting.context_tokens),
+                    compact_tokens(budget.window())
+                )
+            } else {
+                let window = u128::from(budget.window());
+                let percent = (used + window / 2) / window;
+                format!("{percent}%")
+            };
+            Span::styled(label, style)
+        });
+        let usage = &accounting.usage;
+        let cost = usage
+            .cost
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            .map(|cost| Span::raw(format_cost(cost.abs(), usage.cost_is_estimate)));
+        [
+            Some(Span::raw(self.info.confinement.label()).bold()),
+            context,
+            cost,
+        ]
     }
 
-    fn usage(&self) -> Vec<String> {
-        let thousands = |tokens: u64| format!("{}.{:01}k", tokens / 1000, (tokens % 1000) / 100);
-        let mut parts = vec![self.info.confinement.label().to_owned()];
-        let accounting = &self.info.accounting;
-        if accounting.context_tokens > 0 {
-            parts.push(format!("~{} context", thousands(accounting.context_tokens)));
-        }
-        let usage = &accounting.usage;
-        if let Some(last) = usage.last
-            && last.input_tokens > 0
-            && let Some(cached) = last.cache_read_tokens
-        {
-            let percent =
-                u128::from(cached.min(last.input_tokens)) * 100 / u128::from(last.input_tokens);
-            parts.push(format!("{percent}% last cached"));
-        }
-        if let Some(output) = usage.output_tokens {
-            let mut reports = format!("{} out", thousands(output));
-            if let Some(cost) = usage.cost {
-                let _ = write!(
-                    reports,
-                    ", {}${cost:.3}{}",
-                    if usage.cost_is_estimate { "~" } else { "" },
-                    if usage.cost_is_estimate {
-                        " reported"
-                    } else {
-                        ""
-                    }
-                );
-            }
-            parts.push(reports);
-        }
-        for window in self
+    fn usage_details(&self) -> impl Iterator<Item = Span<'static>> + '_ {
+        let usage = &self.info.accounting.usage;
+        let cache = usage.last.and_then(|last| {
+            let cached = u128::from(last.cache_read_tokens?.min(last.input_tokens));
+            let percent = (cached * 100).checked_div(u128::from(last.input_tokens))?;
+            Some(Span::raw(format!("{percent}% cached")))
+        });
+        let output = usage
+            .output_tokens
+            .map(|tokens| Span::raw(format!("{} out", compact_tokens(tokens))));
+        let limits = self
             .info
             .limits
             .iter()
             .flat_map(|limits| [limits.short, limits.long])
             .flatten()
             .filter(|window| window.minutes != Some(0))
-        {
-            let span = match window.minutes {
-                Some(10_080) => "week".to_owned(),
-                Some(minutes) if minutes % 1440 == 0 => format!("{}d", minutes / 1440),
-                Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
-                Some(minutes) => format!("{minutes}m"),
-                None => "limit".to_owned(),
-            };
-            parts.push(format!("{span} {:.0}% used", window.used_percent));
+            .map(|window| {
+                let span = match window.minutes {
+                    Some(10_080) => "week".to_owned(),
+                    Some(minutes) if minutes % 1440 == 0 => format!("{}d", minutes / 1440),
+                    Some(minutes) if minutes % 60 == 0 => format!("{}h", minutes / 60),
+                    Some(minutes) => format!("{minutes}m"),
+                    None => "limit".to_owned(),
+                };
+                Span::raw(format!("{span} {:.0}% used", window.used_percent))
+            });
+        cache.into_iter().chain(output).chain(limits)
+    }
+}
+
+fn joined_status_width(widths: impl Iterator<Item = usize>) -> usize {
+    let separator = text_width(STATUS_SEPARATOR);
+    widths
+        .reduce(|total, width| total + separator + width)
+        .unwrap_or(0)
+}
+
+fn usage_line(items: impl Iterator<Item = Span<'static>>, room: usize) -> Line<'static> {
+    let separator = Span::raw(STATUS_SEPARATOR);
+    let mut spans = Vec::new();
+    let mut remaining = room;
+    for item in items {
+        let gap = if spans.is_empty() {
+            0
+        } else {
+            separator.width()
+        };
+        let Some(rest) = remaining.checked_sub(gap + item.width()) else {
+            break;
+        };
+        remaining = rest;
+        if gap > 0 {
+            spans.push(separator.clone());
         }
-        parts
+        spans.push(item);
+    }
+    Line::from(spans)
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    fn tenths(value: u64, suffix: char) -> String {
+        let whole = value / 10;
+        let tenth = value % 10;
+        if tenth == 0 {
+            format!("{whole}{suffix}")
+        } else {
+            format!("{whole}.{tenth}{suffix}")
+        }
+    }
+
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..10_000 => tenths((tokens + 50) / 100, 'k'),
+        10_000..999_500 => format!("{}k", (tokens + 500) / 1_000),
+        _ => tenths(
+            tokens / 100_000 + u64::from(tokens % 100_000 >= 50_000),
+            'M',
+        ),
+    }
+}
+
+fn format_cost(cost: f64, estimate: bool) -> String {
+    let prefix = if estimate { "~" } else { "" };
+    if cost > 0.0 && cost < 0.0005 {
+        format!("{prefix}<$0.001")
+    } else {
+        let decimals = if cost > 0.0 && cost < 0.01 { 3 } else { 2 };
+        format!("{prefix}${cost:.decimals$}")
     }
 }
 
 mod composer;
 use composer::draw_composer;
+
+#[cfg(test)]
+mod tests;
