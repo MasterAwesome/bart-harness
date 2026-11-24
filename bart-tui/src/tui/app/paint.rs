@@ -43,6 +43,8 @@ impl App {
                     .prepare_tail(self.geometry.size.width, self.animation().tick);
                 self.scrollback
                     .prepare(self.geometry.size.width, &self.transcript);
+                self.scrollback
+                    .prepare_search(&self.transcript, &mut self.status);
             }
         } else {
             self.animation_mut().visible = false;

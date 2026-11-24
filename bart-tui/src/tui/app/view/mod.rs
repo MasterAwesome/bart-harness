@@ -132,20 +132,29 @@ impl App {
         }
         let lead = 2;
         let shown = self.composer_rows(frame.area().width);
+        let find_mode = self.surface.is_none() && self.scrollback.search().in_mode();
+        let transcript_rows = u16::from(find_mode);
         let hint_rows = u16::from(
-            self.turn.is_some()
+            find_mode
+                || self.turn.is_some()
                 || self.status.text().is_some()
                 || usize::from(frame.area().height) >= shown + 6,
         );
-        let top_rows = frame.area().height.min(2);
+        let top_rows = frame
+            .area()
+            .height
+            .saturating_sub(4 * transcript_rows)
+            .min(2);
         let height = frame.area().height - top_rows;
-        self.draw_top_bar(frame);
+        if top_rows > 0 {
+            self.draw_top_bar(frame);
+        }
         let shown = u16::try_from(shown).unwrap_or(1);
-        let decorated = height >= shown.saturating_add(4 + hint_rows);
-        let status_rows = u16::from(height > 1);
-        let hint_rows = hint_rows.min(height.saturating_sub(status_rows + 1));
+        let decorated = height >= shown.saturating_add(4 + hint_rows + transcript_rows);
+        let status_rows = u16::from(height > 1 + 2 * transcript_rows);
+        let hint_rows = hint_rows.min(height.saturating_sub(status_rows + 1 + transcript_rows));
         let draft_rows = shown
-            .min(height.saturating_sub(status_rows + hint_rows))
+            .min(height.saturating_sub(status_rows + hint_rows + transcript_rows))
             .max(u16::from(height > 0));
         let borders = u16::from(decorated) * 2;
         let spacer = u16::from(decorated);
@@ -154,7 +163,7 @@ impl App {
         let pending_rows =
             u16::try_from((self.drafts.steers.len() + self.drafts.queued.len()).min(3))
                 .expect("at most three rows")
-                .min(available);
+                .min(available.saturating_sub(transcript_rows));
         let mut y = frame.area().y + top_rows;
         let [live, _, pending, composer, status, hints] = [
             available - pending_rows,
@@ -186,26 +195,42 @@ impl App {
             lead,
             decorated,
             self.info.name.as_deref(),
+            !find_mode,
         );
 
         let count = self.drafts.steers.len() + self.drafts.queued.len();
         let pending = if pending_rows == 0 { count } else { 0 };
-        self.draw_status(frame, status, running_jobs, pending);
+        if let Some(note) = find_mode.then(|| self.status_hint(status.width)).flatten() {
+            frame.render_widget(note, status);
+        } else {
+            self.draw_status(frame, status, running_jobs, pending);
+        }
         if hint_rows > 0 {
-            let hint = match self.status.text() {
-                Some(text) => {
-                    let text = format!("  {text}");
-                    Line::from(crate::tui::links::clipped(
-                        &text,
-                        clip_end(&text, usize::from(hints.width)),
-                        Style::new().fg(brand()),
-                    ))
-                }
-                None => self.hint_line(usize::from(hints.width), hint_context),
-            };
-            frame.render_widget(Paragraph::new(hint), hints);
+            let find_bar = find_mode
+                .then(|| {
+                    self.scrollback
+                        .search()
+                        .prompt_line(hints.width, "Enter find")
+                        .or_else(|| self.scrollback.search().nav_line(hints.width))
+                })
+                .flatten();
+            let hint = find_bar
+                .or_else(|| self.status_hint(hints.width))
+                .unwrap_or_else(|| self.hint_line(usize::from(hints.width), hint_context));
+            frame.render_widget(hint, hints);
         }
         false
+    }
+
+    fn status_hint(&self, width: u16) -> Option<Line<'static>> {
+        self.status.text().map(|text| {
+            let text = format!("  {text}");
+            Line::from(crate::tui::links::clipped(
+                &text,
+                clip_end(&text, usize::from(width)),
+                Style::new().fg(brand()),
+            ))
+        })
     }
 
     fn draw_top_bar(&self, frame: &mut Frame) {
@@ -381,6 +406,13 @@ impl App {
         } else {
             "Esc interrupt"
         };
+        let main = self.surface.is_none();
+        let empty = self.drafts.composer.is_empty();
+        let slash = if main && empty && self.scrollback.in_history() {
+            "/ search"
+        } else {
+            "/ commands"
+        };
         let units: &[&str] = match context {
             HintContext::Mention => &["Esc dismiss", "Enter/Tab complete"],
             HintContext::SlashMention => &["Esc dismiss", "Enter command", "Tab complete"],
@@ -400,25 +432,30 @@ impl App {
                 if self.turn.is_some() {
                     &[interrupt, "↑ edit pending", "Ctrl+O details"]
                 } else {
-                    &["↑ edit pending", "/ commands", "Ctrl+O details"]
+                    &["↑ edit pending", slash, "Ctrl+O details"]
                 }
             }
             HintContext::Normal if self.turn.is_some() => {
                 &[interrupt, "Enter steer", "Tab queue", "Ctrl+O details"]
             }
             HintContext::Normal => &[
-                "/ commands",
+                slash,
                 "Ctrl+O details",
                 "PgUp/PgDn history",
                 "Ctrl+End latest",
             ],
         };
         Line::from(fit(
-            units.iter().enumerate().map(|(i, full)| Item {
-                full: (*full).to_owned(),
-                short: None,
-                priority: usize::MAX - i,
-            }),
+            units
+                .iter()
+                .copied()
+                .chain(main.then_some("Ctrl+F search"))
+                .enumerate()
+                .map(|(i, full)| Item {
+                    full: full.to_owned(),
+                    short: None,
+                    priority: usize::MAX - i,
+                }),
             width,
         ))
     }
@@ -473,61 +510,58 @@ impl App {
     }
 
     fn draw_live(&mut self, frame: &mut Frame, area: Rect) -> HintContext {
-        let mut lines = Vec::new();
-        let (menu, context) = if matches!(&self.surface, Some(Surface::Approval(answer)) if answer.answer.pending())
+        let find_mode = self.surface.is_none() && self.scrollback.search().in_mode();
+        let (menu, context) = if find_mode
+            || matches!(&self.surface, Some(Surface::Approval(answer)) if answer.answer.pending())
         {
             (Vec::new(), HintContext::Normal)
         } else {
             self.menu_rows()
         };
-        let selecting = !menu.is_empty();
-        let area = if selecting {
-            let menu_height = u16::try_from(menu.len() + 2)
-                .unwrap_or(u16::MAX)
-                .min(area.height)
-                .min(10);
+        let transcript_rows = u16::from(find_mode);
+        let menu_height = u16::try_from(menu.len() + 2)
+            .unwrap_or(u16::MAX)
+            .min(area.height.saturating_sub(transcript_rows))
+            .min(10);
+        let (conversation, menu_area) = if menu.is_empty() || menu_height == 0 {
+            (area, None)
+        } else {
             let [conversation, menu_area] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(menu_height)])
                     .areas(area);
-            self.geometry.conversation = conversation;
-            let history = self
-                .scrollback
-                .view(usize::from(conversation.height), &self.transcript);
-            frame.render_widget(Paragraph::new(history), conversation);
-            lines = Vec::new();
-            let block = ratatui::widgets::Block::bordered()
-                .border_type(ratatui::widgets::BorderType::Rounded)
-                .border_style(Style::new().dim())
-                .padding(ratatui::widgets::Padding::horizontal(1));
-            let inner = block.inner(menu_area);
-            frame.render_widget(block, menu_area);
-            inner
-        } else {
-            area
+            (conversation, Some(menu_area))
         };
+        self.geometry.conversation = conversation;
+        let history = self
+            .scrollback
+            .view(usize::from(conversation.height), &self.transcript);
+        frame.render_widget(Paragraph::new(history), conversation);
+        let Some(menu_area) = menu_area else {
+            return context;
+        };
+        let block = ratatui::widgets::Block::bordered()
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::new().dim())
+            .padding(ratatui::widgets::Padding::horizontal(1));
+        let area = block.inner(menu_area);
+        frame.render_widget(block, menu_area);
         let selected = self.drafts.menu.min(menu.len().saturating_sub(1));
         let first = selected.saturating_sub(usize::from(area.height).saturating_sub(1));
-        for (index, mut row) in menu
+        let lines: Vec<_> = menu
             .into_iter()
             .enumerate()
             .skip(first)
             .take(usize::from(area.height))
-        {
-            let marker = if index == selected {
-                Span::styled("❯ ", Style::new().fg(brand()).bold())
-            } else {
-                Span::raw("  ")
-            };
-            row.insert(0, marker);
-            lines.push(Line::from(row));
-        }
-        let lines = if !selecting {
-            self.geometry.conversation = area;
-            self.scrollback
-                .view(usize::from(area.height), &self.transcript)
-        } else {
-            lines
-        };
+            .map(|(index, mut row)| {
+                let marker = if index == selected {
+                    Span::styled("❯ ", Style::new().fg(brand()).bold())
+                } else {
+                    Span::raw("  ")
+                };
+                row.insert(0, marker);
+                Line::from(row)
+            })
+            .collect();
         let paragraph = Paragraph::new(lines);
         let height = u16::try_from(paragraph.line_count(area.width)).unwrap_or(u16::MAX);
         let scroll = height.saturating_sub(area.height);

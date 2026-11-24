@@ -616,12 +616,17 @@ fn table_search_excludes_matches_wholly_in_a_clipped_cell_suffix() {
     assert_eq!(rows.last().unwrap().line().to_string(), "…");
     assert_eq!(rows[rows.len() - 2].line().to_string(), "Y");
 
-    let (hits, marks) = selection::search(&rows, "suffix");
-    assert_eq!(hits, [] as [usize; 0]);
-    assert!(marks.iter().all(Vec::is_empty));
-    let (hits, marks) = selection::search(&rows, "xys");
-    assert_eq!(hits, [rows.len() - 3]);
-    assert_eq!(marks.iter().filter(|ranges| !ranges.is_empty()).count(), 2);
+    let hits = selection::search(&rows, "suffix");
+    assert!(hits.is_empty());
+    let hits = selection::search(&rows, "xys");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].anchor, rows[rows.len() - 3].anchor);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| !selection::marks(row, &hits, 3).is_empty())
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -639,11 +644,14 @@ fn wide_wrap_separator_keeps_copy_hit_testing_and_search_in_source_order() {
     assert!(a < b);
     assert_eq!(selection::text(&rows, (b, b)).as_deref(), Some("b"));
     assert_eq!(selection::text(&rows, (a, b)).as_deref(), Some(text));
-    let (matches, marks) = selection::search(&rows, text);
-    assert_eq!(matches, [0]);
-    assert_eq!(marks.len(), 2);
-    for mark in &marks {
-        assert_eq!(mark.as_slice(), std::slice::from_ref(&(0..1)));
+    let hits = selection::search(&rows, text);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].anchor, rows[0].anchor);
+    for row in &rows {
+        assert_eq!(
+            selection::marks(row, &hits, text.len()),
+            std::slice::from_ref(&(0..1))
+        );
     }
 }
 

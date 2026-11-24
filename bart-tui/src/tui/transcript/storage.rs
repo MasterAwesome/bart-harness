@@ -46,6 +46,9 @@ impl Transcript {
     pub(in crate::tui) fn ui(&self) -> crate::preferences::Ui {
         self.ui
     }
+    pub(in crate::tui) fn revision(&self) -> u64 {
+        self.revision
+    }
     pub(in crate::tui) fn tail(&self) -> &Arc<[RenderRow]> {
         &self.tail
     }

@@ -71,6 +71,19 @@ impl App {
                 if self.global_key(key) {
                     return;
                 }
+                if self.surface.is_none() {
+                    if key.code == KeyCode::End && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        self.scrollback.follow();
+                        return;
+                    }
+                    if self
+                        .scrollback
+                        .search_key(key, self.drafts.composer.is_empty())
+                    {
+                        self.status.clear();
+                        return;
+                    }
+                }
                 if key.code == KeyCode::Esc
                     && self
                         .turn
@@ -108,10 +121,6 @@ impl App {
                             self.scrollback.scroll(true);
                             return;
                         }
-                        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            self.scrollback.follow();
-                            return;
-                        }
                         _ => {}
                     }
                     self.scrollback.clear_selection();
@@ -128,6 +137,13 @@ impl App {
                 if let Some(Surface::Viewer(viewer, _)) = &mut self.surface {
                     if let Err(reason) = viewer.paste(&text) {
                         self.set_status(StatusKind::Info, reason);
+                    }
+                } else if self.surface.is_none() && self.scrollback.search().in_mode() {
+                    if self.scrollback.search().prompting() {
+                        match self.scrollback.search_paste(&text) {
+                            Ok(()) => self.status.clear(),
+                            Err(reason) => self.set_status(StatusKind::Info, reason),
+                        }
                     }
                 } else {
                     self.paste_visible(&text);
@@ -176,10 +192,14 @@ impl App {
                 } else if self.turn.is_some() {
                     self.interrupt(false);
                 } else if self.surface.is_none() {
-                    self.cancel_task(Kind::Image);
-                    self.drafts.composer.clear();
-                    self.drafts.images.clear();
-                    self.drafts.browsing = None;
+                    if self.scrollback.search().in_mode() {
+                        self.scrollback.clear_search();
+                    } else {
+                        self.cancel_task(Kind::Image);
+                        self.drafts.composer.clear();
+                        self.drafts.images.clear();
+                        self.drafts.browsing = None;
+                    }
                 }
                 self.set_status(StatusKind::Info, "press ctrl+c again to quit");
             }
@@ -443,11 +463,13 @@ impl App {
             }
             Event::Mouse(mouse) if self.surface.is_none() => {
                 use crossterm::event::{MouseButton, MouseEventKind};
+                let painted = self.geometry.resized_at.is_none() && self.conversation_painted();
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.drafts.composer.clear_selection();
                         self.scrollback.clear_selection();
-                        if self.drafts.composer.contains(mouse.column, mouse.row) {
+                        if painted && self.drafts.composer.contains(mouse.column, mouse.row) {
+                            self.scrollback.clear_search();
                             self.drafts.composer.select(mouse.column, mouse.row, false);
                             return;
                         }
@@ -468,7 +490,6 @@ impl App {
                 let area = self.geometry.conversation;
                 let row = usize::from(mouse.row.saturating_sub(area.y));
                 let column = usize::from(mouse.column.saturating_sub(area.x));
-                let painted = self.geometry.resized_at.is_none() && self.conversation_painted();
                 let hit = area.contains((mouse.column, mouse.row).into()) && painted;
                 let clickable = mouse.modifiers.is_empty() && painted;
                 match mouse.kind {
@@ -545,7 +566,10 @@ impl App {
                 self.send_command(Command::Compact);
                 self.turn = Some(Turn::new());
             }
-            Slash::Rewind => self.send_command(Command::Messages),
+            Slash::Rewind => {
+                self.scrollback.clear_search();
+                self.send_command(Command::Messages);
+            }
             Slash::New => self.open(self.info.settings.clone(), OpenFrom::New),
             Slash::Resume | Slash::Delete => {
                 self.start_task(Task::Sessions(

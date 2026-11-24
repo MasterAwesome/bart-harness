@@ -129,7 +129,7 @@ impl App {
         }
         session.interactive();
         self.info.accounting = session.accounting();
-        self.transcript = transcript;
+        self.replace_transcript(transcript);
         self.info.preferences = session.preferences();
         self.session = Some(SessionView {
             id: id.clone(),

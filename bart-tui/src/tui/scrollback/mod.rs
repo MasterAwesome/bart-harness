@@ -1,10 +1,32 @@
 use super::{
     markdown::{RenderRow, selectable},
+    search::{self, PromptKey, Search},
     selection::{self, Anchor, Point, Row},
+    status::Status,
     transcript::{DetailSequence, Transcript},
 };
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{style::Modifier, text::Line};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, num::NonZeroIsize, sync::Arc};
+
+#[derive(PartialEq, Eq)]
+struct IndexKey {
+    width: u16,
+    ui: crate::preferences::Ui,
+    first: u64,
+}
+
+struct SearchIndex {
+    key: IndexKey,
+    next: u64,
+    revision: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingScroll {
+    origin: Option<Anchor>,
+    delta: NonZeroIsize,
+}
 
 #[derive(Default)]
 pub(super) struct Scrollback {
@@ -15,17 +37,173 @@ pub(super) struct Scrollback {
     ui: crate::preferences::Ui,
     tail: Arc<[RenderRow]>,
     anchor: Option<Anchor>,
-    pending: isize,
+    painted_origin: Option<Anchor>,
+    pending: Option<PendingScroll>,
     height: usize,
     shown: Vec<Row>,
     selection: Option<(Point, Point, bool)>,
     pressed_detail: Option<DetailSequence>,
     hovered_row: Option<usize>,
+    search: Search,
+    index: Option<SearchIndex>,
+    seek: bool,
 }
 
 impl Scrollback {
     pub(super) fn in_history(&self) -> bool {
-        self.anchor.is_some()
+        self.anchor.is_some() || (self.pending.is_some() && !self.shown.is_empty())
+    }
+
+    pub(super) fn search(&self) -> &Search {
+        &self.search
+    }
+
+    pub(super) fn clear_search(&mut self) {
+        self.search.clear();
+        self.index = None;
+        self.seek = false;
+    }
+
+    pub(super) fn search_key(&mut self, key: KeyEvent, composer_empty: bool) -> bool {
+        if self.search.in_mode() {
+            if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                return false;
+            }
+            match self.search.prompt_key(key) {
+                PromptKey::Submitted => {
+                    if self.search.active() {
+                        self.pending = None;
+                    } else {
+                        self.index = None;
+                        self.seek = false;
+                    }
+                }
+                PromptKey::Consumed => {
+                    if !self.search.active() {
+                        self.index = None;
+                    }
+                }
+                PromptKey::Unhandled => {
+                    let reopen = (key.code == KeyCode::Char('f')
+                        && key.modifiers == KeyModifiers::CONTROL)
+                        || (key.code == KeyCode::Char('/') && key.modifiers.is_empty());
+                    if reopen {
+                        self.clear_search();
+                        self.search.open();
+                    } else if self.search.clear_key(key) {
+                        self.index = None;
+                        self.seek = false;
+                    } else if let Some(delta) = match (key.code, key.modifiers) {
+                        (KeyCode::Char('n') | KeyCode::Enter | KeyCode::Down, m)
+                            if m.is_empty() =>
+                        {
+                            Some(1)
+                        }
+                        (KeyCode::Char('N'), m) if m.difference(KeyModifiers::SHIFT).is_empty() => {
+                            Some(-1)
+                        }
+                        (KeyCode::Enter, m) if m == KeyModifiers::SHIFT => Some(-1),
+                        (KeyCode::Up, m) if m.is_empty() => Some(-1),
+                        _ => None,
+                    } && self.search.step_by(delta)
+                    {
+                        self.pending = None;
+                    }
+                }
+            }
+            self.cancel_click();
+            self.clear_hover();
+            return true;
+        }
+        let open = (key.code == KeyCode::Char('f') && key.modifiers == KeyModifiers::CONTROL)
+            || (key.code == KeyCode::Char('/')
+                && key.modifiers.is_empty()
+                && composer_empty
+                && self.in_history());
+        if open {
+            self.clear_search();
+            self.search.open();
+            self.cancel_click();
+            self.clear_hover();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn search_paste(&mut self, text: &str) -> Result<(), &'static str> {
+        self.search.paste(text)
+    }
+
+    pub(super) fn prepare_search(&mut self, transcript: &Transcript, status: &mut Status) {
+        if !self.search.active() {
+            return;
+        }
+        let key = IndexKey {
+            width: self.width,
+            ui: self.ui,
+            first: self.first,
+        };
+        let revision = transcript.revision();
+        let reusable = self
+            .index
+            .as_ref()
+            .filter(|index| self.search.indexed() && index.key == key && index.next <= self.next);
+        if !reusable.is_some_and(|index| index.next == self.next && index.revision == revision) {
+            self.index_search(transcript, reusable.map(|index| index.next));
+            self.index = Some(SearchIndex {
+                key,
+                next: self.next,
+                revision,
+            });
+        }
+        self.seek |= self.search.take_seek(status).is_some();
+    }
+
+    fn index_search(&mut self, transcript: &Transcript, scan_from: Option<u64>) {
+        let query = self.search.lower();
+        let previous = self.search.target().filter(|_| !self.search.prompting());
+        let keep = scan_from.map_or(0, |from| {
+            self.search
+                .matches()
+                .partition_point(|hit| hit.anchor.0 < from)
+        });
+        let blocks = transcript.blocks();
+        let start = scan_from.map_or(0, |from| blocks.partition_point(|entry| entry.id < from));
+        let mut hits = Vec::new();
+        for entry in blocks.iter().skip(start) {
+            let rows = selectable(&entry.block.rows(self.width, self.ui), entry.id, self.width);
+            hits.extend(selection::search(&rows, query));
+        }
+        hits.extend(selection::search(
+            &selectable(transcript.tail(), self.next, self.width),
+            query,
+        ));
+        let anchor = self.anchor;
+        let reflow = self
+            .index
+            .as_ref()
+            .is_some_and(|index| index.key.width != self.width || index.key.ui != self.ui);
+        self.seek |=
+            reflow && anchor.is_some() && previous.is_some_and(|hit| self.shows(hit.anchor));
+        self.search.update_matches(keep, hits, |hits| {
+            previous
+                .and_then(|hit| {
+                    hits.binary_search_by_key(&hit.start(), |hit| hit.start())
+                        .ok()
+                })
+                .or_else(|| {
+                    let top = anchor?;
+                    hits.iter().position(|hit| hit.anchor >= top)
+                })
+                .or_else(|| hits.len().checked_sub(1))
+        });
+    }
+
+    fn shows(&self, anchor: Anchor) -> bool {
+        self.shown
+            .binary_search_by_key(&anchor, |row| row.anchor)
+            .is_ok()
     }
 
     fn cancel_layout_selection(&mut self, transcript: &Transcript) {
@@ -57,7 +235,7 @@ impl Scrollback {
     fn revalidate_selection(&mut self, width: u16, transcript: &Transcript) {
         if let Some((a, b, moved)) = self.selection
             && a.0.max(b.0) == self.next
-            && (self.next != transcript.next() || self.tail.as_ref() != transcript.tail().as_ref())
+            && (self.next != transcript.next() || !Arc::ptr_eq(&self.tail, transcript.tail()))
         {
             self.selection = self
                 .rebase_tail(a, b, width, transcript)
@@ -142,10 +320,16 @@ impl Scrollback {
         Some((translate(a)?, translate(b)?))
     }
     pub(super) fn protected(&self) -> Option<(u64, u64)> {
-        self.anchor?;
+        if !self.in_history() {
+            return None;
+        }
         Some((self.shown.first()?.anchor.0, self.shown.last()?.anchor.0))
     }
     pub(super) fn evicted(&mut self, ids: &[u64]) {
+        if !ids.is_empty() {
+            self.index = None;
+            self.seek = false;
+        }
         for id in ids {
             self.heights.remove(id);
         }
@@ -216,41 +400,80 @@ impl Scrollback {
             }
         }
     }
+    fn locate(&mut self, anchor: Anchor, transcript: &Transcript, tail: &[Row]) -> (usize, usize) {
+        let block = transcript
+            .blocks()
+            .partition_point(|entry| entry.id < anchor.0);
+        let rows = if block == transcript.blocks().len() {
+            tail
+        } else {
+            &self.rows(block, transcript)
+        };
+        let row = rows
+            .partition_point(|row| row.anchor <= anchor)
+            .saturating_sub(1);
+        (block, row)
+    }
+
     pub(super) fn view(&mut self, height: usize, transcript: &Transcript) -> Vec<Line<'_>> {
-        if self.height != height {
+        let resized = self.height != height;
+        if resized {
             self.hovered_row = None;
         }
         self.height = height;
-        self.shown.clear();
         if height == 0 {
+            self.painted_origin = None;
+            self.shown.clear();
             return Vec::new();
         }
+        let page = isize::try_from(height).expect("terminal height fits in isize");
+        let seek = std::mem::take(&mut self.seek);
+        let target = self
+            .search
+            .target()
+            .filter(|hit| {
+                seek || (resized
+                    && !self.search.prompting()
+                    && self.anchor.is_some()
+                    && self.shows(hit.anchor))
+            })
+            .map(|hit| hit.anchor);
+        self.shown.clear();
         let last = transcript.blocks().len();
         let mut tail = self.rows(last, transcript);
         let tail_height = tail.len();
-        let (mut block, mut row) = if let Some(anchor @ (id, ..)) = self.anchor {
-            let block = transcript.blocks().partition_point(|entry| entry.id < id);
-            if block == last && tail_height == 0 {
+        let pending = self.pending.take();
+        let origin = pending.and_then(|scroll| scroll.origin).or(self.anchor);
+        let (mut block, mut row) = if let Some(target) = target {
+            let (block, row) = self.locate(target, transcript, &tail);
+            let context = (page - 1).min(2);
+            let start = self.move_rows(block, row, -context, transcript, tail_height);
+            let bottom = self.move_rows(last, tail_height, -page, transcript, tail_height);
+            if start >= bottom {
                 self.anchor = None;
-                self.move_rows(last, 0, -(height as isize), transcript, tail_height)
+                bottom
             } else {
-                let rows = if block == last {
+                let rows = if start.0 == last {
                     &tail
                 } else {
-                    &self.rows(block, transcript)
+                    &self.rows(start.0, transcript)
                 };
-                let row = rows
-                    .partition_point(|row| row.anchor <= anchor)
-                    .saturating_sub(1);
-                (block, row)
+                self.anchor = rows.get(start.1).map(|row| row.anchor);
+                start
+            }
+        } else if let Some(anchor) = origin {
+            let start = self.locate(anchor, transcript, &tail);
+            if start.0 == last && tail_height == 0 {
+                self.anchor = None;
+                self.move_rows(last, 0, -page, transcript, tail_height)
+            } else {
+                start
             }
         } else {
-            let end = tail_height;
-            self.move_rows(last, end, -(height as isize), transcript, tail_height)
+            self.move_rows(last, tail_height, -page, transcript, tail_height)
         };
-        let pending = std::mem::take(&mut self.pending);
-        if pending != 0 {
-            (block, row) = self.move_rows(block, row, pending, transcript, tail_height);
+        if let Some(scroll) = pending {
+            (block, row) = self.move_rows(block, row, scroll.delta.get(), transcript, tail_height);
             let rows = if block == last {
                 &tail
             } else {
@@ -258,14 +481,12 @@ impl Scrollback {
             };
             self.anchor = rows.get(row).map(|row| row.anchor);
         }
-        if self.anchor.is_some() && pending > 0 {
-            let (end_block, end_row) =
-                self.move_rows(block, row, height as isize, transcript, tail_height);
+        if self.anchor.is_some() && pending.is_some_and(|scroll| scroll.delta.get() > 0) {
+            let (end_block, end_row) = self.move_rows(block, row, page, transcript, tail_height);
             if end_block == last && end_row >= tail_height.saturating_sub(1) {
                 self.anchor = None;
                 let end = tail_height;
-                (block, row) =
-                    self.move_rows(last, end, -(height as isize), transcript, tail_height);
+                (block, row) = self.move_rows(last, end, -page, transcript, tail_height);
             }
         }
         let capacity = height;
@@ -280,11 +501,11 @@ impl Scrollback {
             block += 1;
             row = 0;
         }
+        self.painted_origin = self.shown.first().map(|row| row.anchor);
         if self.first > 0
-            && self
-                .shown
-                .first()
-                .is_some_and(|row| row.anchor == (self.first, 0, 0))
+            && self.shown.first().is_some_and(|row| {
+                row.anchor == (self.first, 0, 0) && self.search.marks(row).is_empty()
+            })
         {
             const OMITTED: &str = "… older display rows omitted";
             self.shown[0] = Row::chrome(self.shown[0].anchor, Line::from(OMITTED));
@@ -299,19 +520,16 @@ impl Scrollback {
         let mut lines: Vec<_> = self
             .shown
             .iter()
-            .map(|row| match selection {
-                Some(range) => selection::highlight(row, range),
-                None => {
-                    let mut line = selection::borrowed(row.line());
-                    if hovered.is_some() && row.detail() == hovered {
-                        for span in &mut line.spans {
-                            if !span.content.trim().is_empty() {
-                                span.style = span.style.add_modifier(Modifier::UNDERLINED);
-                            }
+            .map(|row| {
+                let mut line = search::paint(row, selection, Some(&self.search));
+                if hovered.is_some() && row.detail() == hovered {
+                    for span in &mut line.spans {
+                        if !span.content.trim().is_empty() {
+                            span.style = span.style.add_modifier(Modifier::UNDERLINED);
                         }
                     }
-                    line
                 }
+                line
             })
             .collect();
         for line in &mut lines {
@@ -331,22 +549,32 @@ impl Scrollback {
     fn scroll_by(&mut self, down: bool, rows: usize) {
         self.cancel_click();
         self.hovered_row = None;
-        if self.anchor.is_none()
-            && let Some(row) = self.shown.first()
+        if down
+            && self.anchor.is_none()
+            && self.pending.is_none()
+            && !self.search.has_pending_seek()
+            && !self.seek
         {
-            self.anchor = Some(row.anchor);
+            return;
         }
-        self.pending += if down {
-            rows as isize
-        } else {
-            -(rows as isize)
-        };
+        let rows = isize::try_from(rows).expect("terminal height fits in isize");
+        let delta = if down { rows } else { -rows };
+        let (origin, previous) = self
+            .pending
+            .map_or((self.painted_origin.or(self.anchor), 0), |scroll| {
+                (scroll.origin, scroll.delta.get())
+            });
+        self.pending = NonZeroIsize::new(previous.saturating_add(delta))
+            .map(|delta| PendingScroll { origin, delta });
     }
     pub(super) fn follow(&mut self) {
         self.cancel_click();
         self.hovered_row = None;
         self.anchor = None;
-        self.pending = 0;
+        self.pending = None;
+        self.painted_origin = None;
+        self.search.cancel_seek();
+        self.seek = false;
     }
     pub(super) fn hover(&mut self, row: Option<usize>) {
         self.hovered_row = if self.selected_range().is_some() {
@@ -469,6 +697,154 @@ mod tests {
                     .map(|byte| (row, super::super::text::width(&line[..byte])))
             })
             .expect(needle)
+    }
+
+    fn find(scrollback: &mut Scrollback, query: &str) {
+        assert!(scrollback.search_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            true
+        ));
+        scrollback.search_paste(query).unwrap();
+        assert!(scrollback.search_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), true));
+    }
+
+    fn collect_marks(lines: &[Line<'_>]) -> String {
+        use ratatui::style::Modifier;
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter(|span| {
+                span.style
+                    .add_modifier
+                    .contains(Modifier::BOLD | Modifier::REVERSED)
+            })
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn search_paints_the_visible_end_of_a_match_across_a_prose_wrap() {
+        let mut transcript = Transcript::default();
+        let message = transcript.user("alpha beta gamma", &[], false);
+        let later = transcript.user("later", &[], false);
+        transcript.append([message, later], None);
+        let mut scrollback = Scrollback::default();
+        let mut status = Status::default();
+        scrollback.prepare(10, &transcript);
+        find(&mut scrollback, "alpha beta");
+        scrollback.prepare_search(&transcript, &mut status);
+        let lines = scrollback.view(2, &transcript);
+        assert_eq!(collect_marks(&lines[..1]).trim(), "alpha");
+        assert_eq!(collect_marks(&lines[1..]).trim(), "beta");
+        scrollback.scroll_line(true);
+        assert_eq!(collect_marks(&scrollback.view(2, &transcript)), "beta");
+    }
+
+    #[test]
+    fn search_keeps_a_wrapped_table_cell_in_view_after_resize() {
+        use crate::tui::session::UiEvent;
+        let mut transcript = Transcript::default();
+        let blocks = transcript.apply(
+            UiEvent::Text("| Name | Data |\n| --- | ---: |\n| x | abcdefg   hij klm |".into()),
+            23,
+        );
+        transcript.append(blocks, None);
+        let blocks = transcript.end(None, 23);
+        transcript.append(blocks, None);
+        for _ in 0..40 {
+            let block = transcript.user("filler", &[], false);
+            transcript.append([block], None);
+        }
+        let mut scrollback = Scrollback::default();
+        let mut status = Status::default();
+        scrollback.prepare(23, &transcript);
+        find(&mut scrollback, "g   hij");
+        scrollback.prepare_search(&transcript, &mut status);
+        assert_eq!(
+            scrollback.search.step_hint().as_deref(),
+            Some("n/N find [1/1]")
+        );
+        let lines = scrollback.view(12, &transcript);
+        assert_eq!(collect_marks(&lines).replace(' ', ""), "ghij");
+        scrollback.prepare(11, &transcript);
+        scrollback.prepare_search(&transcript, &mut status);
+        let lines = scrollback.view(7, &transcript);
+        assert!(lines.iter().any(|line| line.to_string().contains("Data:")));
+        assert_eq!(collect_marks(&lines).replace(' ', ""), "ghij");
+        for chrome in ["─", "╌", "Data:", "▌"] {
+            find(&mut scrollback, chrome);
+            scrollback.prepare_search(&transcript, &mut status);
+            assert_eq!(status.text(), Some("No matches"));
+        }
+    }
+
+    #[test]
+    fn search_updates_for_live_tail_and_eviction() {
+        use crate::tui::session::UiEvent;
+        let mut transcript = Transcript::default();
+        let block = transcript.user("alpha needle", &[], false);
+        transcript.append([block], None);
+        let mut scrollback = Scrollback::default();
+        let mut status = Status::default();
+        let width = 20;
+        let paint =
+            |scrollback: &mut Scrollback, transcript: &mut Transcript, status: &mut Status| {
+                transcript.prepare_tail(width, 0);
+                scrollback.prepare(width, transcript);
+                scrollback.prepare_search(transcript, status);
+                collect_marks(&scrollback.view(12, transcript))
+            };
+        find(&mut scrollback, "needle");
+        assert_eq!(
+            paint(&mut scrollback, &mut transcript, &mut status),
+            "needle"
+        );
+        let blocks = transcript.apply(UiEvent::Text("live nee".into()), width);
+        transcript.append(blocks, None);
+        assert_eq!(
+            paint(&mut scrollback, &mut transcript, &mut status),
+            "needle"
+        );
+        let blocks = transcript.apply(UiEvent::Text("dle".into()), width);
+        transcript.append(blocks, None);
+        assert_eq!(
+            paint(&mut scrollback, &mut transcript, &mut status),
+            "needleneedle"
+        );
+        assert_eq!(
+            scrollback.search.step_hint().as_deref(),
+            Some("n/N find [1/2]")
+        );
+        let blocks = transcript.end(None, width);
+        transcript.append(blocks, None);
+        assert_eq!(
+            paint(&mut scrollback, &mut transcript, &mut status),
+            "needleneedle"
+        );
+        let block = transcript.user("new needle", &[], false);
+        transcript.append([block], None);
+        assert_eq!(
+            paint(&mut scrollback, &mut transcript, &mut status),
+            "needleneedleneedle"
+        );
+        assert_eq!(
+            scrollback.search.step_hint().as_deref(),
+            Some("n/N find [1/3]")
+        );
+        let large = "filler\n".repeat(500);
+        assert!((0..80).any(|_| {
+            let block = transcript.user(&large, &[], false);
+            let removed = transcript.append([block], None);
+            scrollback.evicted(&removed);
+            transcript.first() >= 3
+        }));
+        scrollback.follow();
+        assert_eq!(paint(&mut scrollback, &mut transcript, &mut status), "");
+        assert!(scrollback.search.step_hint().is_none());
+        assert!(scrollback.search_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), true));
+        assert!(scrollback.search.in_mode());
+        assert!(scrollback.search_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), true));
+        assert!(!scrollback.search.in_mode());
     }
 
     #[test]

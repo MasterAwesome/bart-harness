@@ -1,7 +1,8 @@
 use super::{
     brand,
+    search::{self, PromptKey, Search},
     selection::{self, Anchor, Point, Row, point_at},
-    status::{Kind, Status},
+    status::Status,
     text::{self, Clean, Item},
     transcript::{Detail, DetailSequence, Highlight},
     widgets::confirm::FrameStamp,
@@ -18,7 +19,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::Paragraph,
 };
-use std::{borrow::Cow, ops::Range};
+use std::borrow::Cow;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Selection {
@@ -46,18 +47,6 @@ impl Drag {
     fn range(self) -> (Point, Point) {
         (self.start.min(self.end), self.start.max(self.end))
     }
-}
-const MAX_SEARCH_BYTES: usize = 1024;
-#[derive(Default)]
-struct Search {
-    prompt: bool,
-    query: String,
-    selected: usize,
-    seek: bool,
-    matches: Vec<usize>,
-    marks: Vec<Vec<Range<usize>>>,
-    output_source: Option<u64>,
-    output_key: Option<(Selection, u16, u64)>,
 }
 struct Pane {
     scroll: usize,
@@ -122,7 +111,7 @@ impl Pane {
         heading: &str,
         focused: bool,
         range: Option<(Point, Point)>,
-        marks: &[Vec<Range<usize>>],
+        search: Option<&Search>,
     ) {
         for (index, row) in self
             .lines
@@ -131,16 +120,8 @@ impl Pane {
             .take(usize::from(self.area.height))
             .enumerate()
         {
-            let line = if let Some(range) = range {
-                selection::highlight(row, range)
-            } else {
-                selection::borrowed(row.line())
-            };
             frame.render_widget(
-                match marks.get(self.scroll + index) {
-                    Some(ranges) if !ranges.is_empty() => highlighted(&line, ranges),
-                    _ => selection::borrowed(&line),
-                },
+                search::paint(row, range, search),
                 Rect::new(self.area.x, self.area.y + index as u16, self.area.width, 1),
             );
         }
@@ -153,6 +134,8 @@ pub(super) struct Viewer {
     output: Pane,
     focus: Focus,
     search: Search,
+    output_source: Option<u64>,
+    output_key: Option<(Selection, u16, u64)>,
     drag: Option<Drag>,
     size: Size,
     heading: Line<'static>,
@@ -192,6 +175,8 @@ impl Viewer {
             output: Pane::new(!is_ui_notice(selected, details)),
             focus: Focus::Output,
             search: Search::default(),
+            output_source: None,
+            output_key: None,
 
             drag: None,
             size: Size::default(),
@@ -245,7 +230,9 @@ impl Viewer {
         self.code = Pane::new(false);
         self.code_key = None;
         self.output = Pane::new(!is_ui_notice(selection, details));
-        self.search = Search::default();
+        self.search.clear();
+        self.output_key = None;
+        self.output_source = None;
         self.focus = Focus::Output;
     }
 
@@ -253,17 +240,10 @@ impl Viewer {
         self.painted = stamp;
     }
     pub(super) fn paste(&mut self, text: &str) -> Result<(), &'static str> {
-        if !self.search.prompt {
+        if !self.search.prompting() {
             return Err("paste refused: viewer is not editable");
         }
-        if !super::paste::accepts(text, self.search.query.len(), MAX_SEARCH_BYTES) {
-            return Err("paste refused: search requires one line within 1024 bytes");
-        }
-        self.search.query.push_str(text);
-        self.search.output_key = None;
-        self.search.matches.clear();
-        self.search.selected = 0;
-        Ok(())
+        self.search.paste(text)
     }
 
     pub(super) fn key(
@@ -274,71 +254,32 @@ impl Viewer {
         status: &mut Status,
     ) -> Option<Action> {
         status.clear();
-        if self.search.prompt {
-            match key.code {
-                KeyCode::Esc => self.search = Search::default(),
-                KeyCode::Enter => {
-                    self.search.prompt = false;
-                    self.search.seek = true;
-                    self.focus = Focus::Output;
-                }
-                KeyCode::Backspace => {
-                    self.search.query.pop();
-                    self.search.output_key = None;
-                    self.search.matches.clear();
-                    self.search.selected = 0;
-                }
-                KeyCode::Char(c)
-                    if key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
-                        && !crate::terminal_text::unsafe_character(c)
-                        && self.search.query.len() + c.len_utf8() <= MAX_SEARCH_BYTES =>
-                {
-                    self.search.query.push(c);
-                    self.search.output_key = None;
-                    self.search.matches.clear();
-                    self.search.selected = 0;
-                }
-                _ => {}
+        match self.search.prompt_key(key) {
+            PromptKey::Submitted => {
+                self.focus = Focus::Output;
+                return None;
             }
-            return None;
+            PromptKey::Consumed => return None,
+            PromptKey::Unhandled => {}
         }
 
         let pane = match self.focus {
             Focus::Code => &mut self.code,
             Focus::Output => &mut self.output,
         };
-        if pane.key(key) {
+        if pane.key(key) || self.search.clear_key(key) {
+            return None;
+        }
+        if self.search.step(key) {
+            self.focus = Focus::Output;
             return None;
         }
         match key.code {
-            KeyCode::Esc => {
-                if !self.search.query.is_empty() {
-                    self.search = Search::default();
-                    return None;
-                }
-                return Some(Action::Close);
-            }
-            KeyCode::Char('q') => return Some(Action::Close),
+            KeyCode::Esc | KeyCode::Char('q') => return Some(Action::Close),
             KeyCode::Char('/') if key.modifiers.is_empty() => {
                 self.focus = Focus::Output;
-                self.search = Search {
-                    prompt: true,
-                    ..Search::default()
-                };
-            }
-            KeyCode::Char(direction @ ('n' | 'N'))
-                if !self.search.matches.is_empty()
-                    && key.modifiers.difference(KeyModifiers::SHIFT).is_empty()
-                    && (direction == 'N' || key.modifiers.is_empty()) =>
-            {
-                let count = self.search.matches.len();
-                self.search.selected = if direction == 'N' {
-                    self.search.selected.checked_sub(1).unwrap_or(count - 1)
-                } else {
-                    (self.search.selected + 1) % count
-                };
-                self.search.seek = true;
-                self.focus = Focus::Output;
+                self.search.open();
+                self.output_key = None;
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 if !self.has_code {
@@ -408,7 +349,7 @@ impl Viewer {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.drag = None;
                 self.focus = hit?;
-                self.search.prompt = false;
+                self.search.dismiss_prompt();
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.focus = self.drag?.focus;
@@ -487,8 +428,8 @@ impl Viewer {
         live: &Live,
         status: &mut Status,
     ) {
-        if self.size.width != size.width && !self.search.prompt && !self.search.query.is_empty() {
-            self.search.seek = true;
+        if self.size.width != size.width && !self.search.prompting() {
+            self.search.request_seek();
         }
         self.size = size;
         let entries = selections(details, live);
@@ -502,6 +443,18 @@ impl Viewer {
             return;
         };
         self.empty = false;
+        let code_excerpt = self.prepare_code(size, &content);
+        self.prepare_output(size, &content);
+        self.layout_panes(size);
+        if let Some(hit) = self.search.take_seek(status) {
+            self.output.anchor = Some(hit.anchor);
+        }
+        self.code.place();
+        self.output.place();
+        self.prepare_headings(size, &entries, &content, code_excerpt);
+    }
+
+    fn prepare_code(&mut self, size: Size, content: &Content<'_>) -> bool {
         self.has_code = !content.markdown && !content.code.is_empty();
         if !self.has_code {
             self.focus = Focus::Output;
@@ -547,7 +500,11 @@ impl Viewer {
                 Vec::new()
             };
         }
-        let query = self.search.query.to_ascii_lowercase();
+        code_excerpt
+    }
+
+    fn prepare_output(&mut self, size: Size, content: &Content<'_>) {
+        let query = self.search.lower();
         let (source_hash, output_hash) = {
             use std::hash::{Hash as _, Hasher as _};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -562,16 +519,13 @@ impl Viewer {
             (source_hash, hasher.finish())
         };
         let key = (self.selected, size.width, output_hash);
-        if self.search.output_key != Some(key) {
+        if self.output_key != Some(key) {
             let output = if content.markdown {
                 super::markdown::render_detail(&content.output, size.width)
             } else {
-                output_rows(&content, size.width)
+                output_rows(content, size.width)
             };
-            if self
-                .search
-                .output_source
-                .is_some_and(|hash| hash != source_hash)
+            if self.output_source.is_some_and(|hash| hash != source_hash)
                 && let Some(drag) = self.drag.filter(|drag| drag.focus == Focus::Output)
                 && !selection::unchanged(
                     &self.output.lines,
@@ -582,14 +536,15 @@ impl Viewer {
             {
                 self.drag = None;
             }
-            self.search.output_key = Some(key);
-            self.search.output_source = Some(source_hash);
-            (self.search.matches, self.search.marks) = selection::search(&output, &query);
+            self.output_key = Some(key);
+            self.output_source = Some(source_hash);
+            let hits = selection::search(&output, query);
+            self.search.update_matches(0, hits, |_| None);
             self.output.lines = output;
         }
-        if self.search.selected >= self.search.matches.len() {
-            self.search.selected = 0;
-        }
+    }
+
+    fn layout_panes(&mut self, size: Size) {
         let compact = size.height < 8;
         let inner = Rect::new(0, 1, size.width, size.height.saturating_sub(2));
         self.code.area = Rect::default();
@@ -627,19 +582,15 @@ impl Viewer {
             ])
             .areas(inner);
         }
-        if std::mem::take(&mut self.search.seek) {
-            if let Some(&row) = self.search.matches.get(self.search.selected) {
-                self.output.anchor = Some(self.output.lines[row].anchor);
-            } else if !query.is_empty() {
-                status.set(
-                    Kind::Info,
-                    Clean::literal("No matches"),
-                    Some(std::time::Duration::from_secs(3)),
-                );
-            }
-        }
-        self.code.place();
-        self.output.place();
+    }
+
+    fn prepare_headings(
+        &mut self,
+        size: Size,
+        entries: &[Selection],
+        content: &Content<'_>,
+        code_excerpt: bool,
+    ) {
         let index = entries
             .iter()
             .position(|entry| *entry == self.selected)
@@ -715,20 +666,20 @@ impl Viewer {
                 selection::borrowed(&self.heading)
             };
             frame.render_widget(heading, Rect::new(0, 0, body.width, 1));
-            for (focus, pane, heading, marks) in [
-                (Focus::Code, &self.code, "CODE", &[][..]),
+            for (focus, pane, heading, search) in [
+                (Focus::Code, &self.code, "CODE", None),
                 (
                     Focus::Output,
                     &self.output,
                     &self.output_heading,
-                    self.search.marks.as_slice(),
+                    Some(&self.search),
                 ),
             ] {
                 let range = self
                     .drag
                     .filter(|drag| drag.focus == focus && drag.moved)
                     .map(Drag::range);
-                pane.draw(frame, heading, focus == self.focus, range, marks);
+                pane.draw(frame, heading, focus == self.focus, range, search);
             }
             if self.waiting {
                 frame.render_widget(Paragraph::new("[no output yet]"), self.output.area);
@@ -739,8 +690,8 @@ impl Viewer {
                 &note.replace(['\n', '\r'], " "),
                 usize::from(bar.width),
             ))
-        } else if self.search.prompt {
-            self.search_prompt(bar.width)
+        } else if let Some(prompt) = self.search.prompt_line(bar.width, "Enter search output") {
+            prompt
         } else {
             Line::styled(self.hint(bar.width), Style::new().dim())
         };
@@ -757,18 +708,15 @@ impl Viewer {
                 usize::from(width),
             );
         }
-        let mut hints = vec![if self.search.query.is_empty() {
-            "Esc back".to_owned()
-        } else {
-            "Esc clear".to_owned()
-        }];
-        if !self.search.matches.is_empty() {
-            hints.push(format!(
-                "n/N find [{}/{}]",
-                self.search.selected + 1,
-                self.search.matches.len()
-            ));
-        }
+        let mut hints = vec![
+            if self.search.active() {
+                "Esc clear"
+            } else {
+                "Esc back"
+            }
+            .to_owned(),
+        ];
+        hints.extend(self.search.step_hint());
         if self.has_code {
             hints.push("Tab switch focus".to_owned());
         }
@@ -790,50 +738,6 @@ impl Viewer {
             }),
             usize::from(width),
         )
-    }
-    fn search_prompt(&self, width: u16) -> Line<'static> {
-        let room = usize::from(width);
-        let lead = text::clip_end(
-            &format!("{} matches /", self.search.matches.len()),
-            room.saturating_sub(2),
-        );
-        let available = room.saturating_sub(text::width(&lead) + 1);
-        let hints = text::fit(
-            [
-                Item {
-                    full: "Enter search output".into(),
-                    short: None,
-                    priority: 2,
-                },
-                Item {
-                    full: "Esc cancel".into(),
-                    short: None,
-                    priority: 1,
-                },
-            ],
-            available.saturating_sub(8),
-        );
-        let reserve = if hints.is_empty() {
-            0
-        } else {
-            text::width(&hints) + 1
-        };
-        Line::from(vec![
-            Span::raw(lead),
-            Span::raw(text::clip_start(
-                &self.search.query,
-                available.saturating_sub(reserve),
-            )),
-            Span::styled(" ", Style::new().reversed()),
-            Span::styled(
-                if hints.is_empty() {
-                    hints
-                } else {
-                    format!(" {hints}")
-                },
-                Style::new().dim(),
-            ),
-        ])
     }
 }
 fn pane_heading(name: &str, pane: &Pane, focused: bool) -> Line<'static> {
@@ -921,34 +825,6 @@ fn output_rows(content: &Content<'_>, width: u16) -> Vec<Row> {
             selection::wrap_line(&line, number as u64, 0, usize::from(width))
         })
         .collect()
-}
-
-fn highlighted<'a>(line: &'a Line<'_>, ranges: &[Range<usize>]) -> Line<'a> {
-    use unicode_segmentation::UnicodeSegmentation as _;
-
-    let mut offset = 0;
-    let mut matches = ranges.iter().peekable();
-    let mut spans = Vec::new();
-    for span in &line.spans {
-        spans.extend(span.content.graphemes(true).map(|glyph| {
-            let start = offset;
-            offset += glyph.len();
-            while matches.peek().is_some_and(|range| range.end <= start) {
-                matches.next();
-            }
-            let style = if matches.peek().is_some_and(|range| range.start < offset) {
-                span.style.bold().reversed()
-            } else {
-                span.style
-            };
-            Span::styled(glyph, style)
-        }));
-    }
-    Line {
-        spans,
-        style: line.style,
-        alignment: line.alignment,
-    }
 }
 
 fn selections(details: &[Detail], live: &Live) -> Vec<Selection> {
@@ -1141,6 +1017,29 @@ mod tests {
                 })
             })
             .expect(token)
+    }
+
+    #[test]
+    fn search_submit_restores_output_focus_after_scrolling_code() {
+        let runtime = std::sync::Arc::new(Live::default());
+        let mut job = runtime.start("fixture", "print('example')", Some(1));
+        let output = "a needle in the output\n";
+        job.result(output);
+        let mut viewer = Viewer::new(&[], &runtime, true);
+        let size = Size::new(40, 16);
+        let mut status = Status::default();
+        viewer.prepare(size, &[], &runtime, &mut status);
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        viewer.key(key(KeyCode::Char('/')), &[], &runtime, &mut status);
+        viewer.paste("needle").unwrap();
+        assert!(viewer.code.area.height > 0);
+        let code_position = (viewer.code.area.x, viewer.code.area.y);
+        mouse(&mut viewer, MouseEventKind::ScrollDown, code_position);
+        assert!(viewer.focus == Focus::Code);
+        viewer.key(key(KeyCode::Enter), &[], &runtime, &mut status);
+        viewer.prepare(size, &[], &runtime, &mut status);
+        let copied = viewer.key(key(KeyCode::Char('c')), &[], &runtime, &mut status);
+        assert!(matches!(copied, Some(Action::Copy { text, .. }) if text.contains(output)));
     }
 
     #[test]

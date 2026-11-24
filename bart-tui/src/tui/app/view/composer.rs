@@ -15,6 +15,7 @@ pub(super) fn draw_composer(
     lead: u16,
     decorated: bool,
     name: Option<&str>,
+    focused: bool,
 ) {
     let selected = draft.selected_range();
     let room = usize::from(composer.width.saturating_sub(lead + 1)).max(1);
@@ -28,10 +29,12 @@ pub(super) fn draw_composer(
         .take(visible)
         .map(|(index, text)| {
             let mut spans = if index == 0 {
-                vec![Span::styled(
-                    "❯ ",
-                    Style::new().fg(brand()).add_modifier(Modifier::BOLD),
-                )]
+                let prompt_style = if focused {
+                    Style::new().fg(brand()).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new().dim()
+                };
+                vec![Span::styled("❯ ", prompt_style)]
             } else {
                 vec![Span::raw(" ".repeat(usize::from(lead)))]
             };
@@ -40,7 +43,13 @@ pub(super) fn draw_composer(
             } else {
                 selection::borrowed(text.line())
             };
-            spans.extend(line.spans);
+            if focused {
+                spans.extend(line.spans);
+            } else {
+                spans.extend(line.spans.into_iter().map(|span| {
+                    Span::styled(span.content, span.style.add_modifier(Modifier::DIM))
+                }));
+            }
             Line::from(spans)
         })
         .collect();
@@ -75,7 +84,7 @@ pub(super) fn draw_composer(
         height: visible as u16,
     };
     draft.painted(content, first);
-    if visible == 0 || composer.width == 0 {
+    if !focused || visible == 0 || composer.width == 0 {
         return;
     }
     let x = (composer.x + lead + u16::try_from(column).unwrap_or(0))

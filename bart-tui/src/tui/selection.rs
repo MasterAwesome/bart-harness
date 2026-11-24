@@ -539,77 +539,75 @@ pub(super) fn text(
 #[derive(Clone)]
 struct Fragment {
     row: usize,
-    display: usize,
     source: Range<usize>,
 }
 
-#[derive(Default)]
-struct Search {
-    hits: Vec<usize>,
-    marks: Vec<Vec<Range<usize>>>,
+#[derive(Clone, Copy)]
+pub(super) struct Hit {
+    pub(super) anchor: Anchor,
+    byte: usize,
 }
 
-impl Search {
-    fn record(&mut self, text: &str, base: usize, query: &str, fragments: &[Fragment]) {
-        let mut visible = fragments.iter().peekable();
-        for (offset, needle) in text.to_ascii_lowercase().match_indices(query) {
-            let start = base + offset;
-            let end = start + needle.len();
-            while visible.peek().is_some_and(|part| part.source.end <= start) {
-                visible.next();
-            }
-            if visible.peek().is_none() {
-                break;
-            }
-            let mut first = None;
-            while let Some(part) = visible.peek() {
-                if part.source.start >= end {
-                    break;
-                }
-                let from = start.saturating_sub(part.source.start) + part.display;
-                let to = end.min(part.source.end) - part.source.start + part.display;
-                if from < to {
-                    first.get_or_insert(part.row);
-                    self.marks[part.row].push(from..to);
-                }
-                if part.source.end > end {
-                    break;
-                }
-                visible.next();
-            }
-            self.hits.extend(first);
-        }
+impl Hit {
+    pub(super) fn start(self) -> Point {
+        (self.anchor.0, self.byte)
     }
+}
 
-    fn table(&mut self, source: &Table, rows: &[Row], first: usize, query: &str) {
-        let mut cells = vec![Vec::new(); source.cells.len()];
-        for (index, row) in rows.iter().enumerate() {
-            if let Content::Table { boxes, .. } = &row.content {
-                for hit in boxes.iter() {
-                    let (display, spans) = row.segment(&hit.part);
-                    let len: usize = spans.iter().map(|span| span.content.len()).sum();
-                    cells[hit.cell].push(Fragment {
-                        row: first + index,
-                        display,
-                        source: hit.part.byte..hit.part.byte + len,
-                    });
-                }
-            }
+fn record(
+    hits: &mut Vec<Hit>,
+    rows: &[Row],
+    text: &str,
+    base: usize,
+    query: &str,
+    fragments: &[Fragment],
+) {
+    let mut visible = fragments
+        .iter()
+        .filter(|part| !part.source.is_empty())
+        .peekable();
+    for (offset, needle) in text.to_ascii_lowercase().match_indices(query) {
+        let start = base + offset;
+        while visible.peek().is_some_and(|part| part.source.end <= start) {
+            visible.next();
         }
-        for (cell, fragments) in source.cells.iter().zip(cells) {
-            self.record(&cell.text, cell.byte, query, &fragments);
+        let Some(part) = visible.peek() else { break };
+        if part.source.start < start + needle.len() {
+            let anchor = rows[part.row].anchor;
+            hits.push(Hit {
+                anchor,
+                byte: start,
+            });
         }
     }
 }
 
-pub(super) fn search(rows: &[Row], query: &str) -> (Vec<usize>, Vec<Vec<Range<usize>>>) {
+fn table_hits(hits: &mut Vec<Hit>, rows: &[Row], source: &Table, range: Range<usize>, query: &str) {
+    let mut cells = vec![Vec::new(); source.cells.len()];
+    for index in range {
+        let row = &rows[index];
+        if let Content::Table { boxes, .. } = &row.content {
+            for hit in boxes.iter() {
+                let (_, spans) = row.segment(&hit.part);
+                let len: usize = spans.iter().map(|span| span.content.len()).sum();
+                cells[hit.cell].push(Fragment {
+                    row: index,
+                    source: hit.part.byte..hit.part.byte + len,
+                });
+            }
+        }
+    }
+    for (cell, fragments) in source.cells.iter().zip(cells) {
+        record(hits, rows, &cell.text, cell.byte, query, &fragments);
+    }
+}
+
+// Keep the hits in source order. The visible order of table cells can differ.
+pub(super) fn search(rows: &[Row], query: &str) -> Vec<Hit> {
     if query.is_empty() {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     }
-    let mut search = Search {
-        hits: Vec::new(),
-        marks: vec![Vec::new(); rows.len()],
-    };
+    let mut hits = Vec::new();
     let mut index = 0;
     let mut text = String::new();
     let mut fragments = Vec::new();
@@ -625,32 +623,61 @@ pub(super) fn search(rows: &[Row], query: &str) -> (Vec<usize>, Vec<Vec<Range<us
                     if part.byte != start + text.len() {
                         break;
                     }
-                    let (display, spans) = next.segment(part);
+                    let (_, spans) = next.segment(part);
                     text.extend(spans.iter().map(|span| span.content.as_ref()));
                     fragments.push(Fragment {
                         row: index,
-                        display,
                         source: part.byte..start + text.len(),
                     });
                     text.push_str(skipped);
                     index += 1;
                 }
-                search.record(&text, start, query, &fragments);
+                record(&mut hits, rows, &text, start, query, &fragments);
                 text.clear();
                 fragments.clear();
             }
             Content::Table { source, .. } => {
                 let len = rows[index..].iter().take_while(|row| matches!(&row.content, Content::Table { source: next, .. } if Arc::ptr_eq(next, source))).count();
-                search.table(source, &rows[index..index + len], index, query);
+                table_hits(&mut hits, rows, source, index..index + len, query);
                 index += len;
             }
             Content::Chrome(_) | Content::Notice(_) => index += 1,
         }
     }
-    for marks in &mut search.marks {
-        marks.sort_unstable_by_key(|range| range.start);
+    hits
+}
+
+pub(super) fn marks(row: &Row, hits: &[Hit], bytes: usize) -> Vec<Range<usize>> {
+    if hits.is_empty() {
+        return Vec::new();
     }
-    (search.hits, search.marks)
+    let mut marks = Vec::new();
+    let mut mark = |part: &Part| {
+        let (display, spans) = row.segment(part);
+        let block = row.anchor.0;
+        let end = part.byte + spans.iter().map(|span| span.content.len()).sum::<usize>();
+        if end == part.byte {
+            return;
+        }
+        let first =
+            hits.partition_point(|hit| (hit.anchor.0, hit.byte + bytes) <= (block, part.byte));
+        marks.extend(
+            hits[first..]
+                .iter()
+                .take_while(|hit| hit.start() < (block, end))
+                .map(|hit| {
+                    let start = display + hit.byte.saturating_sub(part.byte);
+                    let end = display + (hit.byte + bytes).min(end) - part.byte;
+                    start..end
+                }),
+        );
+    };
+    match &row.content {
+        Content::Text { part, .. } => mark(part),
+        Content::Table { boxes, .. } => boxes.iter().for_each(|cell| mark(&cell.part)),
+        Content::Chrome(_) | Content::Notice(_) => {}
+    }
+    marks
 }
 
 pub(super) fn wrap_line(line: &Line<'static>, block: u64, byte: usize, width: usize) -> Vec<Row> {

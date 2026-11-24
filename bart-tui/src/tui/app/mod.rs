@@ -538,6 +538,12 @@ impl App {
         self.surface = picker.map(Surface::Picker);
     }
 
+    fn replace_transcript(&mut self, transcript: super::transcript::Transcript) {
+        self.transcript = transcript;
+        self.scrollback = super::scrollback::Scrollback::default();
+        self.invalidate_paint();
+    }
+
     fn append_display(&mut self, texts: impl IntoIterator<Item = super::transcript::Block>) {
         let removed = self.transcript.append(texts, self.scrollback.protected());
         self.scrollback.evicted(&removed);

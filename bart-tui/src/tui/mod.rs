@@ -31,6 +31,7 @@ mod paste;
 mod picker;
 mod progress;
 mod scrollback;
+mod search;
 mod selection;
 mod session;
 mod status;

@@ -284,6 +284,7 @@ pub(super) struct Transcript {
     next: u64,
     tail: Arc<[RenderRow]>,
     tail_tick: usize,
+    revision: u64,
 }
 
 impl Transcript {
@@ -970,6 +971,7 @@ impl Transcript {
         let tail = self.live(width, tick);
         if self.tail.as_ref() != tail {
             self.tail = tail.into();
+            self.revision += 1;
         }
     }
 

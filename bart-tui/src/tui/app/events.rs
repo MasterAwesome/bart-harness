@@ -169,8 +169,7 @@ impl App {
             UiEvent::Rewound(Ok((text, transcript, accounting))) => {
                 self.surface = None;
                 self.info.accounting = accounting;
-                self.transcript = *transcript;
-                self.scrollback = Default::default();
+                self.replace_transcript(*transcript);
                 self.cancel_task(Kind::Image);
                 if self.drafts.composer.is_empty() {
                     self.restore_draft(&text);

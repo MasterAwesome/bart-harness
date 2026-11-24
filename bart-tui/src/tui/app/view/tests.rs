@@ -286,9 +286,13 @@ mod cell_click_and_hover {
     }
 
     fn paint(app: &mut App) -> Terminal<TestBackend> {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        app.update(Msg::Size(ratatui::layout::Size::new(80, 24)));
+        paint_height(app, 24)
+    }
+
+    fn paint_height(app: &mut App, height: u16) -> Terminal<TestBackend> {
+        app.update(Msg::Size(ratatui::layout::Size::new(80, height)));
         app.update(Msg::PrepareFrame);
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
         let painted = app.render_frame(&mut terminal, 0).unwrap();
         app.update(Msg::Painted(Some(painted)));
         terminal
@@ -309,6 +313,474 @@ mod cell_click_and_hover {
             }
         }
         panic!("token {token:?} not found");
+    }
+
+    mod transcript_search {
+        use super::*;
+
+        fn press(app: &mut App, code: KeyCode) -> Vec<Effect> {
+            key(app, code, KeyModifiers::NONE)
+        }
+
+        fn open(app: &mut App) {
+            key(app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+        }
+
+        fn paste(app: &mut App, text: &str) {
+            input(app, Event::Paste(text.into()));
+        }
+
+        fn painted(app: &mut App) -> String {
+            frame_text(&paint(app))
+        }
+
+        fn frame_text(terminal: &Terminal<TestBackend>) -> String {
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .as_chunks::<80>()
+                .0
+                .iter()
+                .map(|row| row.iter().map(Cell::symbol).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn user(app: &mut App, text: &str) {
+            app.update(Msg::Events(vec![UiEvent::Delivering {
+                text: text.into(),
+                skills: vec![],
+            }]));
+        }
+
+        fn history(app: &mut App) {
+            for i in 0..100 {
+                if [10, 40, 70].contains(&i) {
+                    user(app, &format!("needle {i}"));
+                } else {
+                    user(app, &format!("line {i}"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn modal_find_mode_owns_navigation_with_nonempty_composer_draft() {
+            let dir = TempDir::new("tui-transcript-search-input");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            user(&mut app, "a needle and another NEEDLE");
+            press(&mut app, KeyCode::Char('/'));
+            assert!(painted(&mut app).contains("start a new session"));
+            app.drafts.composer.clear();
+            app.insert("unfinished draft");
+
+            open(&mut app);
+            for c in "NeX".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            assert!(painted(&mut app).contains("0 matches /NeX"));
+            press(&mut app, KeyCode::Backspace);
+            paste(&mut app, "edle");
+            let frame = painted(&mut app);
+            assert!(frame.contains("2 matches /Needle"));
+            assert!(frame.contains("Enter find") && frame.contains("Esc cancel"));
+            for invalid in ["bad\nline".into(), "x".repeat(1025), "\x1b[2J".into()] {
+                paste(&mut app, &invalid);
+                let frame = painted(&mut app);
+                assert!(
+                    frame.contains("paste refused: search requires one line within 1024 bytes")
+                );
+                assert!(frame.contains("2 matches /Needle"));
+            }
+
+            // Enter transitions to modal Find Navigation — n/N/Enter/Shift+Enter/arrows step
+            // matches without touching the preserved composer draft!
+            press(&mut app, KeyCode::Enter);
+            let frame = painted(&mut app);
+            assert!(frame.contains("find /Needle [2/2]"));
+            press(&mut app, KeyCode::Char('n'));
+            assert!(painted(&mut app).contains("find /Needle [1/2]"));
+            key(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+            assert!(painted(&mut app).contains("find /Needle [2/2]"));
+            press(&mut app, KeyCode::Char('z'));
+            paste(&mut app, "ignored paste");
+            assert_eq!(app.drafts.composer.text(), "unfinished draft");
+
+            // Ctrl+C exits Find Mode without erasing the preserved composer draft.
+            key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
+            assert!(!app.scrollback.search().in_mode());
+            assert_eq!(app.drafts.composer.text(), "unfinished draft");
+            app.quit_armed = None;
+
+            // Re-enter Find Mode and verify a stale post-resize click does not exit Find Mode.
+            open(&mut app);
+            paste(&mut app, "Needle");
+            press(&mut app, KeyCode::Enter);
+            let term = paint(&mut app);
+            let stale_draft_pos = locate(&term, "unfinished");
+            input(&mut app, Event::Resize(80, 16));
+            mouse(
+                &mut app,
+                MouseEventKind::Down(MouseButton::Left),
+                stale_draft_pos,
+            );
+            mouse(
+                &mut app,
+                MouseEventKind::Up(MouseButton::Left),
+                stale_draft_pos,
+            );
+            assert!(app.scrollback.search().in_mode());
+            assert!(!app.drafts.composer.selecting());
+
+            // Clicking inside the painted composer exits Find Mode back to editing the draft.
+            let term = paint(&mut app);
+            let draft_pos = locate(&term, "unfinished");
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), draft_pos);
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), draft_pos);
+            assert!(!app.scrollback.search().in_mode());
+            press(&mut app, KeyCode::Char('!'));
+            assert_eq!(app.drafts.composer.text(), "unfinished draft!");
+
+            open(&mut app);
+            paste(&mut app, "absent");
+            press(&mut app, KeyCode::Enter);
+            assert!(painted(&mut app).contains("No matches"));
+            assert_eq!(app.drafts.composer.text(), "unfinished draft!");
+        }
+
+        #[tokio::test]
+        async fn search_at_bottom_keeps_following_and_slash_opens_commands() {
+            let dir = TempDir::new("tui-search-follow");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            user(&mut app, "one needle");
+            open(&mut app);
+            paste(&mut app, "needle");
+            press(&mut app, KeyCode::Enter);
+            assert!(painted(&mut app).contains("find /needle [1/1]"));
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Char('/'));
+            assert!(painted(&mut app).contains("start a new session"));
+        }
+
+        #[tokio::test]
+        async fn scrolling_down_at_the_bottom_keeps_slash_commands() {
+            let dir = TempDir::new("tui-scroll-down-follow");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            user(&mut app, "latest message");
+            assert!(painted(&mut app).contains("latest message"));
+            mouse(&mut app, MouseEventKind::ScrollDown, (0, 3));
+            press(&mut app, KeyCode::Char('/'));
+            assert!(painted(&mut app).contains("start a new session"));
+        }
+
+        #[tokio::test]
+        async fn page_up_during_streaming_uses_the_last_painted_page() {
+            let dir = TempDir::new("tui-scroll-painted-origin");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            history(&mut app);
+            let initial = painted(&mut app);
+            assert!(initial.contains("line 99") && !initial.contains("line 85"));
+
+            press(&mut app, KeyCode::PageUp);
+            for i in 0..40 {
+                user(&mut app, &format!("stream message {i}"));
+            }
+            let scrolled = painted(&mut app);
+            assert!(scrolled.contains("line 85") && !scrolled.contains("stream message"));
+
+            press(&mut app, KeyCode::PageUp);
+            key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+            assert!(painted(&mut app).contains("stream message 39"));
+        }
+
+        #[tokio::test]
+        async fn fast_search_steps_are_applied_before_the_first_paint() {
+            let dir = TempDir::new("tui-search-fast-steps");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            history(&mut app);
+            for (direction, modifiers, token, position) in [
+                ('n', KeyModifiers::NONE, "needle 10", "[1/3]"),
+                ('N', KeyModifiers::SHIFT, "needle 40", "[2/3]"),
+            ] {
+                key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+                open(&mut app);
+                paste(&mut app, "needle");
+                press(&mut app, KeyCode::Enter);
+                key(&mut app, KeyCode::Char(direction), modifiers);
+                assert!(app.drafts.composer.is_empty());
+                let frame = painted(&mut app);
+                assert!(frame.contains(token) && frame.contains(position));
+            }
+        }
+
+        #[tokio::test]
+        async fn search_and_latest_keys_respect_unpainted_scroll_order() {
+            let dir = TempDir::new("tui-search-scroll-order");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            history(&mut app);
+            assert!(painted(&mut app).contains("line 99"));
+            press(&mut app, KeyCode::PageUp);
+            open(&mut app);
+            paste(&mut app, "needle");
+            press(&mut app, KeyCode::Enter);
+            assert!(painted(&mut app).contains("needle 70"));
+
+            open(&mut app);
+            paste(&mut app, "needle");
+            assert!(!painted(&mut app).contains("line 99"));
+            key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+            let frame = painted(&mut app);
+            assert!(frame.contains("line 99") && frame.contains("3 matches /needle"));
+
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::Char('N'));
+            key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+            let frame = painted(&mut app);
+            assert!(frame.contains("line 99") && frame.contains("find /needle"));
+        }
+
+        #[tokio::test]
+        async fn page_down_after_search_seek_shows_the_same_rows_with_or_without_a_paint() {
+            let dir = TempDir::new("tui-search-page-down-order");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            history(&mut app);
+            let [separate, batched] = [true, false].map(|paint_between| {
+                key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+                assert!(painted(&mut app).contains("line 99"));
+                open(&mut app);
+                paste(&mut app, "needle");
+                press(&mut app, KeyCode::Enter);
+                if paint_between {
+                    assert!(painted(&mut app).contains("needle 70"));
+                }
+                press(&mut app, KeyCode::PageDown);
+                let frame = painted(&mut app);
+                let area = app.geometry.conversation;
+                frame
+                    .lines()
+                    .skip(usize::from(area.y))
+                    .take(usize::from(area.height))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
+            assert!(!separate.contains("needle 70"));
+            assert_eq!(batched, separate);
+        }
+
+        #[tokio::test]
+        async fn short_search_layout_keeps_a_transcript_row() {
+            let dir = TempDir::new("tui-search-short-layout");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            app.geometry.size = ratatui::layout::Size::new(80, 8);
+            user(&mut app, "needle in the haystack");
+            for draft in ["", "draft\nline two\nline three\nline four\nline five"] {
+                app.drafts.composer.clear();
+                if !draft.is_empty() {
+                    app.update(Msg::Events(vec![UiEvent::Started(vec![])]));
+                    for message in ["queued one", "queued two", "queued three"] {
+                        app.insert(message);
+                        press(&mut app, KeyCode::Tab);
+                    }
+                    assert_eq!(app.drafts.queued.len(), 3);
+                }
+                app.insert(draft);
+                open(&mut app);
+                paste(&mut app, "needle");
+                let frame = frame_text(&paint_height(&mut app, 8));
+                assert!(
+                    frame.contains("needle in the haystack") && frame.contains("1 matches /needle")
+                );
+                press(&mut app, KeyCode::Enter);
+                let frame = frame_text(&paint_height(&mut app, 8));
+                assert!(
+                    frame.contains("needle in the haystack")
+                        && frame.contains("find /needle [1/1]")
+                );
+                assert_eq!(app.drafts.composer.text(), draft);
+                press(&mut app, KeyCode::Esc);
+            }
+        }
+
+        #[tokio::test]
+        async fn search_wraps_through_history_and_keeps_manual_scrolling() {
+            let dir = TempDir::new("tui-transcript-search-history");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            history(&mut app);
+            assert!(painted(&mut app).contains("line 99"));
+            open(&mut app);
+            paste(&mut app, "needle");
+            press(&mut app, KeyCode::Enter);
+            let frame = painted(&mut app);
+            assert!(frame.contains("find /needle [3/3]"));
+            assert!(frame.contains("needle 70"));
+            assert!(frame.contains("line 69"));
+            press(&mut app, KeyCode::Char('n'));
+            let frame = painted(&mut app);
+            assert!(frame.contains("needle 10"));
+            assert!(frame.contains("find /needle [1/3]"));
+            key(&mut app, KeyCode::Char('N'), KeyModifiers::SHIFT);
+            assert!(painted(&mut app).contains("needle 70"));
+            press(&mut app, KeyCode::Up);
+            assert!(painted(&mut app).contains("needle 40"));
+            press(&mut app, KeyCode::PageDown);
+            assert!(!painted(&mut app).contains("needle 40"));
+            press(&mut app, KeyCode::PageUp);
+            let match_row = |frame: &str| frame.lines().position(|row| row.contains("needle 40"));
+            let row = match_row(&painted(&mut app)).unwrap();
+            mouse(&mut app, MouseEventKind::ScrollUp, (0, 3));
+            assert_eq!(match_row(&painted(&mut app)), Some(row + 1));
+            mouse(&mut app, MouseEventKind::ScrollDown, (0, 3));
+            assert_eq!(match_row(&painted(&mut app)), Some(row));
+            key(&mut app, KeyCode::End, KeyModifiers::CONTROL);
+            let frame = painted(&mut app);
+            assert!(frame.contains("line 99"));
+            assert!(frame.contains("find /needle [2/3]"));
+            press(&mut app, KeyCode::Char('/'));
+            assert!(painted(&mut app).contains("0 matches /"));
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::PageUp);
+            paint(&mut app);
+            press(&mut app, KeyCode::Char('/'));
+            assert!(painted(&mut app).contains("0 matches /"));
+            assert!(app.drafts.composer.is_empty());
+        }
+
+        #[tokio::test]
+        async fn search_highlights_do_not_change_columns_or_drag_copy() {
+            let dir = TempDir::new("tui-transcript-search-grapheme");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            let value = "e\u{301}界Z";
+            user(&mut app, value);
+            let term = paint(&mut app);
+            let at = locate(&term, "e\u{301}界");
+            open(&mut app);
+            paste(&mut app, "\u{301}");
+            assert!(painted(&mut app).contains("1 matches /"));
+            press(&mut app, KeyCode::Enter);
+            let terminal = paint(&mut app);
+            assert_eq!(locate(&terminal, "e\u{301}界"), at);
+            let row = &terminal.backend().buffer().content.as_chunks::<80>().0[usize::from(at.1)];
+            let cell = &row[usize::from(at.0)];
+            assert_eq!(cell.symbol(), "e\u{301}");
+            assert!(cell.modifier.contains(Modifier::BOLD | Modifier::REVERSED));
+            assert_eq!(row[usize::from(at.0) + 1].symbol(), "界");
+            assert!(
+                !row[usize::from(at.0) + 1]
+                    .modifier
+                    .contains(Modifier::REVERSED)
+            );
+            let end = (at.0 + 3, at.1);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), at);
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), end);
+            let effects = mouse(&mut app, MouseEventKind::Up(MouseButton::Left), end);
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Spawn(_, Task::Copy(Copy::Text { text, .. })) if text == value
+            )));
+        }
+
+        #[tokio::test]
+        async fn switching_sessions_discards_the_active_search() {
+            let dir = TempDir::new("tui-transcript-search-session");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            user(&mut app, "needle");
+            open(&mut app);
+            paste(&mut app, "needle");
+            press(&mut app, KeyCode::Enter);
+            assert!(painted(&mut app).contains("find /needle [1/1]"));
+            let next = app
+                .shared
+                .opener
+                .open(
+                    app.info.settings.clone(),
+                    app.info.preferences.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            app.update(Msg::Attached(crate::tui::tasks::opened(next).await));
+            let frame = painted(&mut app);
+            assert!(!frame.contains("find /") && !frame.contains("needle"));
+        }
+
+        #[tokio::test]
+        async fn search_escape_does_not_interrupt_and_rewind_clears_it() {
+            let dir = TempDir::new("tui-transcript-search-escape");
+            let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+            let (mut app, _) = attached_fixture(dir.path(), provider).await;
+            user(&mut app, "needle");
+            app.update(Msg::Events(vec![UiEvent::Started(vec![])]));
+            app.agent_event(
+                UiEvent::WaitingForReset {
+                    message: "wait".into(),
+                    delay: std::time::Duration::from_secs(60),
+                },
+                80,
+            );
+            assert!(
+                app.turn
+                    .as_ref()
+                    .is_some_and(|turn| turn.progress.waiting_for_reset())
+            );
+            for submit in [false, true] {
+                open(&mut app);
+                paste(&mut app, "needle");
+                if submit {
+                    press(&mut app, KeyCode::Enter);
+                    assert!(painted(&mut app).contains("find /needle"));
+                }
+                assert!(press(&mut app, KeyCode::Esc).is_empty());
+                let frame = painted(&mut app);
+                assert!(!frame.contains("find /") && !frame.contains("matches /"));
+                assert!(
+                    app.turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.progress.waiting_for_reset())
+                );
+            }
+            open(&mut app);
+            paste(&mut app, "needle");
+            press(&mut app, KeyCode::Enter);
+            assert!(painted(&mut app).contains("find /needle [1/1]"));
+            let (ack, _) = tokio::sync::oneshot::channel();
+            app.update(Msg::Events(vec![UiEvent::Ended {
+                ack,
+                error: None,
+                recover_input: false,
+                rejected: vec![],
+            }]));
+            press(&mut app, KeyCode::Esc);
+            paste(&mut app, "/rewind");
+            assert!(
+                press(&mut app, KeyCode::Enter)
+                    .iter()
+                    .any(|effect| matches!(
+                        effect,
+                        Effect::Send(crate::tui::session::Command::Messages)
+                    ))
+            );
+            open(&mut app);
+            paste(&mut app, "needle");
+            app.update(Msg::Events(vec![UiEvent::Rewound(Ok((
+                "restored".into(),
+                Box::default(),
+                Accounting::default(),
+            )))]));
+            let frame = painted(&mut app);
+            assert!(!frame.contains("find /") && !frame.contains("needle"));
+            assert_eq!(app.drafts.composer.text(), "restored");
+        }
     }
 
     fn is_underlined(terminal: &Terminal<TestBackend>, token: &str) -> bool {
