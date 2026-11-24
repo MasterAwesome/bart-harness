@@ -44,8 +44,8 @@ impl Transcript {
         let message = match entry {
             Entry::Compact(summary) => {
                 self.flush_text(&mut done);
-                self.compaction_note(summary);
-                done.push(self.compaction_block(summary));
+                let detail = self.compaction_note(summary);
+                done.push(self.compaction_block(summary, detail));
                 return done;
             }
             Entry::Message(message) => message,
@@ -139,15 +139,15 @@ impl Transcript {
         }
         done
     }
-    pub(super) fn compaction_block(&mut self, summary: &str) -> Block {
+    pub(super) fn compaction_block(&mut self, summary: &str, detail: DetailSequence) -> Block {
         let text = self
             .spacing
             .render(
                 &Kind::Notice,
-                Text::from(Line::styled(
-                    "  Context compacted · Ctrl+O summary",
-                    Style::new().dim(),
-                ))
+                vec![RenderRow::detail(
+                    Line::styled("  Context compacted · Ctrl+O summary", Style::new().dim()),
+                    detail,
+                )]
                 .into(),
             )
             .unwrap_or_default();

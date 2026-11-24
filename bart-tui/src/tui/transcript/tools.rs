@@ -1,4 +1,4 @@
-use super::{Call, DisplayDiff, Finished, muted};
+use super::{Call, DisplayDiff, Finished, RenderRow, muted};
 use crate::tui::text::{self, Clean};
 use crate::{
     tool::Status,
@@ -163,9 +163,10 @@ pub(super) fn tools(
     live: Option<&crate::tool::Live>,
     width: u16,
     tick: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<RenderRow> {
     let mut lines = Vec::new();
     for call in calls {
+        let row = |line| RenderRow::detail(line, call.detail);
         let theme = theme();
         let (glyph, color, summary, expand, elapsed) = match &call.result {
             None => (
@@ -225,12 +226,12 @@ pub(super) fn tools(
             Span::styled(summary, summary_style),
             Span::styled(duration, quiet),
         ]);
-        lines.push(Line::from(spans));
+        lines.push(row(Line::from(spans)));
         for line in expand {
-            lines.push(Line::from(vec![
+            lines.push(row(Line::from(vec![
                 Span::raw("    ").dim(),
                 Span::styled(line, Style::new().fg(theme.error)),
-            ]));
+            ])));
         }
         if call.result.is_none()
             && let Some(activities) = live_activities(call, live)
@@ -242,23 +243,27 @@ pub(super) fn tools(
                 .collect();
             for activity in running.iter().take(RUNNING_SHOWN) {
                 let text = format!("  ↳ {}", activity.title);
-                lines.push(Line::from(crate::tui::links::clipped(
+                lines.push(row(Line::from(crate::tui::links::clipped(
                     &text,
                     clip_end(&text, width),
                     quiet,
-                )));
+                ))));
             }
             if running.len() > RUNNING_SHOWN {
-                lines.push(Line::styled(
+                lines.push(row(Line::styled(
                     clip_end(
                         &format!("  ↳ +{} more running", running.len() - RUNNING_SHOWN),
                         width,
                     ),
                     quiet,
-                ));
+                )));
             }
         }
-        lines.extend(diff_rows(&call.diffs, "    "));
+        lines.extend(
+            diff_rows(&call.diffs, "    ")
+                .into_iter()
+                .map(RenderRow::literal),
+        );
     }
     lines
 }
@@ -268,10 +273,11 @@ pub(super) fn activities(
     live: Option<&crate::tool::Live>,
     width: u16,
     tick: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<RenderRow> {
     use crate::tool::LiveState;
     let mut lines = Vec::new();
     for call in calls {
+        let row = |line| RenderRow::detail(line, call.detail);
         let recorded = match &call.result {
             Some(_) => call.activities.as_ref().map(Cow::Borrowed),
             None => live_activities(call, live).map(Cow::Owned),
@@ -325,27 +331,31 @@ pub(super) fn activities(
                 Span::raw(" ".repeat(gap)),
                 Span::styled(suffix, Style::new().fg(color)),
             ]);
-            lines.push(Line::from(spans));
+            lines.push(row(Line::from(spans)));
         }
         if omitted > 0 {
-            lines.push(Line::styled(
+            lines.push(row(Line::styled(
                 format!("  {omitted} additional activities omitted"),
                 muted(Style::new()),
-            ));
+            )));
         }
         // Python execution itself can fail outside any builtin, or between two successful ones.
         if let Some(result) = &call.result
             && result.status == Status::Failed
         {
-            lines.push(Line::styled(
+            lines.push(row(Line::styled(
                 clip_end(
                     "✗ Python cell failed or interrupted · Ctrl+O details",
                     usize::from(width),
                 ),
                 Style::new().fg(theme().error),
-            ));
+            )));
         }
-        lines.extend(diff_rows(&call.diffs, "    "));
+        lines.extend(
+            diff_rows(&call.diffs, "    ")
+                .into_iter()
+                .map(RenderRow::literal),
+        );
     }
     lines
 }

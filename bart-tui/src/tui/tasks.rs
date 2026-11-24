@@ -244,9 +244,10 @@ fn conversation_text(sources: &[super::transcript::CopySource]) -> String {
         .iter()
         .flat_map(|source| match source {
             super::transcript::CopySource::Text(text) => vec![text.to_string()],
-            super::transcript::CopySource::Rows(rows) => {
-                rows.iter().map(super::markdown::RenderRow::source).collect()
-            }
+            super::transcript::CopySource::Rows(rows) => rows
+                .iter()
+                .map(super::markdown::RenderRow::source)
+                .collect(),
         })
         .collect::<Vec<_>>()
         .join("\n")

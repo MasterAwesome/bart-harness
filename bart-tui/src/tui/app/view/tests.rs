@@ -245,3 +245,254 @@ async fn busy_jailed_status_keeps_recording_and_compaction_warnings() {
     }
     assert_usage_styles(&row, right, Some(("80%", theme().error, true)));
 }
+
+mod cell_click_and_hover {
+    use super::*;
+    use crate::{
+        history::{
+            Activity, Completeness, JobOutcome, Notification, NotificationKind, SavedArtifact,
+        },
+        preferences::Ui,
+        tool::{LiveState, Status},
+        tui::{
+            app::{Effect, Msg},
+            input::ReadEvent,
+            tasks::{Copy, Task},
+            transcript::MAX_DETAILS,
+        },
+    };
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn input(app: &mut App, event: Event) -> Vec<Effect> {
+        app.update(Msg::Input(ReadEvent::Terminal(event)))
+    }
+
+    fn key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Vec<Effect> {
+        input(app, Event::Key(KeyEvent::new(code, modifiers)))
+    }
+
+    fn mouse(app: &mut App, kind: MouseEventKind, (column, row): (u16, u16)) -> Vec<Effect> {
+        input(
+            app,
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+    }
+
+    fn paint(app: &mut App) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        app.update(Msg::Size(ratatui::layout::Size::new(80, 24)));
+        app.update(Msg::PrepareFrame);
+        let painted = app.render_frame(&mut terminal, 0).unwrap();
+        app.update(Msg::Painted(Some(painted)));
+        terminal
+    }
+
+    fn locate(terminal: &Terminal<TestBackend>, token: &str) -> (u16, u16) {
+        let buf = terminal.backend().buffer();
+        let width = usize::from(buf.area.width);
+        let height = usize::from(buf.area.height);
+        for y in 0..height {
+            let text: String = buf.content[y * width..(y + 1) * width]
+                .iter()
+                .map(Cell::symbol)
+                .collect();
+            if let Some(byte) = text.find(token) {
+                let col = text[..byte].chars().count();
+                return (u16::try_from(col).unwrap(), u16::try_from(y).unwrap());
+            }
+        }
+        panic!("token {token:?} not found");
+    }
+
+    fn is_underlined(terminal: &Terminal<TestBackend>, token: &str) -> bool {
+        let (col, row) = locate(terminal, token);
+        let buf = terminal.backend().buffer();
+        let start = usize::from(row) * usize::from(buf.area.width) + usize::from(col);
+        let end = start + token.chars().count();
+        buf.content[start..end]
+            .iter()
+            .all(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+    }
+
+    fn assert_viewer_output(app: &mut App, wanted: &str) {
+        assert!(matches!(app.surface, Some(Surface::Viewer(..))));
+        let _ = paint(app);
+        let effects = key(app, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Spawn(_, Task::Copy(Copy::Text { text, .. })) if text == wanted
+            )),
+            "expected viewer copy of {wanted:?}"
+        );
+        key(app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.surface.is_none());
+    }
+
+    #[tokio::test]
+    async fn hovering_underlines_clickable_cells_and_clicking_opens_them_without_breaking_drag() {
+        let dir = TempDir::new("tui-cell-hover-click");
+        let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+        let (mut app, _) = attached_fixture(dir.path(), provider).await;
+        app.transcript.set_ui(Ui::Cells);
+        app.update(Msg::Events(vec![
+            UiEvent::ToolStarted {
+                id: "first".into(),
+                name: "first".into(),
+                arguments: serde_json::json!({"code": "read('a.rs')"}).into(),
+                live: None,
+            },
+            UiEvent::ToolFinished {
+                id: "first".into(),
+                output: "first output".into(),
+                status: Status::Succeeded,
+                elapsed: None,
+                jobs: Vec::new(),
+                diffs: Vec::new(),
+                activities: crate::tool::Activities {
+                    rows: vec![Activity {
+                        title: "read('a.rs')".into(),
+                        state: LiveState::Finished,
+                    }],
+                    omitted: 0,
+                },
+            },
+            UiEvent::ToolStarted {
+                id: "second".into(),
+                name: "second".into(),
+                arguments: serde_json::json!({"code": "run('test')"}).into(),
+                live: None,
+            },
+            UiEvent::ToolFinished {
+                id: "second".into(),
+                output: "failure preview\nproblem".into(),
+                status: Status::Failed,
+                elapsed: None,
+                jobs: Vec::new(),
+                diffs: Vec::new(),
+                activities: crate::tool::Activities {
+                    rows: vec![Activity {
+                        title: "run('test')".into(),
+                        state: LiveState::Failed,
+                    }],
+                    omitted: 0,
+                },
+            },
+            UiEvent::Compacted("compaction body".into()),
+            UiEvent::Notification(Notification {
+                text: "[job 1]\njob detail".into(),
+                kind: NotificationKind::JobFinished {
+                    id: 1,
+                    outcome: JobOutcome::Exit(0),
+                    command: "echo ok".into(),
+                    capture: SavedArtifact {
+                        path: "job.log".into(),
+                        completeness: Completeness::Complete,
+                        chars: 0,
+                        bytes: 0,
+                    },
+                },
+            }),
+        ]));
+
+        let term = paint(&mut app);
+        assert!(!is_underlined(&term, "first"));
+        let first_pos = locate(&term, "first");
+
+        // Hover underlines the hovered cell only.
+        mouse(&mut app, MouseEventKind::Moved, first_pos);
+        let term = paint(&mut app);
+        assert!(is_underlined(&term, "first"));
+        assert!(!is_underlined(&term, "second"));
+
+        // Moving outside conversation clears hover underline.
+        let outside = (0, app.geometry.conversation.bottom());
+        mouse(&mut app, MouseEventKind::Moved, outside);
+        let term = paint(&mut app);
+        assert!(!is_underlined(&term, "first"));
+
+        // Dragging text on a cell row copies without opening the viewer.
+        let drag_end = (first_pos.0 + 4, first_pos.1);
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), first_pos);
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), drag_end);
+        let effects = mouse(&mut app, MouseEventKind::Up(MouseButton::Left), drag_end);
+        assert!(app.surface.is_none());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Spawn(_, Task::Copy(Copy::Text { text, .. })) if text == "first"
+        )));
+
+        // Clicking opens the exact cell or notice directly.
+        for (token, expected) in [
+            ("first", "first output"),
+            ("second", "failure preview\nproblem"),
+            ("Context compacted", "compaction body"),
+            ("job 1 finished", "job detail"),
+        ] {
+            let term = paint(&mut app);
+            let pos = locate(&term, token);
+            mouse(&mut app, MouseEventKind::Down(MouseButton::Left), pos);
+            mouse(&mut app, MouseEventKind::Up(MouseButton::Left), pos);
+            assert_viewer_output(&mut app, expected);
+        }
+
+        // Ctrl+O keeps its standard behavior (opens latest detail, not failed cell).
+        key(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_viewer_output(&mut app, "job detail");
+
+        // Evicted detail shows status instead of panicking or opening wrong item.
+        for _ in 0..MAX_DETAILS {
+            app.transcript.note("filler", "filler");
+        }
+        let term = paint(&mut app);
+        let pos = locate(&term, "first");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), pos);
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), pos);
+        assert!(app.surface.is_none());
+        assert_eq!(app.status.text(), Some("detail is no longer retained"));
+
+        // Drag updates against stale geometry after resize are ignored so they cannot pull in a resized tool row.
+        app.update(Msg::Events(vec![
+            UiEvent::Text("Before".into()),
+            UiEvent::Responded,
+        ]));
+        let term = paint(&mut app);
+        let prose_pos = locate(&term, "Before");
+        let cell_pos = locate(&term, "1 line");
+        mouse(&mut app, MouseEventKind::Down(MouseButton::Left), prose_pos);
+        app.update(Msg::Size(ratatui::layout::Size::new(120, 24)));
+        mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), cell_pos);
+        let effects = mouse(&mut app, MouseEventKind::Up(MouseButton::Left), cell_pos);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Spawn(_, Task::Copy(_))))
+        );
+
+        // Stationary pointer hover follows the row under the pointer when content appends.
+        let term = paint(&mut app);
+        let job_pos = locate(&term, "job 1 finished");
+        mouse(&mut app, MouseEventKind::Moved, job_pos);
+        let term = paint(&mut app);
+        assert!(is_underlined(&term, "job 1 finished"));
+        let filler = "row\n".repeat(12);
+        app.update(Msg::Events(vec![
+            UiEvent::Text(format!("```txt\n{filler}```")),
+            UiEvent::Responded,
+        ]));
+        let term = paint(&mut app);
+        assert!(locate(&term, "job 1 finished").1 < job_pos.1);
+        assert!(!is_underlined(&term, "job 1 finished"));
+
+        // Oversized compaction replay summary evicted by bound_details does not panic.
+        let oversized = "x".repeat(33 * 1024 * 1024);
+        app.update(Msg::Events(vec![UiEvent::Compacted(oversized)]));
+    }
+}

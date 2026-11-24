@@ -135,7 +135,7 @@ impl App {
             }
             Event::Mouse(mouse) => self.mouse(mouse),
             Event::FocusGained => self.effects.push(Effect::Clear),
-            Event::Resize(..) => self.geometry.resized_at = Some(Instant::now()),
+            Event::Resize(..) => self.resize_pending(),
             _ => {}
         }
     }
@@ -466,26 +466,35 @@ impl App {
                     _ => {}
                 }
                 let area = self.geometry.conversation;
-                let row = mouse.row.saturating_sub(area.y);
+                let row = usize::from(mouse.row.saturating_sub(area.y));
                 let column = usize::from(mouse.column.saturating_sub(area.x));
-                let fresh = self.geometry.resized_at.is_none();
+                let painted = self.geometry.resized_at.is_none() && self.conversation_painted();
+                let hit = area.contains((mouse.column, mouse.row).into()) && painted;
+                let clickable = mouse.modifiers.is_empty() && painted;
                 match mouse.kind {
                     MouseEventKind::ScrollUp => self.scrollback.scroll_line(false),
                     MouseEventKind::ScrollDown => self.scrollback.scroll_line(true),
-                    MouseEventKind::Down(MouseButton::Left) if fresh => {
-                        if area.contains((mouse.column, mouse.row).into()) {
-                            self.scrollback.select(usize::from(row), column, false);
-                        }
+                    MouseEventKind::Moved => {
+                        self.scrollback.hover((hit && clickable).then_some(row));
                     }
-                    MouseEventKind::Drag(MouseButton::Left) if fresh => {
+                    MouseEventKind::Down(MouseButton::Left) if hit => {
+                        self.scrollback.press(row, column, clickable);
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if painted => {
                         if mouse.row < area.y || mouse.row >= area.bottom() {
                             self.scrollback.select_beyond(mouse.row < area.y, column);
                         } else {
-                            self.scrollback.select(usize::from(row), column, true);
+                            self.scrollback.select(row, column, true);
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some(text) = self.scrollback.selected_text(&mut self.transcript) {
+                        if let Some(detail) =
+                            self.scrollback.release((hit && clickable).then_some(row))
+                        {
+                            self.open_detail(detail);
+                        } else if let Some(text) =
+                            self.scrollback.selected_text(&mut self.transcript)
+                        {
                             let chars = format!("{} chars", text.chars().count());
                             self.copy_text(text, chars);
                         }

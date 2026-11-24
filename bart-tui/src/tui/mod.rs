@@ -493,7 +493,10 @@ async fn run_effects(
             HostEffect::CopyToTerminal { text, what } => effects.extend(app.update(
                 Msg::Clipboard(clipboard::copy_terminal(screen.backend_mut(), &text, &what)),
             )),
-            HostEffect::Clear => screen.clear()?,
+            HostEffect::Clear => {
+                app.invalidate_paint();
+                screen.clear()?;
+            }
             HostEffect::Suspend => {
                 input.pause().await?;
                 if crate::signals::job_control_available() {
@@ -505,7 +508,10 @@ async fn run_effects(
                 }
                 input.resume()?;
             }
-            HostEffect::Reassert => input::reassert(screen)?,
+            HostEffect::Reassert => {
+                app.invalidate_paint();
+                input::reassert(screen)?;
+            }
             HostEffect::Quit => return Ok(Some(Effect::Quit)),
             HostEffect::Exec(plan) => return Ok(Some(Effect::Exec(plan))),
         }

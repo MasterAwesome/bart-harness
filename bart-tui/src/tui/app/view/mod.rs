@@ -1,9 +1,9 @@
 use crate::tui::text::clip_end;
 use crate::tui::text::{Item, fit, width as text_width};
-use std::io;
 
 use ratatui::{
-    Frame,
+    Frame, Terminal,
+    backend::Backend,
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     text::{Line, Span},
@@ -12,7 +12,7 @@ use ratatui::{
 
 use super::{App, MAX_COMPOSER_ROWS, Surface, parse_slash};
 use crate::tui::SPIN;
-use crate::tui::{Screen, brand, theme};
+use crate::tui::{brand, theme};
 
 const STATUS_SEPARATOR: &str = " · ";
 const WIDE_STATUS_WIDTH: usize = 100;
@@ -28,18 +28,22 @@ enum HintContext {
 
 pub(in crate::tui) use crate::tui::widgets::confirm::FrameStamp;
 
+type TerminalSizeProbe = fn() -> std::io::Result<(u16, u16)>;
+
 pub(in crate::tui) struct Painted {
     pub(super) stamp: FrameStamp,
     pub(super) review: bool,
+    pub(super) conversation: bool,
+    pub(super) terminal_size: Option<TerminalSizeProbe>,
     pub(super) spinner_visible: bool,
 }
 
 impl App {
-    pub(super) fn render_frame(
+    pub(super) fn render_frame<B: Backend>(
         &mut self,
-        screen: &mut Screen,
+        screen: &mut Terminal<B>,
         running_jobs: usize,
-    ) -> io::Result<Painted> {
+    ) -> Result<Painted, B::Error> {
         let mut reviewable = false;
         let mut spinner_visible = false;
         let completed = screen.draw(|frame| {
@@ -65,6 +69,8 @@ impl App {
         Ok(Painted {
             stamp,
             review,
+            conversation: self.surface.is_none(),
+            terminal_size: None,
             spinner_visible,
         })
     }

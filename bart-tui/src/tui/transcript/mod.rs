@@ -37,7 +37,7 @@ use crate::{
 };
 
 const MAX_DETAIL_BYTES: usize = 32 * 1024 * 1024;
-const MAX_DETAILS: usize = 1024;
+pub(in crate::tui) const MAX_DETAILS: usize = 1024;
 const MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ROWS: usize = 32768;
 
@@ -80,6 +80,7 @@ struct Finished {
 
 struct Call {
     id: String,
+    detail: DetailSequence,
     subject: Subject,
     live: Option<u64>,
     started: Instant,
@@ -318,7 +319,7 @@ impl Transcript {
         self.ui = ui;
     }
 
-    fn tool_rows(&self, width: u16, tick: usize) -> Vec<Line<'static>> {
+    fn tool_rows(&self, width: u16, tick: usize) -> Vec<RenderRow> {
         if self.ui == crate::preferences::Ui::Cells {
             return tools(&self.calls, self.live_tools.as_deref(), width, tick);
         }
@@ -440,21 +441,20 @@ impl Transcript {
                 self.finish_compaction("no-op · sufficient headroom");
             }
             UiEvent::Compacted(summary) => {
-                let had_live = self.compaction.is_some();
                 if let Some(detail) = self.compaction_detail() {
                     detail.output = Clean::new(&summary);
                 }
-                self.finish_compaction("completed");
-                if !had_live
-                    && !self
+                let detail = self.finish_compaction("completed").unwrap_or_else(|| {
+                    let existing = self
                         .details
                         .iter()
-                        .any(|detail| detail.is_compaction() && *detail.output == summary)
-                {
-                    self.compaction_note(&summary);
-                }
+                        .rev()
+                        .find(|detail| detail.is_compaction() && *detail.output == summary)
+                        .map(|detail| detail.sequence);
+                    existing.unwrap_or_else(|| self.compaction_note(&summary))
+                });
                 self.flush_text(&mut done);
-                done.push(self.compaction_block(&summary));
+                done.push(self.compaction_block(&summary, detail));
             }
             UiEvent::Reasoning(delta) => self.stream_reasoning(&delta, &mut done),
             UiEvent::Text(delta) => self.stream_text(&delta, &mut done),
@@ -518,8 +518,9 @@ impl Transcript {
                 };
                 let code = Clean::new(&code);
                 let subject = Subject::of(&name, &code);
+                let detail = self.next_detail.take_next();
                 self.details.push(Detail {
-                    sequence: self.next_detail.take_next(),
+                    sequence: detail,
                     kind: DetailKind::Call {
                         call_id: id.clone(),
                     },
@@ -534,6 +535,7 @@ impl Transcript {
                 self.bound_details();
                 self.calls.push(Call {
                     id,
+                    detail,
                     subject,
                     live,
                     started: Instant::now(),
@@ -682,10 +684,10 @@ impl Transcript {
             .iter_mut()
             .flat_map(|call| std::mem::take(&mut call.diffs))
             .collect();
-        let text = Text::from(self.tool_rows(width, 0));
+        let text = RenderText::from(self.tool_rows(width, 0));
         let calls = std::mem::take(&mut self.calls);
         let mut done = Vec::new();
-        if let Some(text) = self.spacing.render(&Kind::Tools(Vec::new()), text.into()) {
+        if let Some(text) = self.spacing.render(&Kind::Tools(Vec::new()), text) {
             done.push(Block::new(Kind::Tools(calls), text));
         }
         if !diffs.is_empty() {
@@ -720,6 +722,7 @@ impl Transcript {
         let (heading, body) = text.split_once('\n').unwrap_or((&text, ""));
         let heading = heading.trim_start_matches('[').trim_end_matches(']');
         let title = &heading[..heading.floor_char_boundary(heading.len().min(500))];
+        let sequence = self.next_detail.take_next();
         if let NotificationKind::JobFinished {
             id,
             outcome,
@@ -755,10 +758,13 @@ impl Transcript {
             }
             self.emit(
                 Kind::Notice,
-                Text::from(Line::from(vec![
-                    Span::styled(format!("{mark} "), style),
-                    Span::raw(status),
-                ])),
+                vec![RenderRow::detail(
+                    Line::from(vec![
+                        Span::styled(format!("{mark} "), style),
+                        Span::raw(status),
+                    ]),
+                    sequence,
+                )],
                 done,
             );
         }
@@ -766,7 +772,11 @@ impl Transcript {
             kind,
             NotificationKind::JobMatched { .. } | NotificationKind::JobCommandExited { .. }
         ) {
-            self.emit(Kind::Notice, Text::from(title.to_owned()), done);
+            self.emit(
+                Kind::Notice,
+                vec![RenderRow::detail(Line::from(title.to_owned()), sequence)],
+                done,
+            );
         }
         let order = self
             .details
@@ -774,7 +784,7 @@ impl Transcript {
             .rev()
             .find_map(|detail| detail.order_hint.or(detail.live_run_id));
         self.details.push(Detail {
-            sequence: self.next_detail.take_next(),
+            sequence,
             kind: DetailKind::Notification {
                 terminal_job_id: job,
             },
@@ -985,7 +995,7 @@ impl Transcript {
             ),
             (
                 Kind::Tools(Vec::new()),
-                RenderText::from(Text::from(self.tool_rows(width, tick))),
+                RenderText::from(self.tool_rows(width, tick)),
             ),
         ] {
             if let Some(text) = spacing.render(&element, text) {

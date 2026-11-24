@@ -1,4 +1,4 @@
-use crate::tui::text;
+use crate::tui::{text, transcript::DetailSequence};
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -14,6 +14,7 @@ pub(super) struct Row {
     pub(super) anchor: Anchor,
     line: Line<'static>,
     content: Content,
+    detail: Option<DetailSequence>,
 }
 
 #[derive(Clone)]
@@ -199,6 +200,13 @@ impl Row {
     pub(super) fn line(&self) -> &Line<'static> {
         &self.line
     }
+    pub(super) fn detail(&self) -> Option<DetailSequence> {
+        self.detail
+    }
+    pub(super) fn with_detail(mut self, detail: Option<DetailSequence>) -> Self {
+        self.detail = detail;
+        self
+    }
     #[cfg(test)]
     pub(super) fn into_line(self) -> Line<'static> {
         self.line
@@ -211,6 +219,7 @@ impl Row {
             anchor,
             line,
             content: Content::Chrome(point),
+            detail: None,
         }
     }
     pub(super) fn notice(anchor: Anchor, line: Line<'static>, source: &'static str) -> Self {
@@ -218,6 +227,7 @@ impl Row {
             anchor,
             line,
             content: Content::Notice(source),
+            detail: None,
         }
     }
     pub(super) fn table(
@@ -245,6 +255,7 @@ impl Row {
                         last,
                     },
                 },
+                detail: None,
             },
             None => Self::chrome(anchor, line),
         }
@@ -704,6 +715,7 @@ pub(super) fn wrap_prefixed(
                     alignment: line.alignment,
                 },
                 content,
+                detail: None,
             }
         })
         .collect()

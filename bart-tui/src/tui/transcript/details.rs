@@ -43,8 +43,15 @@ impl Transcript {
             .find(|detail| detail.sequence == sequence)
     }
 
-    pub(super) fn finish_compaction(&mut self, status: &str) {
-        if let Some(detail) = self.compaction_detail() {
+    pub(super) fn finish_compaction(&mut self, status: &str) -> Option<DetailSequence> {
+        let sequence = self.compaction.take();
+        if let Some(sequence) = sequence
+            && let Some(detail) = self
+                .details
+                .iter_mut()
+                .rev()
+                .find(|detail| detail.sequence == sequence)
+        {
             detail.title = if status == "completed" {
                 Clean::literal("Compaction summary")
             } else {
@@ -54,21 +61,27 @@ impl Transcript {
                 *running = false;
             }
         }
-        self.compaction = None;
+        sequence
     }
 
-    pub(in crate::tui) fn compaction_note(&mut self, output: &str) {
-        self.note("Compaction summary", output);
-        if let Some(detail) = self.details.last_mut() {
+    pub(in crate::tui) fn compaction_note(&mut self, output: &str) -> DetailSequence {
+        let sequence = self.note("Compaction summary", output);
+        if let Some(detail) = self
+            .details
+            .last_mut()
+            .filter(|detail| detail.sequence == sequence)
+        {
             detail.kind = DetailKind::Compaction { running: false };
         }
+        sequence
     }
 
-    pub(in crate::tui) fn note(&mut self, title: &str, output: &str) {
+    pub(in crate::tui) fn note(&mut self, title: &str, output: &str) -> DetailSequence {
         let order_hint = self.latest_order_hint();
+        let sequence = self.next_detail.take_next();
         self.details.push(Detail {
             kind: DetailKind::Note,
-            sequence: self.next_detail.take_next(),
+            sequence,
             live_run_id: None,
             order_hint,
             title: Clean::new(title),
@@ -78,6 +91,7 @@ impl Transcript {
             highlights: Vec::new(),
         });
         self.bound_details();
+        sequence
     }
 
     pub(in crate::tui) fn ui_notice(&mut self, kind: StatusKind, body: &Clean) {

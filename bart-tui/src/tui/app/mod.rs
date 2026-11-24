@@ -420,6 +420,7 @@ impl App {
     }
 
     pub(in crate::tui) fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        let surface = self.surface.as_ref().map(std::mem::discriminant);
         match msg {
             Msg::Input(ReadEvent::Terminal(event)) => self.input(event),
             Msg::Input(ReadEvent::Refused(reason)) => self.set_status(StatusKind::Info, reason),
@@ -506,6 +507,14 @@ impl App {
                 self.set_picker(Some(Picker::providers(Vec::new(), false)));
                 self.load_providers(None);
             }
+        }
+        if surface != self.surface.as_ref().map(std::mem::discriminant)
+            || self
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Clear))
+        {
+            self.invalidate_paint();
         }
         std::mem::take(&mut self.effects)
     }
@@ -622,6 +631,14 @@ impl App {
         }
     }
 
+    fn open_detail(&mut self, detail: super::transcript::DetailSequence) {
+        let Some(viewer) = Viewer::open_detail(self.transcript.details(), detail) else {
+            self.set_status(StatusKind::Info, "detail is no longer retained");
+            return;
+        };
+        self.show_viewer(viewer);
+    }
+
     fn open_details(&mut self, error: Option<String>) {
         let latest = error.is_some();
         if let Some(error) = error {
@@ -631,6 +648,12 @@ impl App {
             return;
         };
         let viewer = Viewer::new(self.transcript.details(), &session.live, latest);
+        self.show_viewer(viewer);
+    }
+
+    fn show_viewer(&mut self, viewer: Viewer) {
+        self.scrollback.clear_hover();
+        self.scrollback.cancel_click();
         self.cancel_picker_tasks();
         self.cancel_task(Kind::Image);
         self.cancel_task(Kind::Prepare);

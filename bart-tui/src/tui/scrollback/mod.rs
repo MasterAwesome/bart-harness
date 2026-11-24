@@ -1,9 +1,9 @@
 use super::{
     markdown::{RenderRow, selectable},
     selection::{self, Anchor, Point, Row},
-    transcript::Transcript,
+    transcript::{DetailSequence, Transcript},
 };
-use ratatui::text::Line;
+use ratatui::{style::Modifier, text::Line};
 use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Default)]
@@ -19,6 +19,8 @@ pub(super) struct Scrollback {
     height: usize,
     shown: Vec<Row>,
     selection: Option<(Point, Point, bool)>,
+    pressed_detail: Option<DetailSequence>,
+    hovered_row: Option<usize>,
 }
 
 impl Scrollback {
@@ -46,6 +48,8 @@ impl Scrollback {
     pub(super) fn resize(&mut self, width: u16, transcript: &Transcript) {
         if self.width != width {
             self.cancel_layout_selection(transcript);
+            self.cancel_click();
+            self.hovered_row = None;
             self.width = width;
             self.heights.clear();
         }
@@ -213,6 +217,9 @@ impl Scrollback {
         }
     }
     pub(super) fn view(&mut self, height: usize, transcript: &Transcript) -> Vec<Line<'_>> {
+        if self.height != height {
+            self.hovered_row = None;
+        }
         self.height = height;
         self.shown.clear();
         if height == 0 {
@@ -283,12 +290,28 @@ impl Scrollback {
             self.shown[0] = Row::chrome(self.shown[0].anchor, Line::from(OMITTED));
         }
         let selection = self.selected_range();
+        let hovered = selection
+            .is_none()
+            .then_some(self.hovered_row)
+            .flatten()
+            .and_then(|row| self.shown.get(row))
+            .and_then(Row::detail);
         let mut lines: Vec<_> = self
             .shown
             .iter()
             .map(|row| match selection {
                 Some(range) => selection::highlight(row, range),
-                None => selection::borrowed(row.line()),
+                None => {
+                    let mut line = selection::borrowed(row.line());
+                    if hovered.is_some() && row.detail() == hovered {
+                        for span in &mut line.spans {
+                            if !span.content.trim().is_empty() {
+                                span.style = span.style.add_modifier(Modifier::UNDERLINED);
+                            }
+                        }
+                    }
+                    line
+                }
             })
             .collect();
         for line in &mut lines {
@@ -306,6 +329,8 @@ impl Scrollback {
         self.scroll_by(down, 1);
     }
     fn scroll_by(&mut self, down: bool, rows: usize) {
+        self.cancel_click();
+        self.hovered_row = None;
         if self.anchor.is_none()
             && let Some(row) = self.shown.first()
         {
@@ -318,10 +343,51 @@ impl Scrollback {
         };
     }
     pub(super) fn follow(&mut self) {
+        self.cancel_click();
+        self.hovered_row = None;
         self.anchor = None;
         self.pending = 0;
     }
+    pub(super) fn hover(&mut self, row: Option<usize>) {
+        self.hovered_row = if self.selected_range().is_some() {
+            None
+        } else {
+            row
+        };
+    }
+    pub(super) fn clear_hover(&mut self) {
+        self.hovered_row = None;
+    }
+    pub(super) fn cancel_click(&mut self) {
+        self.pressed_detail = None;
+    }
+    pub(super) fn press(&mut self, row: usize, column: usize, clickable: bool) {
+        self.pressed_detail = clickable
+            .then(|| self.shown.get(row).and_then(Row::detail))
+            .flatten();
+        self.select(row, column, false);
+    }
+    pub(super) fn release(&mut self, row: Option<usize>) -> Option<DetailSequence> {
+        let pressed = self.pressed_detail.take()?;
+        if self.selected_range().is_some() {
+            return None;
+        }
+        let released = row
+            .and_then(|row| self.shown.get(row))
+            .and_then(Row::detail);
+        if released == Some(pressed) {
+            self.clear_selection();
+            self.hovered_row = None;
+            Some(pressed)
+        } else {
+            None
+        }
+    }
     pub(super) fn select(&mut self, row: usize, column: usize, extend: bool) {
+        if extend {
+            self.cancel_click();
+            self.hovered_row = None;
+        }
         if extend && self.selection.is_none() {
             return;
         }

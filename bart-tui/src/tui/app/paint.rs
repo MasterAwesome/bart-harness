@@ -1,6 +1,24 @@
 use super::*;
 
 impl App {
+    pub(in crate::tui) fn invalidate_paint(&mut self) {
+        self.paint.record(None);
+        self.scrollback.cancel_click();
+        self.scrollback.clear_hover();
+    }
+
+    pub(super) fn resize_pending(&mut self) {
+        self.invalidate_paint();
+        self.geometry.resized_at = Some(Instant::now());
+    }
+
+    pub(super) fn conversation_painted(&self) -> bool {
+        self.paint
+            .last
+            .as_ref()
+            .is_some_and(|frame| frame.conversation && self.frame_size_matches(frame))
+    }
+
     pub(super) fn prepare_frame(&mut self) {
         self.animation_mut().advance();
         if let Some(turn) = &mut self.turn {
@@ -42,6 +60,8 @@ impl App {
             self.geometry.resized_at = None;
         } else {
             self.animation_mut().visible = false;
+            self.scrollback.cancel_click();
+            self.scrollback.clear_hover();
         }
         if let Some(painted) = &painted
             && painted.review
@@ -60,7 +80,7 @@ impl App {
             self.geometry.size = size;
             self.scrollback.resize(size.width, &self.transcript);
             self.animation_mut().visible = false;
-            self.geometry.resized_at = Some(Instant::now());
+            self.resize_pending();
         }
     }
 
@@ -76,13 +96,18 @@ impl App {
             _ => None,
         }
     }
-    pub(super) fn review_stamp(&self) -> Option<view::FrameStamp> {
-        let stamp = self.paint.last.as_ref()?.stamp;
+    fn frame_size_matches(&self, frame: &view::Painted) -> bool {
         let size = (self.geometry.size.width, self.geometry.size.height);
-        (stamp.size == size
-            && crossterm::terminal::size().ok() == Some(size)
-            && self.geometry.resized_at.is_none())
-        .then_some(stamp)
+        self.geometry.resized_at.is_none()
+            && frame.stamp.size == size
+            && frame
+                .terminal_size
+                .is_none_or(|probe| probe().ok() == Some(size))
+    }
+
+    pub(super) fn review_stamp(&self) -> Option<view::FrameStamp> {
+        let frame = self.paint.last.as_ref()?;
+        self.frame_size_matches(frame).then_some(frame.stamp)
     }
 
     pub(in crate::tui) fn drawable(&self) -> bool {
@@ -112,7 +137,9 @@ impl App {
             if self.geometry.resized_at.is_some() {
                 screen.clear()?;
             }
-            self.render_frame(screen, running_jobs)
+            let mut painted = self.render_frame(screen, running_jobs)?;
+            painted.terminal_size = Some(crossterm::terminal::size);
+            Ok(painted)
         })
     }
 

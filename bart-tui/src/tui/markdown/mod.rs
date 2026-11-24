@@ -13,6 +13,7 @@ use std::{
 use super::{
     selection::{self, CellBox, Point, Row},
     text,
+    transcript::DetailSequence,
 };
 use pulldown_cmark::{Alignment, BrokenLink, CodeBlockKind, Event, LinkType, Options, Parser, Tag};
 use ratatui::{
@@ -25,6 +26,7 @@ pub(super) struct RenderRow {
     kind: RowKind,
     prefix: Vec<Span<'static>>,
     wrap_prefix: Vec<Span<'static>>,
+    detail: Option<DetailSequence>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +68,7 @@ impl RenderRow {
             kind,
             prefix: Vec::new(),
             wrap_prefix: Vec::new(),
+            detail: None,
         }
     }
     fn text(line: Line<'static>, wrap: Wrap) -> Self {
@@ -73,6 +76,11 @@ impl RenderRow {
     }
     pub(super) fn literal(line: Line<'static>) -> Self {
         Self::text(line, Wrap::Prose)
+    }
+    pub(super) fn detail(line: Line<'static>, detail: DetailSequence) -> Self {
+        let mut row = Self::literal(line);
+        row.detail = Some(detail);
+        row
     }
     pub(super) fn source(&self) -> String {
         match &self.kind {
@@ -114,11 +122,11 @@ impl RenderRow {
         len + 1
     }
     fn selectable(&self, at: Point, width: usize, budget: &mut TableBudget) -> Vec<Row> {
-        match &self.kind {
+        let rows = match &self.kind {
             RowKind::Text(line, mode) => {
                 selection::wrap_prefixed(line, &self.prefix, &self.wrap_prefix, at, width, *mode)
             }
-            RowKind::Table(_) if self.table_clipped() => {
+            RowKind::Table(_) | RowKind::TableClipped if self.table_clipped() => {
                 if budget.remaining() > 0 {
                     budget.used += 1;
                     vec![Row::notice(
@@ -131,18 +139,14 @@ impl RenderRow {
                 }
             }
             RowKind::Table(row) => row.project(at, width, &self.prefix, budget),
-            RowKind::TableClipped => {
-                if budget.remaining() > 0 {
-                    budget.used += 1;
-                    vec![Row::notice(
-                        (at.0, at.1, 0),
-                        table_notice(TABLE_BYTES_NOTICE, width),
-                        TABLE_BYTES_NOTICE,
-                    )]
-                } else {
-                    budget.clip(at, 0, width).into_iter().collect()
-                }
-            }
+            RowKind::TableClipped => unreachable!("clipped table"),
+        };
+        if self.detail.is_none() {
+            rows
+        } else {
+            rows.into_iter()
+                .map(|row| row.with_detail(self.detail))
+                .collect()
         }
     }
     pub(super) fn bytes(&self) -> usize {
@@ -390,6 +394,7 @@ fn marked(mut lines: Vec<RenderRow>, marker: String) -> Vec<RenderRow> {
             kind: RowKind::Text(line, Plain),
             prefix,
             wrap_prefix,
+            detail: None,
         }) if prefix.is_empty() => {
             line.spans.insert(0, Span::raw(marker));
             wrap_prefix.insert(0, indent.clone());

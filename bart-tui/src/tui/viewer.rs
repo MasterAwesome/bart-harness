@@ -178,6 +178,34 @@ struct Content<'a> {
 }
 
 impl Viewer {
+    pub(super) fn open_detail(details: &[Detail], detail: DetailSequence) -> Option<Self> {
+        details
+            .iter()
+            .any(|entry| entry.sequence == detail)
+            .then(|| Self::with_selection(Selection::Detail(detail), details))
+    }
+
+    fn with_selection(selected: Selection, details: &[Detail]) -> Self {
+        Self {
+            selected,
+            code: Pane::new(false),
+            output: Pane::new(!is_ui_notice(selected, details)),
+            focus: Focus::Output,
+            search: Search::default(),
+
+            drag: None,
+            size: Size::default(),
+            heading: Line::default(),
+            output_heading: String::new(),
+            compact_title: String::new(),
+            has_code: false,
+            empty: true,
+            waiting: false,
+            painted: None,
+            code_key: None,
+        }
+    }
+
     pub(super) fn new(details: &[Detail], live: &Live, latest: bool) -> Self {
         let active = details
             .iter()
@@ -208,24 +236,7 @@ impl Viewer {
                 |(_, selection)| selection,
             )
         });
-        Self {
-            selected,
-            code: Pane::new(false),
-            output: Pane::new(!is_ui_notice(selected, details)),
-            focus: Focus::Output,
-            search: Search::default(),
-
-            drag: None,
-            size: Size::default(),
-            heading: Line::default(),
-            output_heading: String::new(),
-            compact_title: String::new(),
-            has_code: false,
-            empty: true,
-            waiting: false,
-            painted: None,
-            code_key: None,
-        }
+        Self::with_selection(selected, details)
     }
 
     fn select(&mut self, selection: Selection, details: &[Detail]) {

@@ -51,7 +51,7 @@ impl Block {
             } else {
                 tools::activities(calls, None, width, 0)
             };
-            rows.extend(lines.into_iter().map(RenderRow::literal));
+            rows.extend(lines);
             return rows.into();
         }
         std::borrow::Cow::Borrowed(&self.rows)
