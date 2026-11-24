@@ -10,10 +10,10 @@ use sha2::{Digest as _, Sha256};
 use tokio::time;
 
 use super::{
-    ERROR_BODY_TIMEOUT, Error, Protocol, Provider, authorize, credential, gemini, http_error,
-    messages, responses,
+    ERROR_BODY_TIMEOUT, Error, Protocol, Provider, Resolved, authorize, credential, gemini,
+    http_error, messages, refresh_command, responses,
 };
-use crate::auth::{Credential, Store};
+use crate::auth::Store;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Visibility {
@@ -101,16 +101,16 @@ enum Owner {
 }
 
 impl Owner {
-    fn of(credential: Option<&Credential>) -> Self {
+    fn of(credential: Option<&Resolved>) -> Self {
         match credential {
             None => Self::None,
-            Some(Credential::Chatgpt(tokens)) => Self::Account(tokens.account_id.clone()),
-            Some(Credential::ApiKey { key }) => Self::Key(Sha256::digest(key.expose()).into()),
+            Some(Resolved::Chatgpt(tokens)) => Self::Account(tokens.account_id.clone()),
+            Some(key) => Self::Key(Sha256::digest(key.secret().expose()).into()),
         }
     }
 }
 
-fn entry(provider: &Provider, credential: Option<&Credential>) -> Arc<Entry> {
+fn entry(provider: &Provider, credential: Option<&Resolved>) -> Arc<Entry> {
     let owner = Owner::of(credential);
     let mut catalogs = CATALOGS.lock().expect(crate::NOT_POISONED);
     match catalogs.get(provider.name()) {
@@ -134,13 +134,10 @@ pub async fn models(
     store: &Store,
     provider: &Provider,
 ) -> Result<Vec<Model>, Error> {
-    let credential = credential(client, store, provider).await?;
-    let credential = credential.as_ref();
-    let entry = entry(provider, credential);
-    let mut models = entry.models.lock().await;
-    Ok(loaded(&mut models, client, provider, credential, None)
-        .await?
-        .clone())
+    lookup(client, store, provider, None, async |models| {
+        Ok(models.to_vec())
+    })
+    .await
 }
 
 /// # Errors
@@ -152,42 +149,56 @@ pub async fn model(
     provider: &Provider,
     id: &str,
 ) -> Result<Option<Model>, Error> {
-    let credential = credential(client, store, provider).await?;
-    let credential = credential.as_ref();
-    let entry = entry(provider, credential);
-    let mut models = entry.models.lock().await;
-    let Some(model) = loaded(&mut models, client, provider, credential, Some(id))
-        .await?
-        .iter_mut()
-        .find(|model| model.id == id)
-    else {
-        return Ok(None);
-    };
-    if provider.protocol() == Protocol::Claude && model.context_window.is_none() {
-        let window = super::claude_code::context_window(id).await?;
-        model.context_window = Some(window);
-        model.max_context_window = Some(window);
-    }
-    Ok(Some(model.clone()))
+    lookup(client, store, provider, Some(id), async |models| {
+        let Some(model) = models.iter_mut().find(|model| model.id == id) else {
+            return Ok(None);
+        };
+        if provider.protocol() == Protocol::Claude && model.context_window.is_none() {
+            let window = super::claude_code::context_window(id).await?;
+            model.context_window = Some(window);
+            model.max_context_window = Some(window);
+        }
+        Ok(Some(model.clone()))
+    })
+    .await
 }
 
-async fn loaded<'a>(
-    models: &'a mut Option<Vec<Model>>,
+async fn lookup<T>(
     client: &Client,
+    store: &Store,
     provider: &Provider,
-    credential: Option<&Credential>,
     selected: Option<&str>,
-) -> Result<&'a mut Vec<Model>, Error> {
-    if models.is_none() {
-        let listed = match provider.http() {
-            None => super::claude_code::models(selected).await?,
-            Some(endpoint) => catalog(client, endpoint, credential)
-                .await
-                .map_err(|error| error.sanitized(credential))?,
-        };
-        *models = Some(listed);
+    project: impl AsyncFnOnce(&mut [Model]) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let mut resolved = credential(client, store, provider).await?;
+    let mut replay = true;
+    loop {
+        let credential = resolved.as_ref();
+        let entry = entry(provider, credential);
+        let mut models = entry.models.lock().await;
+        if models.is_none() {
+            let result = match provider.http() {
+                None => super::claude_code::models(selected).await,
+                Some(endpoint) => catalog(client, endpoint, credential).await,
+            };
+            match result {
+                Ok(listed) => *models = Some(listed),
+                Err(error) => {
+                    if let Some(issued) = error.reject_command(credential)
+                        && std::mem::take(&mut replay)
+                    {
+                        drop(models);
+                        if let Some(fresh) = refresh_command(store, provider, issued).await? {
+                            resolved = Some(fresh);
+                            continue;
+                        }
+                    }
+                    return Err(error.sanitized(credential));
+                }
+            }
+        }
+        return project(models.as_mut().expect("the catalog was just loaded")).await;
     }
-    Ok(models.as_mut().expect("the catalog was just loaded"))
 }
 
 async fn codex_version() -> &'static str {
@@ -225,7 +236,7 @@ async fn codex_version() -> &'static str {
 async fn catalog(
     client: &Client,
     endpoint: super::HttpEndpoint<'_>,
-    credential: Option<&Credential>,
+    credential: Option<&Resolved>,
 ) -> Result<Vec<Model>, Error> {
     let mut url = endpoint.url("/models");
     if endpoint.codex() {
@@ -361,7 +372,7 @@ pub(super) fn data_models(list: &Value) -> Result<Vec<Model>, Error> {
 async fn model_page(
     client: &Client,
     endpoint: super::HttpEndpoint<'_>,
-    credential: Option<&Credential>,
+    credential: Option<&Resolved>,
     url: reqwest::Url,
 ) -> Result<Value, Error> {
     let builder = authorize(client.get(url), endpoint, credential)?;
@@ -397,6 +408,7 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+    use crate::auth::Credential;
     use crate::provider::{Custom, HttpProtocol};
 
     #[tokio::test]
@@ -491,6 +503,133 @@ mod tests {
         assert_eq!(gets.load(Ordering::SeqCst), 4);
         assert_eq!(ids(models(&client, &store, &provider).await), ["b"]);
         assert_eq!(gets.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn a_401_on_a_later_page_restarts_the_catalog_under_the_new_key() {
+        use serde_json::json;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for (key, cursor, status, body) in [
+                (
+                    "key-1",
+                    None,
+                    200,
+                    json!({"data":[{"id":"old"}], "has_more":true, "last_id":"old"}),
+                ),
+                (
+                    "key-1",
+                    Some("old"),
+                    401,
+                    json!({"error":{"message":"expired"}}),
+                ),
+                (
+                    "key-2",
+                    None,
+                    200,
+                    json!({"data":[{"id":"fresh"}], "has_more":true, "last_id":"fresh"}),
+                ),
+                (
+                    "key-2",
+                    Some("fresh"),
+                    200,
+                    json!({"data":[{"id":"selected"}], "has_more":false}),
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let read = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(read, 0);
+                    head.extend_from_slice(&bytes[..read]);
+                }
+                let head = String::from_utf8(head).unwrap();
+                assert!(
+                    head.lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .any(|(name, value)| {
+                            name.eq_ignore_ascii_case("x-api-key") && value.trim_ascii() == key
+                        }),
+                    "{head}"
+                );
+                let path = head
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_ascii_whitespace()
+                    .nth(1)
+                    .unwrap();
+                assert_eq!(
+                    reqwest::Url::parse(&format!("http://localhost{path}"))
+                        .unwrap()
+                        .query_pairs()
+                        .find_map(|(name, value)| (name == "after_id").then_some(value))
+                        .as_deref(),
+                    cursor
+                );
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status} Reply\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("auth.json"));
+        let name = "catalog-rotation";
+        super::super::CustomUpdate::prepare(
+            dir.path(),
+            name,
+            Some(Custom {
+                protocol: HttpProtocol::Messages,
+                url,
+                key: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .save()
+        .unwrap();
+        let provider = Provider::named(name, dir.path()).unwrap();
+        let argv = [
+            "sh",
+            "-c",
+            r#"if [ -e "$1/first" ]; then echo key-2; else touch "$1/first"; echo key-1; fi"#,
+            "sh",
+            dir.path().to_str().unwrap(),
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        store
+            .update(async |credentials| {
+                credentials.providers.insert(
+                    provider.name().into(),
+                    Credential::Command {
+                        endpoint: provider.endpoint().unwrap().to_string(),
+                        argv,
+                    },
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let client = crate::http_client::new();
+        let selected = model(&client, &store, &provider, "selected")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, "selected");
+        server.await.unwrap();
+        let listed = models(&client, &store, &provider).await.unwrap();
+        assert_eq!(
+            listed.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            ["fresh", "selected"]
+        );
     }
 
     #[test]

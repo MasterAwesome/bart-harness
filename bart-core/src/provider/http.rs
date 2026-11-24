@@ -4,30 +4,30 @@ use tokio::time;
 
 use super::{
     Decoder, Error, Events, HttpAuth, HttpEndpoint, HttpProtocol, IDLE_TIMEOUT, Observer, Request,
-    Trace, chat, chatgpt, deliver, gemini, http_error, messages, observe, observe_limits, prepare,
-    responses, validate,
+    Resolved, Trace, chat, chatgpt, deliver, gemini, http_error, messages, observe, observe_limits,
+    prepare, responses, validate,
 };
-use crate::{
-    auth::{self, Credential},
-    history::Assistant,
-};
+use crate::{auth, history::Assistant};
 
 pub(super) fn authorize(
     builder: RequestBuilder,
     endpoint: HttpEndpoint<'_>,
-    credential: Option<&Credential>,
+    credential: Option<&Resolved>,
 ) -> Result<RequestBuilder, Error> {
     let builder = match endpoint.protocol() {
         HttpProtocol::Messages => messages::headers(builder),
         _ => builder,
     };
     Ok(match (endpoint.auth(), credential) {
-        (HttpAuth::ApiKey, Some(Credential::ApiKey { key })) => match endpoint.protocol() {
-            HttpProtocol::Responses | HttpProtocol::Chat => builder.bearer_auth(key.expose()),
-            HttpProtocol::Messages => messages::authorize(builder, key.expose()),
-            HttpProtocol::Gemini => gemini::authorize(builder, key.expose()),
-        },
-        (HttpAuth::Chatgpt, Some(Credential::Chatgpt(tokens))) => {
+        (HttpAuth::ApiKey, Some(credential @ (Resolved::ApiKey(_) | Resolved::Command(_)))) => {
+            let key = credential.secret().expose();
+            match endpoint.protocol() {
+                HttpProtocol::Responses | HttpProtocol::Chat => builder.bearer_auth(key),
+                HttpProtocol::Messages => messages::authorize(builder, key),
+                HttpProtocol::Gemini => gemini::authorize(builder, key),
+            }
+        }
+        (HttpAuth::Chatgpt, Some(Resolved::Chatgpt(tokens))) => {
             let builder = builder
                 .bearer_auth(tokens.access.expose())
                 .header("ChatGPT-Account-Id", &tokens.account_id)
@@ -70,7 +70,7 @@ fn serialize_body(
 pub(super) async fn send(
     endpoint: HttpEndpoint<'_>,
     client: &Client,
-    credential: Option<&Credential>,
+    credential: Option<&Resolved>,
     request: &Request<'_>,
     on_delta: &mut impl Observer,
     trace: Option<&mut Trace>,
@@ -79,7 +79,7 @@ pub(super) async fn send(
     let url = endpoint.base_url().clone();
     let codex = endpoint.codex();
     let metadata = match (request.cache, credential) {
-        (Some(cache), Some(Credential::Chatgpt(tokens))) if codex => {
+        (Some(cache), Some(Resolved::Chatgpt(tokens))) if codex => {
             Some(chatgpt::metadata(cache, tokens))
         }
         _ => None,
@@ -99,7 +99,7 @@ pub(super) async fn send(
 async fn send_body(
     endpoint: HttpEndpoint<'_>,
     client: &Client,
-    credential: Option<&Credential>,
+    credential: Option<&Resolved>,
     request: &Request<'_>,
     body: Vec<u8>,
     on_delta: &mut impl Observer,

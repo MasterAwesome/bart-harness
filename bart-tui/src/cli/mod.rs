@@ -228,13 +228,31 @@ struct LoginArgs {
         help = "Base URL of a new provider; the protocol's path is appended"
     )]
     url: Option<String>,
-    #[arg(long, help = "The new provider needs no key")]
+    #[arg(
+        long,
+        conflicts_with = "key_command",
+        help = "The new provider needs no key"
+    )]
     no_key: bool,
     #[arg(
         long,
+        conflicts_with = "key_command",
         help = "For chatgpt: sign in with a code entered on another device"
     )]
     device: bool,
+    #[arg(
+        long,
+        requires = "command",
+        help = "Store the command after `--` instead of a key; Bart runs it when it first needs the key, and again if the provider rejects the key"
+    )]
+    key_command: bool,
+    #[arg(
+        last = true,
+        value_name = "COMMAND",
+        requires = "key_command",
+        help = "The key command and its literal arguments; it prints the key"
+    )]
+    command: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -250,8 +268,15 @@ pub(crate) enum Invocation {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Login {
     Chatgpt(LoginMethod),
-    Key(String),
-    Custom { name: String, config: Custom },
+    Key {
+        name: String,
+        command: Option<Vec<String>>,
+    },
+    Custom {
+        name: String,
+        config: Custom,
+        command: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -343,7 +368,10 @@ fn login_target(login: LoginArgs) -> Result<Login, String> {
         url,
         no_key,
         device,
+        key_command,
+        command,
     } = login;
+    let command = key_command.then_some(command);
     if let Some((protocol, name)) = target.split_once(':') {
         if device {
             return Err("--device is for chatgpt".into());
@@ -366,12 +394,16 @@ fn login_target(login: LoginArgs) -> Result<Login, String> {
                 url,
                 key: !no_key,
             },
+            command,
         });
     }
     if url.is_some() || no_key {
         return Err("--url and --no-key are for a new `<protocol>:<name>` provider".into());
     }
     Ok(if target == "chatgpt" {
+        if command.is_some() {
+            return Err("--key-command is for providers that take an API key".into());
+        }
         Login::Chatgpt(if device {
             LoginMethod::Device
         } else {
@@ -380,7 +412,10 @@ fn login_target(login: LoginArgs) -> Result<Login, String> {
     } else if device {
         return Err("--device is for chatgpt".into());
     } else {
-        Login::Key(target)
+        Login::Key {
+            name: target,
+            command,
+        }
     })
 }
 

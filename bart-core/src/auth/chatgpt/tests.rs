@@ -214,9 +214,7 @@ async fn dropped_refresh_saves_rotation_and_drain_excludes_lock_waiters() {
     tokio::task::yield_now().await;
     assert!(!draining.is_finished());
     server.release.notify_one();
-    let Credential::Chatgpt(tokens) = competing.await.unwrap().unwrap() else {
-        panic!()
-    };
+    let tokens = competing.await.unwrap().unwrap();
     assert_eq!(tokens.access.expose(), "access-B");
     draining.await.unwrap();
     let Credential::Chatgpt(saved) = &store.load().unwrap().providers["chatgpt"] else {

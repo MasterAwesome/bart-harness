@@ -764,12 +764,7 @@ impl Peer {
 }
 
 pub(super) fn kill_group(child: &Child) {
-    if let Some(pid) = child
-        .id()
-        .and_then(|pid| rustix::process::Pid::from_raw(pid.cast_signed()))
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
+    crate::supervise::kill_group(child.id());
 }
 
 impl Drop for Peer {

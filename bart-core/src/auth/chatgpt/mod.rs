@@ -227,12 +227,12 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, Error> {
     })
 }
 
-pub async fn credential(
+pub(crate) async fn credential(
     store: &super::Store,
     client: &Client,
     key: &str,
     missing: String,
-) -> Result<super::Credential, Error> {
+) -> Result<Tokens, Error> {
     credential_at(
         store,
         client,
@@ -249,7 +249,7 @@ async fn credential_at(
     key: &str,
     missing: String,
     endpoint: &str,
-) -> Result<super::Credential, Error> {
+) -> Result<Tokens, Error> {
     let locked = store.lock().await?;
     let client = client.clone();
     let key = key.to_owned();
@@ -257,16 +257,14 @@ async fn credential_at(
     super::refresh::run(async move {
         locked
             .update(async |credentials| {
-                let credential = credentials
-                    .providers
-                    .get_mut(&key)
-                    .ok_or(Error::Login(missing))?;
-                if let super::Credential::Chatgpt(tokens) = credential
-                    && tokens.needs_refresh()
-                {
+                let Some(super::Credential::Chatgpt(tokens)) = credentials.providers.get_mut(&key)
+                else {
+                    return Err(Error::Login(missing));
+                };
+                if tokens.needs_refresh() {
                     *tokens = refresh(&client, tokens, &endpoint).await?;
                 }
-                Ok(credential.clone())
+                Ok(tokens.clone())
             })
             .await
     })

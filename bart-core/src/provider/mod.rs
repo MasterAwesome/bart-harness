@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time;
 
 use crate::{
-    auth::{self, Credential, Store},
+    auth::{self, Credential, Secret, Store},
     history::{Assistant, Message, ToolDefinition as Definition},
     preferences::ServiceTier,
 };
@@ -484,7 +484,7 @@ impl<F: FnMut(Delta<'_>) + Send> Observer for F {
 fn finish(
     result: Result<Assistant, Error>,
     mut trace: Option<Trace>,
-    credential: Option<&Credential>,
+    credential: Option<&Resolved>,
 ) -> Result<Assistant, Error> {
     use crate::diagnostics::Outcome;
     if let Some(trace) = &mut trace {
@@ -583,11 +583,56 @@ fn unix_now() -> i64 {
         .map_or(0, |elapsed| elapsed.as_secs().cast_signed())
 }
 
+enum Resolved {
+    ApiKey(Secret),
+    Command(auth::command::Issued),
+    Chatgpt(auth::chatgpt::Tokens),
+}
+
+impl Resolved {
+    fn secret(&self) -> &Secret {
+        match self {
+            Self::ApiKey(key) => key,
+            Self::Command(issued) => issued.key(),
+            Self::Chatgpt(tokens) => &tokens.access,
+        }
+    }
+}
+
+fn command_is_current(store: &Store, provider: &Provider, argv: &[String]) -> bool {
+    let name = provider.name();
+    let endpoint = provider.endpoint().expect("API key providers use HTTP");
+    Provider::named(name, store.config_dir()).is_ok_and(|saved| saved == *provider)
+        && store.load().is_ok_and(|saved| {
+            matches!(saved.providers.get(name), Some(Credential::Command { endpoint: saved_endpoint, argv: saved_argv })
+                if saved_endpoint == endpoint.as_str() && saved_argv == argv)
+        })
+}
+
+async fn refresh_command(
+    store: &Store,
+    provider: &Provider,
+    issued: &auth::command::Issued,
+) -> Result<Option<Resolved>, Error> {
+    match issued
+        .refresh(|argv| command_is_current(store, provider, argv))
+        .await
+    {
+        Ok(fresh) => Ok(Some(Resolved::Command(fresh))),
+        Err(auth::command::IssueError::StaleBinding) => Ok(None),
+        Err(error) => Err(command_error(provider.name(), &error)),
+    }
+}
+
+fn command_error(name: &str, error: &auth::command::IssueError) -> Error {
+    Error::Credential(format!("cannot get the key for {name}: {error}"))
+}
+
 async fn credential(
     client: &Client,
     store: &Store,
     provider: &Provider,
-) -> Result<Option<Credential>, Error> {
+) -> Result<Option<Resolved>, Error> {
     if matches!(provider.auth(), Auth::None | Auth::External) {
         return Ok(None);
     }
@@ -600,10 +645,29 @@ async fn credential(
         (Auth::Chatgpt, Some(Credential::Chatgpt(tokens))) if tokens.needs_refresh() => {
             auth::chatgpt::credential(store, client, key, missing())
                 .await
+                .map(Resolved::Chatgpt)
                 .map_err(|error| Error::Credential(error.to_string()))
         }
-        (Auth::Chatgpt, Some(credential @ Credential::Chatgpt(_)))
-        | (Auth::ApiKey, Some(credential @ Credential::ApiKey { .. })) => Ok(credential.clone()),
+        (Auth::Chatgpt, Some(Credential::Chatgpt(tokens))) => Ok(Resolved::Chatgpt(tokens.clone())),
+        (Auth::ApiKey, Some(Credential::ApiKey { key })) => Ok(Resolved::ApiKey(key.clone())),
+        (
+            Auth::ApiKey,
+            Some(Credential::Command {
+                endpoint: saved_endpoint,
+                argv,
+            }),
+        ) => {
+            let endpoint = provider.endpoint().expect("API key providers use HTTP");
+            if saved_endpoint != endpoint.as_str() {
+                return Err(command_error(key, &auth::command::IssueError::StaleBinding));
+            }
+            auth::command::resolve(store, key, endpoint.as_str(), argv, |argv| {
+                command_is_current(store, provider, argv)
+            })
+            .await
+            .map(Resolved::Command)
+            .map_err(|error| command_error(key, &error))
+        }
         _ => Err(Error::Credential(missing())),
     };
     credential.map(Some)

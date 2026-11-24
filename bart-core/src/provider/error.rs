@@ -7,8 +7,7 @@ use reqwest::{StatusCode, header};
 use serde_json::Value;
 use tokio::time;
 
-use super::{CONTEXT_LENGTH_EXCEEDED, ERROR_BODY_TIMEOUT, unix_now};
-use crate::auth::Credential;
+use super::{CONTEXT_LENGTH_EXCEEDED, ERROR_BODY_TIMEOUT, Resolved, unix_now};
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 
@@ -47,16 +46,31 @@ impl Error {
         Self::Credential("the credential does not belong to this provider".into())
     }
 
+    pub(super) fn reject_command<'a>(
+        &self,
+        credential: Option<&'a Resolved>,
+    ) -> Option<&'a crate::auth::command::Issued> {
+        if let Some(Resolved::Command(issued)) = credential
+            && matches!(
+                self,
+                Self::Http {
+                    status: StatusCode::UNAUTHORIZED,
+                    ..
+                }
+            )
+        {
+            issued.reject();
+            return Some(issued);
+        }
+        None
+    }
+
     // A server that echoes what it was sent would print the credential.
-    pub(super) fn sanitized(mut self, credential: Option<&Credential>) -> Self {
+    pub(super) fn sanitized(mut self, credential: Option<&Resolved>) -> Self {
         if let Self::Transport(error) = self {
             return Self::Transport(error.without_url());
         }
-        let secret = match credential {
-            Some(Credential::ApiKey { key }) => key.expose(),
-            Some(Credential::Chatgpt(tokens)) => tokens.access.expose(),
-            _ => "",
-        };
+        let secret = credential.map_or("", |credential| credential.secret().expose());
         let clean = |text: &mut String| *text = crate::terminal_text::printable(text, &[secret]);
         match &mut self {
             Self::Http { message, .. }

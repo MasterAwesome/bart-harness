@@ -3,6 +3,7 @@ use std::{
     fmt, io,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use crate::persist::{self, Lock};
 
 pub(crate) mod callback;
 pub mod chatgpt;
+pub mod command;
 pub mod refresh;
 
 const GROUP_OR_OTHER_BITS: u32 = 0o077;
@@ -39,6 +41,7 @@ impl fmt::Debug for Secret {
 pub enum Credential {
     ApiKey { key: Secret },
     Chatgpt(chatgpt::Tokens),
+    Command { endpoint: String, argv: Vec<String> },
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +72,7 @@ pub enum Error {
         column: usize,
     },
     InvalidApiKey,
+    KeyCommand(String),
     Login(String),
     Http {
         status: reqwest::StatusCode,
@@ -102,6 +106,7 @@ impl fmt::Display for Error {
                 )
             }
             Self::InvalidApiKey => f.write_str("an API key must be one token of printable ASCII"),
+            Self::KeyCommand(problem) => f.write_str(problem),
             Self::Login(problem) => write!(f, "login failed: {problem}"),
             Self::Http { status, message } => {
                 write!(f, "authorization server returned {status}: {message}")
@@ -140,6 +145,7 @@ pub fn api_key(input: &str) -> Result<Secret, Error> {
 #[derive(Clone)]
 pub struct Store {
     path: PathBuf,
+    commands: Arc<command::Cache>,
 }
 
 impl Store {
@@ -150,10 +156,19 @@ impl Store {
     }
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            commands: Arc::default(),
+        }
     }
 
     pub fn load(&self) -> Result<Credentials, Error> {
+        let credentials = self.read()?;
+        self.commands.retain(&credentials);
+        Ok(credentials)
+    }
+
+    fn read(&self) -> Result<Credentials, Error> {
         let file = match crate::persist::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -217,7 +232,9 @@ impl Locked {
                 io::Error::other("the credentials would exceed the store's 1 MiB limit"),
             )));
         }
-        persist::replace(&self.store.path, &text).map_err(Error::Replace)
+        persist::replace(&self.store.path, &text).map_err(Error::Replace)?;
+        self.store.commands.retain(credentials);
+        Ok(())
     }
 }
 

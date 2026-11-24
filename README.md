@@ -69,6 +69,17 @@ bart login chat:openrouter    --url https://openrouter.ai/api/v1 < key-file
 bart login chat:local         --url http://localhost:8080/v1 --no-key
 ```
 
+To use a password manager or another key helper instead of storing the API key in Bart, pass `--key-command` and put the program and its arguments after `--`:
+
+```sh
+bart login responses:openai --url https://api.openai.com/v1 --key-command -- op read op://Private/OpenAI/credential
+bart login openai --key-command -- secret-tool lookup service openai
+```
+
+The first example adds a provider; the second switches an existing provider to a key command. At login Bart checks that the command prints one printable ASCII token, then saves the command, its arguments, and the provider URL, not the output. Bart will not use the command for a different URL. Do not put secrets in the arguments. Bart runs the command again when it first needs the key and retries once with a fresh key on HTTP 401 if the provider configuration and key command still match.
+
+The command runs on the host with your environment, no stdin or terminal, and your home directory as its working directory (or `/` if unset). It has 30 seconds to finish. Bart passes arguments literally, without shell interpolation. Use a trusted executable and arguments; give scripts a shebang to select their interpreter, since Unix may run executable text files without one through a shell. Unlock your password manager first if it requires an interactive login. Bart kills the helper’s process group on timeout, cancellation, or oversized output, not after normal exit. A helper that leaves background processes with closed standard streams can leave them running.
+
 Switch models with `/model`, adjust reasoning effort with `/effort` (**Alt+=** / **Alt+-** while typing), and list available `provider/model` pairs with `bart models`. Use `bart models <provider>` for model names and supported effort levels.
 
 ## CLI and scripting

@@ -25,14 +25,29 @@ pub(crate) mod handoff;
 pub const MODE: &str = "--bart-process-supervisor";
 pub const DETACHED_MODE: &str = "--bart-detached";
 
+pub(crate) const DETACHED_EXEC_FAILED: &str = "bart: cannot execute detached process: ";
+
 pub fn detached(program: impl AsRef<std::ffi::OsStr>) -> io::Result<std::process::Command> {
     #[cfg(target_os = "linux")]
     let executable = "/proc/self/exe";
     #[cfg(not(target_os = "linux"))]
     let executable = std::env::current_exe()?;
+    Ok(detached_via(executable, program))
+}
+
+pub(crate) fn detached_via(
+    executable: impl AsRef<std::ffi::OsStr>,
+    program: impl AsRef<std::ffi::OsStr>,
+) -> std::process::Command {
     let mut command = std::process::Command::new(executable);
     command.arg(DETACHED_MODE).arg(program);
-    Ok(command)
+    command
+}
+
+pub(crate) fn kill_group(id: Option<u32>) {
+    if let Some(pid) = id.and_then(|id| Pid::from_raw(id.cast_signed())) {
+        let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+    }
 }
 
 pub fn detached_main() -> ExitCode {
@@ -45,11 +60,10 @@ pub fn detached_main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let error = std::process::Command::new(program).args(args).exec();
-    crate::terminal_text::stderr_line(format_args!(
-        "bart: cannot execute detached process: {error}"
-    ));
+    crate::terminal_text::stderr_line(format_args!("{DETACHED_EXEC_FAILED}{error}"));
     ExitCode::from(127)
 }
+
 pub(crate) const FRAME_BYTES: usize = 4096;
 pub(crate) const CLEANUP: Duration = Duration::from_secs(5);
 const EXEC_DIAGNOSTIC_NAME_BYTES: usize = 1024;

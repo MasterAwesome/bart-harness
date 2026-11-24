@@ -18,6 +18,21 @@ fn the_command_line_refuses_ambiguity_and_keeps_prompts_verbatim() {
         &["login", "chatgpt", "--url", "http://x"],
         &["login", "chat:local"],
         &["login", "work", "--device"],
+        &["login", "work", "--key-command"],
+        &["login", "work", "--key-command", "--"],
+        &["login", "work", "--", "op", "read"],
+        &["login", "chatgpt", "--key-command", "--", "op"],
+        &["login", "chatgpt", "--device", "--key-command", "--", "op"],
+        &[
+            "login",
+            "chat:x",
+            "--url",
+            "http://h",
+            "--no-key",
+            "--key-command",
+            "--",
+            "op",
+        ],
         &["mcp", "add", "x"],
         &["mcp", "add", "x", "--url", "http://x", "--", "server"],
         &[
@@ -110,6 +125,57 @@ fn the_command_line_refuses_ambiguity_and_keeps_prompts_verbatim() {
                 url: "http://h/v1".into(),
                 key: false,
             },
+            command: None,
+        })
+    );
+    assert_eq!(
+        parsed(&[
+            "login",
+            "work",
+            "--key-command",
+            "--",
+            "op",
+            "read",
+            "--no-newline",
+            "op://v/k"
+        ])
+        .unwrap(),
+        Invocation::Login(Login::Key {
+            name: "work".into(),
+            command: Some(vec![
+                "op".into(),
+                "read".into(),
+                "--no-newline".into(),
+                "op://v/k".into()
+            ]),
+        })
+    );
+    assert_eq!(
+        parsed(&[
+            "login",
+            "responses:gw",
+            "--url",
+            "http://h/v1",
+            "--key-command",
+            "--",
+            "get-token"
+        ])
+        .unwrap(),
+        Invocation::Login(Login::Custom {
+            name: "gw".into(),
+            config: Custom {
+                protocol: HttpProtocol::Responses,
+                url: "http://h/v1".into(),
+                key: true,
+            },
+            command: Some(vec!["get-token".into()]),
+        })
+    );
+    assert_eq!(
+        parsed(&["login", "work"]).unwrap(),
+        Invocation::Login(Login::Key {
+            name: "work".into(),
+            command: None
         })
     );
 }

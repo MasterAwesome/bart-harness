@@ -2,6 +2,7 @@ use reqwest::Client;
 
 use super::{
     Error, HttpEndpoint, Observer, Request, Tools, chatgpt, claude_code, credential, finish, http,
+    refresh_command,
 };
 use crate::{
     auth::Store,
@@ -77,30 +78,44 @@ impl Transport {
         store: &Store,
         request: &Request<'_>,
         mut on_delta: impl Observer,
-        attempts: Option<&mut Attempts<'_>>,
+        mut attempts: Option<&mut Attempts<'_>>,
         scope: Scope,
     ) -> Result<Assistant, Error> {
-        let credential = credential(client, store, request.provider).await?;
-        let credential = credential.as_ref();
-        let mut trace = attempts.map(|attempts| {
-            attempts.start(
-                request.provider.name(),
-                request.model,
-                matches!(request.tools, Tools::WebSearch),
-            )
-        });
-        let result = match request.provider.http() {
-            None => {
-                self.claude
-                    .send(request, &mut on_delta, trace.as_mut())
-                    .await
-            }
-            Some(endpoint)
-                if scope == Scope::Conversation && self.persistent(endpoint, request) =>
-            {
-                self.claude.close().await;
-                self.chatgpt
-                    .send(
+        let mut resolved = credential(client, store, request.provider).await?;
+        let mut replay = true;
+        loop {
+            let credential = resolved.as_ref();
+            let mut trace = attempts.as_deref_mut().map(|attempts| {
+                attempts.start(
+                    request.provider.name(),
+                    request.model,
+                    matches!(request.tools, Tools::WebSearch),
+                )
+            });
+            let result = match request.provider.http() {
+                None => {
+                    self.claude
+                        .send(request, &mut on_delta, trace.as_mut())
+                        .await
+                }
+                Some(endpoint)
+                    if scope == Scope::Conversation && self.persistent(endpoint, request) =>
+                {
+                    self.claude.close().await;
+                    self.chatgpt
+                        .send(
+                            endpoint,
+                            client,
+                            credential,
+                            request,
+                            &mut on_delta,
+                            trace.as_mut(),
+                        )
+                        .await
+                }
+                Some(endpoint) => {
+                    self.claude.close().await;
+                    http::send(
                         endpoint,
                         client,
                         credential,
@@ -109,21 +124,21 @@ impl Transport {
                         trace.as_mut(),
                     )
                     .await
+                }
+            };
+            let result = finish(result, trace, credential);
+            if let Some(issued) = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.reject_command(credential))
+                && std::mem::take(&mut replay)
+                && let Some(fresh) = refresh_command(store, request.provider, issued).await?
+            {
+                resolved = Some(fresh);
+                continue;
             }
-            Some(endpoint) => {
-                self.claude.close().await;
-                http::send(
-                    endpoint,
-                    client,
-                    credential,
-                    request,
-                    &mut on_delta,
-                    trace.as_mut(),
-                )
-                .await
-            }
-        };
-        finish(result, trace, credential)
+            return result;
+        }
     }
 
     pub(crate) async fn prewarm(
@@ -132,16 +147,21 @@ impl Transport {
         store: &Store,
         request: &Request<'_>,
     ) -> Result<(), Error> {
-        let credential = credential(client, store, request.provider).await?;
-        let credential = credential.as_ref();
         match request.provider.http() {
-            None => self.claude.prewarm(request).await,
+            None => self
+                .claude
+                .prewarm(request)
+                .await
+                .map_err(|error| error.sanitized(None)),
             Some(endpoint) if self.persistent(endpoint, request) => {
-                self.chatgpt.prewarm(endpoint, credential, request).await
+                let credential = credential(client, store, request.provider).await?;
+                self.chatgpt
+                    .prewarm(endpoint, credential.as_ref(), request)
+                    .await
+                    .map_err(|error| error.sanitized(credential.as_ref()))
             }
             Some(_) => Ok(()),
         }
-        .map_err(|error| error.sanitized(credential))
     }
 
     pub(crate) async fn admit(
@@ -175,6 +195,9 @@ impl Transport {
                 .is_ok_and(|url| !crate::http_client::proxied(&url))
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 pub(crate) async fn stream(
     client: &Client,

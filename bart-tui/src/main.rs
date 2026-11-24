@@ -202,18 +202,33 @@ async fn login(
     target: Login,
     input: &mut dyn io::Read,
 ) -> Result<(), String> {
-    let (provider, custom, method) = match target {
-        Login::Chatgpt(method) => (Provider::named("chatgpt", config)?, None, method),
-        Login::Key(name) => (Provider::named(&name, config)?, None, LoginMethod::Browser),
+    let (provider, custom, method, command) = match target {
+        Login::Chatgpt(method) => (Provider::named("chatgpt", config)?, None, method, None),
+        Login::Key { name, command } => (
+            Provider::named(&name, config)?,
+            None,
+            LoginMethod::Browser,
+            command,
+        ),
         Login::Custom {
             name,
             config: custom,
+            command,
         } => (
             Provider::custom(&name, &custom)?,
             Some(custom),
             LoginMethod::Browser,
+            command,
         ),
     };
+    if let Some(argv) = &command {
+        if provider.auth() != Auth::ApiKey {
+            return Err("--key-command is for providers that take an API key".into());
+        }
+        auth::command::verify(argv)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
     let update = match custom {
         Some(custom) => Some(
             provider::CustomUpdate::prepare(config, provider.name(), Some(custom))
@@ -230,6 +245,13 @@ async fn login(
                     .into(),
             );
         }
+        Auth::ApiKey if let Some(argv) = command => Some(Credential::Command {
+            endpoint: provider
+                .endpoint()
+                .expect("API key providers use HTTP")
+                .to_string(),
+            argv,
+        }),
         Auth::ApiKey => {
             let mut text = String::new();
             input
@@ -253,16 +275,13 @@ async fn login(
             Some(Credential::Chatgpt(tokens))
         }
     };
+    let saved = match (&credential, provider.auth()) {
+        (Some(Credential::Command { .. }), _) => "key command",
+        (_, Auth::None) => "keyless provider",
+        _ => "credentials",
+    };
     provider::commit_identity(store, provider.name(), credential, update.as_ref()).await?;
-    crate::terminal_text::stderr_line(format_args!(
-        "Saved {} for {}.",
-        if provider.auth() == Auth::None {
-            "keyless provider"
-        } else {
-            "credentials"
-        },
-        provider.name()
-    ));
+    crate::terminal_text::stderr_line(format_args!("Saved {saved} for {}.", provider.name()));
     Ok(())
 }
 

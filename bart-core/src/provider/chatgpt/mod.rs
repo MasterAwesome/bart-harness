@@ -8,15 +8,15 @@ use tokio::{sync::Mutex, time};
 use reqwest::Client;
 
 use super::{
-    Cache, Delta, Error, IDLE_TIMEOUT, Limits, Observer, RESPONSE_BYTES, Request, StatusCode,
-    Trace, Window, deliver,
+    Cache, Delta, Error, IDLE_TIMEOUT, Limits, Observer, RESPONSE_BYTES, Request, Resolved,
+    StatusCode, Trace, Window, deliver,
     error::from_http,
     observe, observe_limits,
     prepare::{self, Snapshot},
     responses, validate,
 };
 use crate::{
-    auth::{Credential, chatgpt},
+    auth::chatgpt,
     history::{Assistant, Message as Item},
 };
 
@@ -82,7 +82,7 @@ impl Route {
         &self,
         endpoint: super::HttpEndpoint<'_>,
         client: &Client,
-        credential: Option<&Credential>,
+        credential: Option<&Resolved>,
         request: &Request<'_>,
         on_delta: &mut impl Observer,
         mut trace: Option<&mut Trace>,
@@ -108,7 +108,7 @@ impl Route {
     pub(super) async fn prewarm(
         &self,
         endpoint: super::HttpEndpoint<'_>,
-        credential: Option<&Credential>,
+        credential: Option<&Resolved>,
         request: &Request<'_>,
     ) -> Result<(), Error> {
         let mut ignore = |_: Delta<'_>| {};
@@ -144,13 +144,13 @@ impl Route {
 async fn receive(
     route: &Route,
     endpoint: super::HttpEndpoint<'_>,
-    credential: Option<&Credential>,
+    credential: Option<&Resolved>,
     request: &Request<'_>,
     generate: bool,
     on_delta: &mut impl Observer,
     mut trace: Option<&mut Trace>,
 ) -> Result<Outcome, Error> {
-    let Some(Credential::Chatgpt(tokens)) = credential else {
+    let Some(Resolved::Chatgpt(tokens)) = credential else {
         return Err(Error::wrong_credential());
     };
     let mut state = route.0.lock().await;
