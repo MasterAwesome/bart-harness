@@ -1,15 +1,23 @@
 use std::{
-    io::{self, Write as _},
+    io::{self, Write},
+    os::unix::process::CommandExt as _,
     process::Stdio,
     time::Duration,
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use tokio::{io::AsyncReadExt as _, process::Command, time};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    process::Command,
+    time,
+};
 
 use crate::history::{InlineImage, MAX_IMAGE_BYTES};
 
 mod child;
+
+#[cfg(test)]
+mod tests;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(target_os = "macos"))]
@@ -25,9 +33,105 @@ enum Sent {
     End,
 }
 
-pub(super) fn copy(text: &str, what: &str) -> io::Result<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Backend {
+    Pbcopy,
+    Wayland,
+    Xclip,
+}
+
+impl Backend {
+    fn command(self) -> std::process::Command {
+        match self {
+            Self::Pbcopy => {
+                let mut command = std::process::Command::new("pbcopy");
+                command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
+                command
+            }
+            Self::Wayland => {
+                let mut command = std::process::Command::new("wl-copy");
+                command.args(["--type", "text/plain;charset=utf-8"]);
+                command
+            }
+            Self::Xclip => {
+                let mut command = std::process::Command::new("xclip");
+                command.args(["-selection", "clipboard"]);
+                command
+            }
+        }
+    }
+
+    fn accepts(self, text: &str) -> bool {
+        self != Self::Pbcopy || !(text.starts_with(r"{\rtf") || text.starts_with("%!PS-Adobe"))
+    }
+}
+
+fn backends(macos: bool, is_set: impl Fn(&str) -> bool) -> &'static [Backend] {
+    use Backend::{Pbcopy, Wayland, Xclip};
+
+    if ["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"]
+        .into_iter()
+        .any(&is_set)
+    {
+        &[]
+    } else if macos {
+        &[Pbcopy]
+    } else {
+        match (is_set("WAYLAND_DISPLAY"), is_set("DISPLAY")) {
+            (true, true) => &[Wayland, Xclip],
+            (true, false) => &[Wayland],
+            (false, true) => &[Xclip],
+            (false, false) => &[],
+        }
+    }
+}
+
+pub(super) async fn copy_native(text: &str) -> bool {
+    let tools = backends(cfg!(target_os = "macos"), |name| {
+        std::env::var_os(name).is_some()
+    });
+    try_native(tools, Backend::command, text, TIMEOUT).await
+}
+
+async fn try_native(
+    tools: &[Backend],
+    command: impl Fn(Backend) -> std::process::Command,
+    text: &str,
+    timeout: Duration,
+) -> bool {
+    for &backend in tools {
+        if backend.accepts(text)
+            && time::timeout(timeout, write_native(command(backend), text))
+                .await
+                .is_ok_and(|result| result.is_ok_and(|status| status.success()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+async fn write_native(
+    mut command: std::process::Command,
+    text: &str,
+) -> io::Result<std::process::ExitStatus> {
+    command
+        .process_group(0)
+        .stdin(Stdio::piped())
+        // The clipboard holder can inherit these file descriptors.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = child::Owner::spawn(Command::from(command)).await?;
+    let (stdin, _, _) = child.pipes();
+    let mut stdin = stdin.expect("piped stdin");
+    stdin.write_all(text.as_bytes()).await?;
+    stdin.shutdown().await?;
+    drop(stdin);
+    child.wait(child::Descendants::KeepOnSuccess).await
+}
+
+pub(super) fn copy_terminal(mut out: impl Write, text: &str, what: &str) -> io::Result<String> {
     let (sent, end) = sendable(text);
-    let mut out = io::stdout();
     write!(out, "\x1b]52;c;{}\x07", STANDARD.encode(end))?;
     out.flush()?;
     Ok(match sent {
@@ -163,9 +267,9 @@ async fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = child::Owner::spawn(&mut command)?;
-    let (_, stdout, stderr) = child.pipes();
     let read = async {
+        let mut child = child::Owner::spawn(command).await?;
+        let (_, stdout, stderr) = child.pipes();
         let output = async {
             let mut bytes = Vec::new();
             let most = u64::try_from(limit).unwrap_or(u64::MAX) + 1;
@@ -197,7 +301,7 @@ async fn run(
             io::Result::Ok(diagnostic)
         };
         let (bytes, diagnostic) = tokio::try_join!(output, errors)?;
-        let status = child.wait().await?;
+        let status = child.wait(child::Descendants::Kill).await?;
         if !status.success() {
             return Err(io::Error::other(format!(
                 "exited with {status}: {}",

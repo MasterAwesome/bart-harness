@@ -1,12 +1,14 @@
 use crate::tui::status::Kind as StatusKind;
 use crate::tui::text::clip_end;
 use crate::tui::text::{self, Clean};
+mod answers;
 mod block;
 mod details;
 mod storage;
 mod stream;
 mod tools;
 
+pub(super) use answers::LookupError as AnswerLookupError;
 use block::Kind;
 pub(super) use block::{Block, CopySource};
 pub(super) use stream::{project, project_rewind};
@@ -271,8 +273,7 @@ pub(super) struct Transcript {
     next_detail: DetailSequence,
     ui_notices_omitted: bool,
     compaction: Option<DetailSequence>,
-    last_answer: String,
-    answer_ended: bool,
+    answers: answers::Answers,
     pastes: Arc<super::paste::Previews>,
     live_tools: Option<Arc<crate::tool::Live>>,
     ui: crate::preferences::Ui,
@@ -288,8 +289,8 @@ impl Transcript {
     pub(super) fn details(&self) -> &[Detail] {
         &self.details
     }
-    pub(super) fn last_answer(&self) -> &str {
-        &self.last_answer
+    pub(super) fn answer(&self, index: usize) -> Result<&str, AnswerLookupError> {
+        self.answers.get(index)
     }
     pub(super) fn set_ui(&mut self, ui: crate::preferences::Ui) {
         self.ui = ui;
@@ -457,8 +458,10 @@ impl Transcript {
             }
             UiEvent::Reasoning(delta) => self.stream_reasoning(&delta, &mut done),
             UiEvent::Text(delta) => self.stream_text(&delta, &mut done),
-            UiEvent::ToolBytes(_) | UiEvent::Approval(_) | UiEvent::CompactingBytes(_) => {}
-            UiEvent::Responded => self.responded = true,
+            UiEvent::Responded => {
+                self.responded = true;
+                self.answers.finish();
+            }
             UiEvent::Image(path) => {
                 let target = crate::tui::links::file(&path);
                 self.flush_text(&mut done);
@@ -561,6 +564,7 @@ impl Transcript {
                 done.push(self.user(&input.text, &input.skills, true));
             }
             UiEvent::WaitingForReset { message, .. } => {
+                self.answers.discard();
                 self.flush_text(&mut done);
                 done.push(self.notice(Text::from(Clean::new(&format!(
                     "  {message} · waiting for reset · Esc cancels"
@@ -570,7 +574,18 @@ impl Transcript {
                 self.flush_text(&mut done);
                 done.push(self.notice(Text::from(Clean::new(&format!("  {message}")))));
             }
-            UiEvent::Retrying { .. }
+            UiEvent::Retrying {
+                discarded: true, ..
+            } => {
+                self.answers.discard();
+                self.flush_text(&mut done);
+            }
+            UiEvent::Retrying {
+                discarded: false, ..
+            }
+            | UiEvent::ToolBytes(_)
+            | UiEvent::Approval(_)
+            | UiEvent::CompactingBytes(_)
             | UiEvent::RegistryReplaced
             | UiEvent::SkillAttached
             | UiEvent::Started(_)
@@ -810,6 +825,7 @@ impl Transcript {
                 "failed"
             });
         }
+        self.answers.finish();
         self.flush_text(&mut done);
         if !self.calls.is_empty() {
             for call in &mut self.calls {
@@ -857,7 +873,6 @@ impl Transcript {
         }
         self.prose += 1;
         self.spacing.blank = false;
-        self.answer_ended = true;
     }
 
     fn end_reasoning(&mut self, done: &mut Vec<Block>) {
@@ -884,15 +899,8 @@ impl Transcript {
         if self.reasoning_detail.is_some() {
             self.end_reasoning(done);
         }
-        self.project_text(delta);
+        self.answers.append(delta);
         self.text.append(delta);
-    }
-
-    pub(super) fn project_text(&mut self, delta: &str) {
-        if std::mem::take(&mut self.answer_ended) {
-            self.last_answer.clear();
-        }
-        self.last_answer.push_str(delta);
     }
 
     pub(super) fn project_reasoning(&mut self, delta: &str) {

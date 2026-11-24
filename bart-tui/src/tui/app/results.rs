@@ -18,10 +18,10 @@ impl App {
                 }
             }
             TaskResult::Closed => {}
-            TaskResult::ConversationCopied(text) => self.effects.push(Effect::Copy(
-                text,
-                "the retained conversation (older content may be omitted)".into(),
-            )),
+            TaskResult::Copied(what) => self.set_status(StatusKind::Info, format!("copied {what}")),
+            TaskResult::CopyToTerminal { text, what } => {
+                self.effects.push(Effect::CopyToTerminal { text, what });
+            }
             TaskResult::Failed(error) => self.set_status(StatusKind::Error, error),
             TaskResult::Catalog {
                 purpose,

@@ -1,5 +1,4 @@
 use super::{
-    app::Effect,
     brand,
     selection::{self, Anchor, Point, Row, point_at},
     status::{Kind, Status},
@@ -30,6 +29,11 @@ enum Selection {
 enum Focus {
     Code,
     Output,
+}
+
+pub(super) enum Action {
+    Close,
+    Copy { text: String, what: &'static str },
 }
 #[derive(Clone, Copy)]
 struct Drag {
@@ -257,7 +261,7 @@ impl Viewer {
         details: &[Detail],
         live: &Live,
         status: &mut Status,
-    ) -> Option<Effect> {
+    ) -> Option<Action> {
         status.clear();
         if self.search.prompt {
             match key.code {
@@ -301,9 +305,9 @@ impl Viewer {
                     self.search = Search::default();
                     return None;
                 }
-                return Some(Effect::Clear);
+                return Some(Action::Close);
             }
-            KeyCode::Char('q') => return Some(Effect::Clear),
+            KeyCode::Char('q') => return Some(Action::Close),
             KeyCode::Char('/') if key.modifiers.is_empty() => {
                 self.focus = Focus::Output;
                 self.search = Search {
@@ -350,32 +354,31 @@ impl Viewer {
                     self.select(selection, details);
                 }
             }
-            KeyCode::Char('c') if key.modifiers.is_empty() => {
-                if let Some(content) = content(self.selected, details, live) {
-                    let text = match self.focus {
-                        Focus::Code => content.code,
-                        Focus::Output if content.markdown => match self.selected {
-                            Selection::Detail(sequence) => details
-                                .iter()
-                                .find(|detail| detail.sequence == sequence)
-                                .map_or(content.output, |detail| Cow::Borrowed(&detail.output)),
-                            Selection::Job(_) => content.output,
-                        },
-                        Focus::Output => content.output,
-                    };
-                    return Some(Effect::Copy(
-                        text.into_owned(),
-                        match self.focus {
-                            Focus::Code => "the code",
-                            Focus::Output => "the output",
-                        }
-                        .into(),
-                    ));
-                }
-            }
+            KeyCode::Char('c') if key.modifiers.is_empty() => return self.copy(details, live),
             _ => {}
         }
         None
+    }
+
+    fn copy(&self, details: &[Detail], live: &Live) -> Option<Action> {
+        let content = content(self.selected, details, live)?;
+        let (text, what) = match self.focus {
+            Focus::Code => (content.code, "the code"),
+            Focus::Output => {
+                let text = match self.selected {
+                    Selection::Detail(sequence) if content.markdown => details
+                        .iter()
+                        .find(|detail| detail.sequence == sequence)
+                        .map_or(content.output, |detail| Cow::Borrowed(&detail.output)),
+                    _ => content.output,
+                };
+                (text, "the output")
+            }
+        };
+        Some(Action::Copy {
+            text: text.into_owned(),
+            what,
+        })
     }
 
     pub(super) fn mouse(&mut self, mouse: MouseEvent, stamp: Option<FrameStamp>) -> Option<String> {

@@ -1,13 +1,33 @@
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use std::{io, process::ExitStatus};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::{
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::oneshot,
+};
+
+#[derive(Clone, Copy)]
+pub(super) enum Descendants {
+    Kill,
+    KeepOnSuccess,
+}
 
 pub(super) struct Owner {
     child: Child,
     pid: Option<Pid>,
 }
 impl Owner {
-    pub(super) fn spawn(command: &mut Command) -> io::Result<Self> {
+    pub(super) async fn spawn(mut command: Command) -> io::Result<Self> {
+        let (send, receive) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            if !send.is_closed() {
+                // If the caller cancels, drop the owner here to stop the helper.
+                let _ = send.send(Self::launch(&mut command));
+            }
+        });
+        receive.await.map_err(io::Error::other)?
+    }
+
+    fn launch(command: &mut Command) -> io::Result<Self> {
         let child = command.kill_on_drop(true).spawn()?;
         let pid = child.id().and_then(|pid| Pid::from_raw(pid.cast_signed()));
         Ok(Self { child, pid })
@@ -21,21 +41,29 @@ impl Owner {
             self.child.stderr.take(),
         )
     }
-    pub(super) async fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub(super) async fn wait(&mut self, descendants: Descendants) -> io::Result<ExitStatus> {
         if let Some(pid) = self.pid {
             loop {
                 match waitid(
                     WaitId::Pid(pid),
                     WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
                 ) {
-                    Ok(Some(_)) => break,
+                    Ok(Some(status)) => {
+                        if matches!(descendants, Descendants::KeepOnSuccess)
+                            && status.exit_status() == Some(0)
+                        {
+                            self.pid = None;
+                        } else {
+                            // The unreaped leader still pins the group ID.
+                            self.kill();
+                        }
+                        break;
+                    }
                     Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
                     Err(rustix::io::Errno::INTR) => {}
                     Err(error) => return Err(error.into()),
                 }
             }
-            // The unreaped leader still pins the group ID.
-            self.kill();
         }
         self.child.wait().await
     }

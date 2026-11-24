@@ -1,5 +1,5 @@
 use super::session::Command;
-use super::tasks::{Kind, OpenFrom, Ticket};
+use super::tasks::{Copy, Kind, OpenFrom, Ticket};
 use super::viewer::Viewer;
 use super::{
     composer::Composer,
@@ -362,7 +362,10 @@ pub(in crate::tui) enum Effect {
     },
     Spawn(Ticket, Task),
     Cancel(Kind),
-    Copy(String, String),
+    CopyToTerminal {
+        text: String,
+        what: String,
+    },
     Clear,
     Suspend,
     Reassert,
@@ -589,6 +592,10 @@ impl App {
         self.surface = Some(Surface::Approval(Approval { answer, confirm }));
     }
 
+    fn copy_text(&mut self, text: String, what: String) {
+        self.start_task(Task::Copy(Copy::Text { text, what }));
+    }
+
     fn start_task(&mut self, task: Task) {
         let ticket = self.work.ticket(task.kind());
         self.work.pending.insert(ticket.kind, ticket);
@@ -673,6 +680,105 @@ mod tests {
     fn run_runtime_effects(app: &mut App, runtime: &mut Runtime, initial: Vec<Effect>) {
         let mut effects: std::collections::VecDeque<_> = initial.into();
         while runtime.next_effect(app, &mut effects).is_some() {}
+    }
+
+    #[tokio::test]
+    async fn copy_command_uses_raw_answers_and_ignores_stale_clipboard_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let (provider, _) = crate::provider::mock::serve(dir.path(), vec![]).await;
+        let (mut app, mut runtime) = attached_fixture(dir.path(), provider).await;
+        let submit = |app: &mut App, command: &str| {
+            app.insert(command);
+            app.update(Msg::Input(ReadEvent::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))))
+        };
+        let copy = |app: &mut App, command, expected_text, expected_what| {
+            let effects = submit(app, command);
+            assert!(
+                matches!(effects.as_slice(), [Effect::Spawn(ticket, Task::Copy(
+                Copy::Text { text, what }
+            ))] if ticket.kind == Kind::Copy && text == expected_text && what == expected_what)
+            );
+            let Effect::Spawn(ticket, _) = effects[0] else {
+                unreachable!();
+            };
+            ticket
+        };
+        let status = |app: &mut App, command, expected| {
+            assert!(submit(app, command).is_empty());
+            assert_eq!(app.status.text(), Some(expected));
+        };
+        status(&mut app, "/copy", "no answer yet");
+        for invalid in ["/copy -1", "/copy +1", "/copy word", "/copy 0 1"] {
+            status(&mut app, invalid, "usage: /copy [N] (0 = latest answer)");
+        }
+        let first = "\n    code\n";
+        let second = "**answer**  \n";
+        app.update(Msg::Events(vec![
+            UiEvent::Text(first.into()),
+            UiEvent::MessageBoundary,
+            UiEvent::Responded,
+            UiEvent::Text(" \n\t".into()),
+            UiEvent::ToolStarted {
+                id: "call".into(),
+                name: "fixture".into(),
+                arguments: serde_json::json!({}).into(),
+                live: None,
+            },
+            UiEvent::Responded,
+        ]));
+        status(&mut app, "/copy 1", "only 1 answer available (use /copy 0)");
+        let stale = copy(&mut app, "/copy", first, "the last answer");
+        app.turn = Some(Turn::new());
+        app.update(Msg::Events(vec![
+            UiEvent::Text("**answer".into()),
+            UiEvent::Text("**  \n".into()),
+        ]));
+        copy(&mut app, "/copy  0  ", second, "the last answer");
+        let current = copy(&mut app, "/copy 1", first, "the previous answer");
+        status(
+            &mut app,
+            "/copy 2",
+            "only 2 answers available (use /copy 0..=1)",
+        );
+        let result = |ticket| {
+            Msg::Done(Done {
+                ticket,
+                result: TaskResult::CopyToTerminal {
+                    text: first.into(),
+                    what: "the answer".into(),
+                },
+            })
+        };
+        assert!(app.update(result(stale)).is_empty());
+        assert!(matches!(app.update(result(current)).as_slice(),
+            [Effect::CopyToTerminal { text, .. }] if text == first));
+        for code in ['c', 'C'] {
+            let effects = app.update(Msg::Input(ReadEvent::Terminal(Event::Key(KeyEvent::new(
+                KeyCode::Char(code),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )))));
+            assert!(
+                matches!(effects.as_slice(), [Effect::Spawn(ticket, Task::Copy(Copy::Conversation(_)))] if ticket.kind == Kind::Copy)
+            );
+        }
+        let effects = app.update(Msg::Input(ReadEvent::Terminal(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )))));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Spawn(_, Task::Copy(_))))
+        );
+        assert!(app.quit_armed.is_some());
+        runtime.running.take().unwrap().driver.stop().await.unwrap();
+        assert_eq!(
+            runtime.tasks.finish(app.sessions()).await,
+            [] as [String; 0]
+        );
     }
 
     fn transcript_copies(app: &App, text: &str) -> usize {

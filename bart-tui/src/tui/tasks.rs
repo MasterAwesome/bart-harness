@@ -15,7 +15,8 @@ use crate::{
     tui::text::Clean,
 };
 use reqwest::Client;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use tokio::sync::Mutex;
 use tokio::task::{AbortHandle, JoinSet};
 
 #[derive(Clone)]
@@ -72,7 +73,7 @@ pub(super) enum Kind {
     Delete,
     Preferences,
     Remember,
-    CopyConversation,
+    Copy,
     Close(u64),
 }
 
@@ -85,7 +86,7 @@ impl Kind {
             | Self::Image
             | Self::Files
             | Self::Prepare
-            | Self::CopyConversation => true,
+            | Self::Copy => true,
             Self::Open
             | Self::Mcp
             | Self::Delete
@@ -107,7 +108,11 @@ pub(super) struct Done {
 pub(super) enum TaskResult {
     Remembered(Result<(), String>),
     Closed,
-    ConversationCopied(String),
+    Copied(String),
+    CopyToTerminal {
+        text: String,
+        what: String,
+    },
     Failed(String),
     Catalog {
         purpose: CatalogUse,
@@ -207,8 +212,48 @@ pub(super) struct Opening {
     pub(super) preferences: Current,
     pub(super) from: OpenFrom,
 }
+pub(super) enum Copy {
+    Text { text: String, what: String },
+    Conversation(Vec<super::transcript::CopySource>),
+}
+
+impl Copy {
+    async fn run(self) -> TaskResult {
+        let (text, what) = match self {
+            Self::Text { text, what } => (text, what),
+            Self::Conversation(sources) => {
+                match tokio::task::spawn_blocking(move || conversation_text(&sources)).await {
+                    Ok(text) => (
+                        text,
+                        "the retained conversation (older content may be omitted)".into(),
+                    ),
+                    Err(error) => return TaskResult::Failed(error.to_string()),
+                }
+            }
+        };
+        if clipboard::copy_native(&text).await {
+            TaskResult::Copied(what)
+        } else {
+            TaskResult::CopyToTerminal { text, what }
+        }
+    }
+}
+
+fn conversation_text(sources: &[super::transcript::CopySource]) -> String {
+    sources
+        .iter()
+        .flat_map(|source| match source {
+            super::transcript::CopySource::Text(text) => vec![text.to_string()],
+            super::transcript::CopySource::Rows(rows) => {
+                rows.iter().map(super::markdown::RenderRow::source).collect()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(super) enum Task {
-    CopyConversation(Vec<super::transcript::CopySource>),
+    Copy(Copy),
     Remember(PathBuf, Settings),
     Close {
         ticket: Ticket,
@@ -257,7 +302,7 @@ pub(super) async fn delete_if_empty(sessions: Sessions, id: &str) -> Result<bool
 impl Task {
     pub(super) fn kind(&self) -> Kind {
         match self {
-            Self::CopyConversation(..) => Kind::CopyConversation,
+            Self::Copy(..) => Kind::Copy,
             Self::Remember(..) => Kind::Remember,
             Self::Close { ticket, .. } => ticket.kind,
             Self::Catalog { .. } => Kind::Catalog,
@@ -273,26 +318,7 @@ impl Task {
     }
     async fn run(self) -> TaskResult {
         match self {
-            Self::CopyConversation(sources) => {
-                match tokio::task::spawn_blocking(move || {
-                    sources
-                        .iter()
-                        .flat_map(|source| match source {
-                            super::transcript::CopySource::Text(text) => vec![text.to_string()],
-                            super::transcript::CopySource::Rows(rows) => rows
-                                .iter()
-                                .map(super::markdown::RenderRow::source)
-                                .collect(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .await
-                {
-                    Ok(text) => TaskResult::ConversationCopied(text),
-                    Err(error) => TaskResult::Failed(error.to_string()),
-                }
-            }
+            Self::Copy(copy) => copy.run().await,
             Self::Remember(state, settings) => {
                 TaskResult::Remembered(super::remember(&state, &settings).await)
             }
@@ -458,10 +484,27 @@ impl Task {
 pub(super) struct Tasks {
     set: JoinSet<Done>,
     owner: HashMap<Kind, (Ticket, AbortHandle)>,
+    clipboard: Arc<Mutex<()>>,
 }
 impl Tasks {
     pub(super) fn start(&mut self, ticket: Ticket, task: Task) {
-        self.spawn(ticket, task.run());
+        if ticket.kind == Kind::Copy {
+            self.spawn_copy(ticket, task.run());
+        } else {
+            self.spawn(ticket, task.run());
+        }
+    }
+
+    pub(super) fn spawn_copy(
+        &mut self,
+        ticket: Ticket,
+        result: impl Future<Output = TaskResult> + Send + 'static,
+    ) {
+        let clipboard = Arc::clone(&self.clipboard);
+        self.spawn(ticket, async move {
+            let _guard = clipboard.lock().await;
+            result.await
+        });
     }
 
     fn spawn(&mut self, ticket: Ticket, result: impl Future<Output = TaskResult> + Send + 'static) {
@@ -562,8 +605,8 @@ mod tests {
     use super::*;
     use crate::agent::Event;
 
-    #[tokio::test]
-    async fn copy_conversation_formats_tables_and_keeps_code_indent() {
+    #[test]
+    fn copy_conversation_formats_tables_and_keeps_code_indent() {
         let mut transcript = super::super::transcript::Transcript::default();
         let message = transcript.user("Show an example.", &[], false);
         transcript.append([message], None);
@@ -573,13 +616,7 @@ mod tests {
         transcript.append(blocks, None);
         let blocks = transcript.end(None, 18);
         transcript.append(blocks, None);
-        let TaskResult::ConversationCopied(text) =
-            Task::CopyConversation(transcript.copy_sources())
-                .run()
-                .await
-        else {
-            panic!("conversation copy failed");
-        };
+        let text = conversation_text(&transcript.copy_sources());
         assert_eq!(
             text,
             "Show an example.\n\nExample\n\n| Name | Value |\n| :--- | ---: |\n| a \\| b | 2 |\n\n    one two three    \n      four"
@@ -675,6 +712,50 @@ mod tests {
             })
             .unwrap();
         (opener, settings, preferences)
+    }
+
+    #[tokio::test]
+    async fn resumed_and_rewound_sessions_restore_raw_answer_history() {
+        use crate::provider::mock::{Reply, serve};
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = "    indented code\n";
+        let second = "**second**  \n";
+        let (provider, _) = serve(
+            dir.path(),
+            vec![
+                Reply::text(first),
+                Reply::text(" \n\t"),
+                Reply::text(second),
+            ],
+        )
+        .await;
+        let (opener, settings, prefs) = open_fixture(dir.path(), provider);
+        let (mut session, id) = opener
+            .open(settings.clone(), prefs.clone(), None)
+            .await
+            .unwrap();
+        let ignore = |_: Event<'_>| {};
+        for prompt in ["first", "second", "third"] {
+            Box::pin(session.turn(prompt.to_owned().into(), ignore))
+                .await
+                .unwrap();
+        }
+        crate::finish_session(&mut session).await.unwrap();
+        drop(session);
+
+        let record = opener.sessions.resume(&id).unwrap();
+        let mut resumed = opened(opener.open(settings, prefs, Some(record)).await.unwrap()).await;
+        assert_eq!(resumed.transcript.answer(0), Ok(second));
+        assert_eq!(resumed.transcript.answer(1), Ok(first));
+        assert!(resumed.transcript.answer(2).is_err());
+
+        let (at, _) = resumed.session.journal().user_messages().pop().unwrap();
+        resumed.session.rewind(at, ignore).await.unwrap();
+        let rewound = super::super::transcript::project_rewind(&resumed.session).await;
+        assert_eq!(rewound.answer(0), Ok(first));
+        assert!(rewound.answer(1).is_err());
+        crate::finish_session(&mut resumed.session).await.unwrap();
     }
 
     #[tokio::test]

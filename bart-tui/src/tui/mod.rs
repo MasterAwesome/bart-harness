@@ -224,7 +224,7 @@ struct Running {
 }
 
 enum HostEffect {
-    Copy(String, String),
+    CopyToTerminal { text: String, what: String },
     Clear,
     Suspend,
     Reassert,
@@ -386,7 +386,9 @@ impl Runtime {
                 self.registry_changes = app.session_view().map(|s| s.registry().changes());
                 return Some(HostEffect::Clear);
             }
-            Effect::Copy(text, what) => return Some(HostEffect::Copy(text, what)),
+            Effect::CopyToTerminal { text, what } => {
+                return Some(HostEffect::CopyToTerminal { text, what });
+            }
             Effect::Clear => return Some(HostEffect::Clear),
             Effect::Suspend => return Some(HostEffect::Suspend),
             Effect::Reassert => return Some(HostEffect::Reassert),
@@ -452,6 +454,7 @@ async fn interact(
     }.await;
     let mut failures = Vec::new();
     let mut closed = None;
+    runtime.tasks.cancel(tasks::Kind::Copy);
     if let Some(mut active) = runtime.running {
         match active.driver.stop().await {
             Ok(()) => closed = Some(active.id),
@@ -487,9 +490,9 @@ async fn run_effects(
 ) -> io::Result<Option<Effect>> {
     while let Some(host) = runtime.next_effect(app, effects) {
         match host {
-            HostEffect::Copy(text, what) => {
-                effects.extend(app.update(Msg::Clipboard(clipboard::copy(&text, &what))))
-            }
+            HostEffect::CopyToTerminal { text, what } => effects.extend(app.update(
+                Msg::Clipboard(clipboard::copy_terminal(screen.backend_mut(), &text, &what)),
+            )),
             HostEffect::Clear => screen.clear()?,
             HostEffect::Suspend => {
                 input.pause().await?;

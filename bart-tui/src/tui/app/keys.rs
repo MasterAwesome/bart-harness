@@ -1,4 +1,5 @@
 use super::*;
+use crate::tui::{transcript::AnswerLookupError, viewer::Action as ViewerAction};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Slash {
@@ -23,7 +24,11 @@ pub(super) const COMMANDS: [(Slash, &str, &str); 12] = [
     (Slash::Settings, "settings", "change Bart preferences"),
     (Slash::Model, "model", "choose the provider and model"),
     (Slash::Effort, "effort", "choose the reasoning effort"),
-    (Slash::Copy, "copy", "copy the last answer"),
+    (
+        Slash::Copy,
+        "copy",
+        "copy an answer as markdown (/copy [N])",
+    ),
     (
         Slash::Mcps,
         "mcps",
@@ -78,13 +83,15 @@ impl App {
                 }
                 if let Some(Surface::Viewer(viewer, _)) = &mut self.surface {
                     let live = &self.session.as_ref().expect("viewer session").live;
-                    if let Some(effect) =
-                        viewer.key(key, self.transcript.details(), live, &mut self.status)
-                    {
-                        if matches!(effect, Effect::Clear) {
+                    match viewer.key(key, self.transcript.details(), live, &mut self.status) {
+                        Some(ViewerAction::Close) => {
                             self.close_details();
+                            self.effects.push(Effect::Clear);
                         }
-                        self.effects.push(effect);
+                        Some(ViewerAction::Copy { text, what }) => {
+                            self.copy_text(text, what.into());
+                        }
+                        None => {}
                     }
                     return;
                 }
@@ -134,14 +141,18 @@ impl App {
     }
 
     fn copy_conversation(&mut self) {
-        self.start_task(Task::CopyConversation(self.transcript.copy_sources()));
+        self.start_task(Task::Copy(Copy::Conversation(
+            self.transcript.copy_sources(),
+        )));
     }
 
     fn global_key(&mut self, key: KeyEvent) -> bool {
         if !key.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
         }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SHIFT) {
+        if matches!(key.code, KeyCode::Char('c' | 'C'))
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+        {
             if self.surface.is_none() {
                 self.copy_conversation();
             }
@@ -427,8 +438,7 @@ impl App {
                     return;
                 };
                 if let Some(text) = viewer.mouse(mouse, stamp) {
-                    self.effects
-                        .push(Effect::Copy(text, "the selection".into()));
+                    self.copy_text(text, "the selection".into());
                 }
             }
             Event::Mouse(mouse) if self.surface.is_none() => {
@@ -449,8 +459,7 @@ impl App {
                         if mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
                             self.drafts.composer.select(mouse.column, mouse.row, true);
                         } else if let Some(text) = self.drafts.composer.finish_selection() {
-                            self.effects
-                                .push(Effect::Copy(text, "the selection".into()));
+                            self.copy_text(text, "the selection".into());
                         }
                         return;
                     }
@@ -478,7 +487,7 @@ impl App {
                     MouseEventKind::Up(MouseButton::Left) => {
                         if let Some(text) = self.scrollback.selected_text(&mut self.transcript) {
                             let chars = format!("{} chars", text.chars().count());
-                            self.effects.push(Effect::Copy(text, chars));
+                            self.copy_text(text, chars);
                         }
                     }
                     _ => {}
@@ -493,7 +502,7 @@ impl App {
             self.set_status(StatusKind::Info, "wait for settings to finish saving");
             return;
         }
-        if argument.is_some() && command != Slash::Rename {
+        if argument.is_some() && !matches!(command, Slash::Rename | Slash::Copy) {
             self.set_status(StatusKind::Info, "this command takes no argument");
             return;
         }
@@ -505,16 +514,7 @@ impl App {
                     self.set_picker(Some(Picker::mcps(session.context.mcp())));
                 }
             }
-            Slash::Copy => {
-                if self.transcript.last_answer().trim().is_empty() {
-                    self.set_status(StatusKind::Info, "no answer yet");
-                } else {
-                    self.effects.push(Effect::Copy(
-                        self.transcript.last_answer().trim().to_owned(),
-                        "the last answer".into(),
-                    ));
-                }
-            }
+            Slash::Copy => self.copy_answer(argument.as_deref()),
             _ if self.turn.is_some() => {
                 self.set_status(StatusKind::Info, "finish or interrupt the turn first")
             }
@@ -551,6 +551,41 @@ impl App {
             Slash::Model => self.load_providers(None),
             Slash::Effort => {
                 self.load_models(self.info.settings.provider.clone(), CatalogUse::Effort);
+            }
+        }
+    }
+
+    fn copy_answer(&mut self, argument: Option<&str>) {
+        let Some(index) = argument.map_or(Some(0), |value| {
+            let value = value.trim();
+            if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+                value.parse::<usize>().ok()
+            } else {
+                None
+            }
+        }) else {
+            self.set_status(StatusKind::Info, "usage: /copy [N] (0 = latest answer)");
+            return;
+        };
+        match self.transcript.answer(index) {
+            Ok(text) => {
+                let what = match index {
+                    0 => "the last answer".into(),
+                    1 => "the previous answer".into(),
+                    n => format!("answer {n} back"),
+                };
+                self.copy_text(text.to_owned(), what);
+            }
+            Err(AnswerLookupError::TooLarge) => {
+                self.set_status(StatusKind::Info, "answer is too large for the copy history");
+            }
+            Err(AnswerLookupError::OutOfRange(count)) => {
+                let message = match count {
+                    0 => "no answer yet".into(),
+                    1 => "only 1 answer available (use /copy 0)".into(),
+                    n => format!("only {n} answers available (use /copy 0..={})", n - 1),
+                };
+                self.set_status(StatusKind::Info, message);
             }
         }
     }
