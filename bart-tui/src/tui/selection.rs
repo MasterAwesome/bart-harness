@@ -75,10 +75,15 @@ impl CellBox {
     }
 }
 
+pub(super) struct Separator {
+    pub(super) rule: String,
+    pub(super) standalone: bool,
+}
+
 pub(super) struct Table {
     start: usize,
     cells: Vec<Cell>,
-    separator: Option<String>,
+    separator: Option<Separator>,
 }
 
 struct Cell {
@@ -103,7 +108,7 @@ impl Table {
     pub(super) fn new(
         start: usize,
         cells: impl IntoIterator<Item = String>,
-        separator: Option<String>,
+        separator: Option<Separator>,
     ) -> Self {
         let cells = cells
             .into_iter()
@@ -135,9 +140,9 @@ impl Table {
             escape_cell(&mut row, &cell.text);
             row.push_str(" |");
         }
-        if let Some(rule) = self.separator.as_ref().filter(|_| separator) {
+        if let Some(sep) = self.separator.as_ref().filter(|_| separator) {
             row.push('\n');
-            row.push_str(rule);
+            row.push_str(&sep.rule);
         }
         row
     }
@@ -158,7 +163,8 @@ impl Table {
             }
         }
         Some(TableScope::Row {
-            separator: last > (block, self.end()),
+            separator: self.separator.as_ref().is_some_and(|sep| sep.standalone)
+                || last > (block, self.end()),
         })
     }
 }
@@ -237,7 +243,7 @@ impl Row {
         source: &Arc<Table>,
         mut boxes: Vec<CellBox>,
     ) -> Self {
-        let width = prefix.iter().map(Span::width).sum::<usize>();
+        let width = prefix.iter().map(text::span_width).sum::<usize>();
         line.spans.splice(..0, prefix.iter().cloned());
         for cell in &mut boxes {
             cell.right += width;
@@ -282,7 +288,7 @@ impl Row {
     fn column(&self, part: &Part) -> usize {
         self.line.spans[..part.spans.start]
             .iter()
-            .map(Span::width)
+            .map(text::span_width)
             .sum()
     }
     fn graphemes(&self, part: &Part) -> impl Iterator<Item = (usize, usize, &str, Style)> {
@@ -294,7 +300,7 @@ impl Row {
             .map(move |(g, style)| {
                 let at = (byte, column, g, style);
                 byte += g.len();
-                column += text::width(g);
+                column += text::grapheme_width(g);
                 at
             })
     }
@@ -694,7 +700,7 @@ pub(super) fn fit_prefix<'a>(
         style: Style::new().dim(),
     }];
     let spare = width.saturating_sub(room);
-    if prefix.iter().map(Span::width).sum::<usize>() <= spare {
+    if prefix.iter().map(text::span_width).sum::<usize>() <= spare {
         prefix
     } else if spare > 0 {
         COLLAPSED
@@ -717,7 +723,7 @@ pub(super) fn wrap_prefixed(
         text::glyph_room(&line.spans, width)
     };
     let prefixes = [first, rest].map(|prefix| fit_prefix(prefix, width, room));
-    let widths = prefixes.map(|prefix| width - prefix.iter().map(Span::width).sum::<usize>());
+    let widths = prefixes.map(|prefix| width - prefix.iter().map(text::span_width).sum::<usize>());
     text::wrap(&line.spans, widths, usize::MAX, mode)
         .0
         .into_iter()

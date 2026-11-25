@@ -42,7 +42,6 @@ tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["process", "time", "net", "io-util", "macros", "rt", "signal", "sync"] }
 unicase = "2.10.0"
 unicode-segmentation = "1.13.3"
-unicode-width = "0.2.3"
 
 [dev-dependencies]
 bart-core = { path = "../bart-core", features = ["test-support"] }

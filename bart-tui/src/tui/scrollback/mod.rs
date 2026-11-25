@@ -533,7 +533,7 @@ impl Scrollback {
             })
             .collect();
         for line in &mut lines {
-            let pad = usize::from(self.width).saturating_sub(line.width());
+            let pad = usize::from(self.width).saturating_sub(super::text::line_width(line));
             if line.style.bg.is_some() && pad > 0 {
                 line.spans.push(" ".repeat(pad).into());
             }

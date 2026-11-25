@@ -120,9 +120,11 @@ impl Pane {
             .take(usize::from(self.area.height))
             .enumerate()
         {
-            frame.render_widget(
-                search::paint(row, range, search),
+            let line = search::paint(row, range, search);
+            text::render_line(
+                &line,
                 Rect::new(self.area.x, self.area.y + index as u16, self.area.width, 1),
+                frame.buffer_mut(),
             );
         }
         frame.render_widget(pane_heading(heading, self, focused), self.label);

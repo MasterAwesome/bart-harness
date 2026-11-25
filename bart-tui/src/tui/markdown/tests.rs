@@ -194,7 +194,7 @@ fn reversed(rows: &[Row], range: (Point, Point)) -> Vec<String> {
 
 #[test]
 fn boxed_cell_drag_rejoins_dropped_spaces_and_snaps_inside_its_box() {
-    let rows = render_detail(TABLE_FIXTURE, 13);
+    let rows = render_detail(TABLE_FIXTURE, 14);
     let start = hit(&rows, "bcdefg", false);
     let end = hit(&rows, "klm", true);
     assert_eq!(
@@ -213,13 +213,13 @@ fn boxed_cell_drag_rejoins_dropped_spaces_and_snaps_inside_its_box() {
         assert_eq!(selection::text(&rows, (x, padding)).as_deref(), Some("x"));
         assert_eq!(reversed(&rows, (x, padding)), ["x"]);
     }
-    let last = selection::point_at(next, 12);
+    let last = selection::point_at(next, 13);
     assert_eq!(last, end);
 }
 
 #[test]
 fn stacked_labels_are_chrome_and_table_coordinates_survive_reflow() {
-    let boxed = render_detail(TABLE_FIXTURE, 13);
+    let boxed = render_detail(TABLE_FIXTURE, 14);
     let stacked = render_detail(TABLE_FIXTURE, 7);
     let first = hit(&stacked, "Data:", false);
     let last = hit(&stacked, "klm", true);
@@ -233,7 +233,7 @@ fn stacked_labels_are_chrome_and_table_coordinates_survive_reflow() {
         assert!(
             reversed(rows, (first, last))
                 .iter()
-                .all(|line| !line.contains("Data:") && !line.contains('─') && !line.contains('╌'))
+                .all(|line| !line.contains("Data:") && !line.contains(['─', '│', '┼']))
         );
     }
     let row = (hit(&stacked, "x", false), last);
@@ -252,7 +252,7 @@ fn border_drag_and_prose_drag_copy_gfm_rows_without_highlighting_chrome() {
     assert!(
         reversed(&rows, full)
             .iter()
-            .all(|text| !text.contains(['─', '╌']))
+            .all(|text| !text.contains(['─', '│', '┼']))
     );
     let stacked = render_detail(&source, 7);
     for rows in [&rows, &stacked] {
@@ -656,7 +656,7 @@ fn wide_wrap_separator_keeps_copy_hit_testing_and_search_in_source_order() {
 }
 
 #[test]
-fn nested_quote_table_uses_booktabs_rules_and_natural_widths() {
+fn nested_quote_table_uses_inner_grid_and_natural_widths() {
     let source = "> > > > > | H |\n> > > > > | --- |\n> > > > > | 界 |";
     let boxed = render_detail(source, 4);
     assert_eq!(
@@ -681,7 +681,7 @@ fn nested_quote_table_uses_booktabs_rules_and_natural_widths() {
 }
 
 #[test]
-fn booktabs_table_adds_dashed_dividers_only_when_rows_wrap() {
+fn inner_grid_table_renders_column_pipes_and_row_dividers_without_outer_frame() {
     let source = "| Svc | Notes | Ms |\n| --- | --- | ---: |\n| api | Validates JWT tokens and keys | 12 |\n| job | Retries webhook deliveries | 48 |";
     let wide: Vec<_> = render_detail(source, 60)
         .into_iter()
@@ -690,49 +690,70 @@ fn booktabs_table_adds_dashed_dividers_only_when_rows_wrap() {
     assert_eq!(
         wide,
         [
-            "Svc  Notes                          Ms",
-            "──────────────────────────────────────",
-            "api  Validates JWT tokens and keys  12",
-            "job  Retries webhook deliveries     48",
+            "Svc │ Notes                         │ Ms",
+            "────┼───────────────────────────────┼───",
+            "api │ Validates JWT tokens and keys │ 12",
+            "────┼───────────────────────────────┼───",
+            "job │ Retries webhook deliveries    │ 48",
         ]
     );
     let narrow: Vec<_> = render_detail(source, 26)
         .into_iter()
         .map(|row| row.line().to_string())
         .collect();
-    assert!(narrow.iter().any(|line| line.starts_with('─')));
-    assert!(narrow.iter().any(|line| line.starts_with('╌')));
-    assert!(!narrow.iter().any(|line| line.contains(['┌', '│', '└'])));
+    assert!(narrow.iter().any(|line| line.contains('┼')));
+    assert!(narrow.iter().any(|line| line.contains('│')));
+    assert!(
+        !narrow
+            .iter()
+            .any(|line| line.starts_with(['┌', '│', '├', '└', '╭', '╰']))
+    );
 
     // Dragging through the trailing header rule includes the header row; starting on it excludes it.
     let with_above = format!("Above\n\n{source}");
     let rows = render_detail(&with_above, 60);
-    let range = (hit(&rows, "Above", false), hit(&rows, "────", true));
+    let range = (hit(&rows, "Above", false), hit(&rows, "────┼", true));
     assert_eq!(
         selection::text(&rows, range).as_deref(),
         Some("Above\n\n| Svc | Notes | Ms |\n| --- | --- | ---: |")
     );
-    let below_rule = (hit(&rows, "────", false), hit(&rows, "12", true));
+    let below_rule = (hit(&rows, "────┼", false), hit(&rows, "12", true));
     assert_eq!(
         selection::text(&rows, below_rule).as_deref(),
         Some("| api | Validates JWT tokens and keys | 12 |")
     );
 
-    // 21 1-char columns fit at width 80 (21 + 20*2 = 61 <= 80) without stacking.
-    let cols = 21;
+    // Dragging from row 1 onto the inter-row divider stops at row 1 without pulling in row 2.
+    let body_rule_row = rows
+        .iter()
+        .rposition(|row| row.line().to_string().contains('┼'))
+        .unwrap();
+    let end_on_body_rule = selection::point_at(&rows[body_rule_row], 5);
+    assert_eq!(
+        selection::text(&rows, (hit(&rows, "api", false), end_on_body_rule)).as_deref(),
+        Some("| api | Validates JWT tokens and keys | 12 |")
+    );
+    assert_eq!(
+        selection::text(&rows, (end_on_body_rule, hit(&rows, "48", true))).as_deref(),
+        Some("| job | Retries webhook deliveries | 48 |")
+    );
+
+    // 20 1-char columns fit at width 80 (20 + 19*3 = 77 <= 80) without stacking.
+    let cols = 20;
     let hdr = format!("|{}", " x |".repeat(cols));
     let sep = format!("|{}", " - |".repeat(cols));
     let body = format!("|{}", " y |".repeat(cols));
     let many = render_detail(&format!("{hdr}\n{sep}\n{body}"), 80);
     assert_eq!(many.len(), 3);
 
-    // Cells wider than MAX_TABLE_COLUMNS (120) still wrap and get dashed body dividers.
+    // Cells wider than MAX_TABLE_COLUMNS (120) still wrap cleanly with inner grid rules.
     let long = "w".repeat(130);
     let overwide: Vec<_> = render_detail(&format!("| H |\n| --- |\n| {long} |\n| next |"), 140)
         .into_iter()
         .map(|row| row.line().to_string())
         .collect();
-    assert!(overwide.iter().any(|line| line.starts_with('╌')));
+    assert_eq!(overwide.len(), 6);
+    assert!(overwide.iter().any(|line| line.starts_with('─')));
 
     // An open streaming table after a closed fence and footnote ref keeps consistent widths.
     let start = "```txt\nhi\n```\n\nSee [^ref]\n\n| A | B |\n| --- | --- |\n| 1 | 2 |\n";
@@ -754,4 +775,191 @@ fn booktabs_table_adds_dashed_dividers_only_when_rows_wrap() {
     };
     assert_eq!(project(&visible), project(&expected));
     assert_eq!(project(&committed), project(&expected));
+}
+
+fn paint_cells(line: &Line<'_>, width: u16) -> Vec<String> {
+    use ratatui::{buffer::Buffer, layout::Rect};
+    let area = Rect::new(0, 0, width, 1);
+    let mut buf = Buffer::empty(area);
+    text::render_line(line, area, &mut buf);
+    (0..width)
+        .map(|x| buf[(x, 0)].symbol().to_owned())
+        .collect()
+}
+
+#[test]
+fn inner_grid_table_preserves_alignment_for_header_only_and_complex_graphemes() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let header_only = "Above\n\n| A | B |\n| --- | ---: |";
+    let rows = render_detail(header_only, 20);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.line().to_string())
+            .collect::<Vec<_>>(),
+        ["Above", "", "A │ B"]
+    );
+    let col_a = selection::point_at(&rows[2], 0);
+    assert_eq!(selection::text(&rows, (col_a, col_a)).as_deref(), Some("A"));
+    assert_eq!(
+        selection::text(&rows, (col_a, hit(&rows, "B", true))).as_deref(),
+        Some("| A | B |\n| --- | ---: |")
+    );
+    assert_eq!(
+        selection::text(&rows, (hit(&rows, "Above", false), hit(&rows, "B", true))).as_deref(),
+        Some(header_only)
+    );
+
+    for (source, width, query, expected_rule, expected_cells) in [
+        (
+            "| A | B |\n| - | - |\n| ❤&#xfe0f; | xy |",
+            7u16,
+            "xy",
+            &["─", "─", "─", "┼", "─", "─", "─"][..],
+            &["❤️", " ", " ", "│", " ", "x", "y"][..],
+        ),
+        (
+            "| A | B |\n| - | - |\n| لا | xy |",
+            7u16,
+            "xy",
+            &["─", "─", "─", "┼", "─", "─", "─"][..],
+            &["ل", "ا", " ", "│", " ", "x", "y"][..],
+        ),
+        (
+            "| A | B |\n| - | - |\n| ｶﾞX | y |",
+            8u16,
+            "X",
+            &["─", "─", "─", "─", "─", "┼", "─", "─"][..],
+            &["ｶﾞ", " ", " ", "X", " ", "│", " ", "y"][..],
+        ),
+        (
+            "| A | B |\n| - | - |\n| &#x600;&#32; | y |",
+            6u16,
+            "y",
+            &["─", "─", "─", "┼", "─", "─"][..],
+            &["\u{0600} ", " ", " ", "│", " ", "y"][..],
+        ),
+        (
+            "| A | B |\n| - | - |\n| ab\u{0600} c | y |",
+            8u16,
+            "y",
+            &["─", "─", "─", "─", "─", "┼", "─", "─"][..],
+            &["a", "b", "\u{0600} ", " ", " ", "│", " ", "y"][..],
+        ),
+        (
+            "| A | B |\n| - | - |\n| क्क्क्क्क | y |",
+            9u16,
+            "y",
+            &["─", "─", "─", "─", "─", "─", "┼", "─", "─"][..],
+            &["क्क्क्क्क", " ", " ", " ", " ", " ", "│", " ", "y"][..],
+        ),
+    ] {
+        let rows = render_detail(source, width);
+        assert_eq!(paint_cells(rows[1].line(), width), expected_rule);
+        assert_eq!(paint_cells(rows[2].line(), width), expected_cells);
+        let highlighted = selection::highlight(
+            &rows[2],
+            (hit(&rows, query, false), hit(&rows, query, true)),
+        );
+        assert_eq!(paint_cells(&highlighted, width), expected_cells);
+        let mut search = crate::tui::search::Search::default();
+        search.open();
+        for ch in query.chars() {
+            search.prompt_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        let hits = selection::search(&rows, search.lower());
+        search.update_matches(0, hits, |_| Some(0));
+        let painted = crate::tui::search::paint(&rows[2], None, Some(&search));
+        assert_eq!(paint_cells(&painted, width), expected_cells);
+    }
+
+    let quoted_wide = render_detail("> | क्क्क्क्क |\n> | --- |", 5);
+    assert_eq!(
+        paint_cells(quoted_wide[0].line(), 5),
+        ["क्क्क्क्क", " ", " ", " ", " "]
+    );
+    let stacked_quoted = render_detail(
+        &format!(
+            "> | क्क्क्क्क |{}\n> | --- |{}",
+            " a |".repeat(30),
+            " - |".repeat(30)
+        ),
+        5,
+    );
+    assert_eq!(
+        paint_cells(stacked_quoted[0].line(), 5),
+        ["क्क्क्क्क", " ", " ", " ", " "]
+    );
+
+    let wide_ws = render_detail(
+        "| A | B |\n| - | - |\n| a&#32;&#xff9e;&#xff9e;b | abcd efgh |",
+        12,
+    );
+    assert_eq!(paint_cells(wide_ws[1].line(), 12)[6], "┼");
+    assert!(
+        wide_ws[2..]
+            .iter()
+            .all(|row| paint_cells(row.line(), 12)[6] == "│")
+    );
+    assert_eq!(
+        paint_cells(wide_ws[3].line(), 12)[8..12],
+        ["e", "f", "g", "h"]
+    );
+
+    let trailing_marks = render_detail(
+        "| A | B |\n| - | - |\n| abcde&#32;&#xff9e;&#xff9e; | z |",
+        80,
+    );
+    assert!(
+        paint_cells(trailing_marks[2].line(), 14)
+            .iter()
+            .any(|cell| cell == " \u{ff9e}\u{ff9e}")
+    );
+
+    let trailing_wide_space = render_detail("| AB | B |\n| - | - |\n| x&#x3000; | z |", 80);
+    assert_eq!(trailing_wide_space.len(), 3);
+    assert_eq!(
+        selection::text(
+            &trailing_wide_space,
+            (
+                hit(&trailing_wide_space, "AB", false),
+                hit(&trailing_wide_space, "z", true)
+            )
+        )
+        .as_deref(),
+        Some("| AB | B |\n| --- | --- |\n| x\u{3000} | z |")
+    );
+    let inner_wide_space = render_detail("| AB | B |\n| - | - |\n| x&#x3000;y | z |", 6);
+    assert_eq!(
+        selection::text(
+            &inner_wide_space,
+            (
+                hit(&inner_wide_space, "x", false),
+                hit(&inner_wide_space, "y", true)
+            )
+        )
+        .as_deref(),
+        Some("x\u{3000}y")
+    );
+    let zwsp_after_wide_space =
+        render_detail("| AB | B |\n| - | - |\n| x&#x3000;&#x200b; y | z |", 6);
+    assert_eq!(
+        selection::text(
+            &zwsp_after_wide_space,
+            (
+                hit(&zwsp_after_wide_space, "x", false),
+                selection::point_at(&zwsp_after_wide_space[3], 0)
+            )
+        )
+        .as_deref(),
+        Some("x\u{3000}\u{200b} ")
+    );
+    assert_eq!(
+        selection::search(&zwsp_after_wide_space, "\u{200b}").len(),
+        1
+    );
+    assert_eq!(
+        render_detail("| A | B |\n| - | - |\n| &#x200b; y | z |", 80).len(),
+        3
+    );
 }

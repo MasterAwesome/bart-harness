@@ -20,6 +20,7 @@ use ratatui::{
     style::{Style, Stylize},
     text::{Line, Span, Text},
 };
+use unicode_segmentation::UnicodeSegmentation as _;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct RenderRow {
@@ -45,21 +46,22 @@ pub(super) struct TableRow {
 
 #[derive(Clone, Debug, PartialEq)]
 struct TableHeader {
-    cells: Vec<Vec<Span<'static>>>,
+    labels: Box<[String]>,
     alignments: Vec<Alignment>,
     geometry: Arc<TableGeometry>,
+    has_body: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TableKind {
     Header,
-    FirstBody,
     Body,
 }
 
 #[derive(Debug, PartialEq)]
 struct TableGeometry {
-    preferred: Box<[usize]>,
+    columns: Box<[(usize, usize)]>,
+    max_grapheme: usize,
 }
 
 impl RenderRow {
@@ -171,10 +173,16 @@ impl RenderRow {
                 RowKind::Text(line, _) => spans(&line.spans),
                 RowKind::TableClipped => 0,
                 RowKind::Table(row) => {
+                    let labels: usize = row
+                        .header
+                        .labels
+                        .iter()
+                        .map(|label| size_of::<String>() + label.capacity())
+                        .sum();
                     size_of::<TableRow>()
                         + size_of::<TableHeader>()
                         + cells(&row.cells)
-                        + cells(&row.header.cells)
+                        + labels
                         + row.header.geometry.bytes()
                         + row.header.alignments.capacity() * size_of::<Alignment>()
                 }
@@ -249,6 +257,7 @@ const MAX_TABLE_COLUMNS: usize = 120;
 const MAX_TABLE_ROW_BYTES: usize = 64 * 1024;
 const MAX_TABLE_RENDERED_ROWS: usize = 32 * 1024;
 const MAX_TABLE_PREFIX_BYTES: usize = 512;
+const MAX_TABLE_LABEL_BYTES: usize = 512;
 const TABLE_BYTES_NOTICE: &str = "table clipped: display limit exceeded";
 const TABLE_ROWS_NOTICE: &str = "table clipped: display row limit exceeded";
 
@@ -610,10 +619,38 @@ fn table(nodes: &[Node<'_>], alignments: &[Alignment]) -> Vec<RenderRow> {
         return Vec::new();
     }
     let geometry = Arc::new(TableGeometry::new(&rows, alignments.len()));
+    let labels = (0..alignments.len())
+        .map(|column| {
+            let raw = rows[0]
+                .get(column)
+                .map_or_else(String::new, |cell| span_text(cell));
+            if raw.trim().is_empty() {
+                format!("Column {}: ", column + 1)
+            } else {
+                let text = raw.replace('\n', " ");
+                let mut end = 0;
+                let mut truncated = false;
+                for (at, grapheme) in text.grapheme_indices(true) {
+                    let next = at + grapheme.len();
+                    if next > MAX_TABLE_LABEL_BYTES {
+                        truncated = true;
+                        break;
+                    }
+                    end = next;
+                }
+                if truncated {
+                    format!("{}…: ", &text[..end])
+                } else {
+                    format!("{text}: ")
+                }
+            }
+        })
+        .collect();
     let header = Arc::new(TableHeader {
-        cells: rows[0].clone(),
+        labels,
         alignments: alignments.to_vec(),
         geometry: Arc::clone(&geometry),
+        has_body: rows.len() > 1,
     });
     rows.drain(..)
         .enumerate()
@@ -621,48 +658,90 @@ fn table(nodes: &[Node<'_>], alignments: &[Alignment]) -> Vec<RenderRow> {
             RenderRow::new(RowKind::Table(Box::new(TableRow {
                 header: Arc::clone(&header),
                 cells,
-                kind: match index {
-                    0 => TableKind::Header,
-                    1 => TableKind::FirstBody,
-                    _ => TableKind::Body,
+                kind: if index == 0 {
+                    TableKind::Header
+                } else {
+                    TableKind::Body
                 },
             })))
         })
         .collect()
 }
 
-const TABLE_GUTTER: usize = 2;
+const TABLE_GUTTER: usize = 3;
 const MIN_TABLE_COLUMN: usize = 4;
 
 impl TableGeometry {
     fn new(rows: &[Vec<Vec<Span<'static>>>], count: usize) -> Self {
-        let preferred = if count > 0 && count <= MAX_TABLE_COLUMNS.div_ceil(1 + TABLE_GUTTER) {
+        let mut max_grapheme = 1;
+        let columns = if count > 0 && count <= MAX_TABLE_COLUMNS.div_ceil(1 + TABLE_GUTTER) {
             (0..count)
                 .map(|column| {
-                    rows.iter()
-                        .filter_map(|row| row.get(column))
-                        .map(|spans| spans.iter().map(Span::width).sum::<usize>())
-                        .max()
-                        .unwrap_or(1)
-                        .clamp(1, MAX_TABLE_COLUMNS + 1)
+                    let mut preferred = 1;
+                    let mut widest = 1;
+                    for spans in rows.iter().filter_map(|row| row.get(column)) {
+                        let cell = span_text(spans);
+                        for line in cell.split('\n') {
+                            let mut line_width = 0;
+                            let mut trailing = 0;
+                            let mut started = false;
+                            for grapheme in line.graphemes(true) {
+                                let w = text::grapheme_width(grapheme);
+                                if text::is_whitespace(grapheme) {
+                                    if started {
+                                        trailing += w;
+                                        widest = widest.max(w);
+                                    }
+                                    continue;
+                                }
+                                started = true;
+                                line_width += trailing + w;
+                                trailing = 0;
+                                widest = widest.max(w);
+                            }
+                            preferred = preferred.max(line_width);
+                        }
+                    }
+                    max_grapheme = max_grapheme.max(widest);
+                    let preferred = preferred.clamp(1, MAX_TABLE_COLUMNS + 1).max(widest);
+                    let min = preferred.clamp(1, MIN_TABLE_COLUMN).max(widest);
+                    (preferred, min)
                 })
                 .collect()
         } else {
+            for cell in rows.iter().flatten() {
+                for grapheme in span_text(cell).graphemes(true) {
+                    if grapheme != "\n" {
+                        max_grapheme = max_grapheme.max(text::grapheme_width(grapheme));
+                    }
+                }
+            }
             Box::default()
         };
-        Self { preferred }
+        Self {
+            columns,
+            max_grapheme,
+        }
     }
 
     fn bytes(&self) -> usize {
-        size_of::<Self>() + size_of_val(self.preferred.as_ref())
+        size_of::<Self>() + size_of_val(self.columns.as_ref())
     }
 
-    fn layout<'a>(prefix: &'a [Span<'static>], width: usize) -> (&'a [Span<'static>], usize) {
+    fn max_grapheme(&self) -> usize {
+        self.max_grapheme
+    }
+
+    fn layout<'a>(
+        prefix: &'a [Span<'static>],
+        width: usize,
+        min_glyph: usize,
+    ) -> (&'a [Span<'static>], usize) {
         const COLLAPSED: &[Span<'static>] = &[Span {
             content: Cow::Borrowed("…"),
             style: Style::new().dim(),
         }];
-        let room = width.min(2);
+        let room = width.min(min_glyph.max(2));
         let prefix = selection::fit_prefix(prefix, width, room);
         let bytes: usize = prefix
             .iter()
@@ -674,35 +753,34 @@ impl TableGeometry {
             prefix
         };
         let available =
-            (width - prefix.iter().map(Span::width).sum::<usize>()).min(MAX_TABLE_COLUMNS);
+            (width - prefix.iter().map(text::span_width).sum::<usize>()).min(MAX_TABLE_COLUMNS);
         (prefix, available)
     }
 
     fn columns(&self, width: usize) -> Option<Vec<usize>> {
-        let count = self.preferred.len();
+        let count = self.columns.len();
         if count == 0 {
             return None;
         }
         let gutters = count.saturating_sub(1) * TABLE_GUTTER;
-        let mins: Vec<usize> = self
-            .preferred
-            .iter()
-            .map(|&pref| pref.clamp(1, MIN_TABLE_COLUMN))
-            .collect();
-        let min_total: usize = mins.iter().sum();
-        if width < min_total + gutters {
+        let mut widths: Vec<usize> = self.columns.iter().map(|&(_, min)| min).collect();
+        let min_total = widths.iter().copied().fold(0usize, usize::saturating_add);
+        if width < min_total.saturating_add(gutters) {
             return None;
         }
         let available = width - gutters;
-        let total: usize = self.preferred.iter().sum();
+        let total = self
+            .columns
+            .iter()
+            .map(|&(pref, _)| pref)
+            .fold(0usize, usize::saturating_add);
         if total <= available {
-            return Some(self.preferred.to_vec());
+            return Some(self.columns.iter().map(|&(pref, _)| pref).collect());
         }
-        let mut widths = mins;
         let mut remaining = available - min_total;
         while remaining > 0 {
             let unfinished: Vec<usize> = (0..count)
-                .filter(|&col| widths[col] < self.preferred[col])
+                .filter(|&col| widths[col] < self.columns[col].0)
                 .collect();
             if unfinished.is_empty() {
                 break;
@@ -712,7 +790,7 @@ impl TableGeometry {
                 if remaining == 0 {
                     break;
                 }
-                let need = self.preferred[col] - widths[col];
+                let need = self.columns[col].0 - widths[col];
                 let grant = need.min(share).min(remaining);
                 widths[col] += grant;
                 remaining -= grant;
@@ -722,9 +800,17 @@ impl TableGeometry {
     }
 }
 
-fn table_rule(widths: &[usize], glyph: char) -> Span<'static> {
-    let total = widths.iter().sum::<usize>() + widths.len().saturating_sub(1) * TABLE_GUTTER;
-    Span::styled(glyph.to_string().repeat(total), Style::new().dim())
+fn table_rule(widths: &[usize]) -> Span<'static> {
+    let mut rule = String::new();
+    for (column, &width) in widths.iter().enumerate() {
+        if column > 0 {
+            rule.push_str("─┼─");
+        }
+        for _ in 0..width {
+            rule.push('─');
+        }
+    }
+    Span::styled(rule, Style::new().dim())
 }
 
 impl TableRow {
@@ -740,7 +826,10 @@ impl TableRow {
                     Alignment::Right => "---:",
                 })
                 .collect::<Vec<_>>();
-            format!("| {} |", rules.join(" | "))
+            selection::Separator {
+                rule: format!("| {} |", rules.join(" | ")),
+                standalone: !self.header.has_body,
+            }
         });
         selection::Table::new(
             byte,
@@ -778,7 +867,7 @@ impl TableRow {
             return budget.clip(at, 0, width).into_iter().collect();
         }
         let geometry = &self.header.geometry;
-        let (prefix, available) = TableGeometry::layout(prefix, width);
+        let (prefix, available) = TableGeometry::layout(prefix, width, geometry.max_grapheme());
         let mut projection = TableProjection {
             rows: Vec::new(),
             prefix,
@@ -805,23 +894,24 @@ impl TableRow {
                 return true;
             }
             let (start, _) = projection.source.cell(column);
-            let mut label = if self.kind == TableKind::Header {
-                Vec::new()
-            } else {
-                self.label(column)
-            };
-            let mut label_width: usize = label.iter().map(Span::width).sum();
-            if !label.is_empty()
-                && label_width + text::glyph_room(self.cell(column), width).max(2) > width
-            {
-                let clipped = text::clip_end(span_text(&label).trim_end(), width);
-                let end = 1;
-                projection.push(
-                    Line::from(Span::raw(clipped).bold()),
-                    vec![CellBox::new(width, column, start, end..end)],
-                );
-                label.clear();
-                label_width = 0;
+            let mut label = Vec::new();
+            let mut label_width = 0;
+            if self.kind != TableKind::Header {
+                let raw = &self.header.labels[column];
+                let room = text::glyph_room(self.cell(column), width).max(2);
+                let limit = width.saturating_sub(room);
+                let measured = text::bounded_width(raw, limit + 1);
+                if measured > limit {
+                    let clipped = text::clip_end(raw.strip_suffix(' ').unwrap_or(raw), width);
+                    let end = 1;
+                    projection.push(
+                        Line::from(Span::raw(clipped).bold()),
+                        vec![CellBox::new(width, column, start, end..end)],
+                    );
+                } else {
+                    label.push(Span::styled(raw.clone(), Style::new().bold()));
+                    label_width = measured;
+                }
             }
             let (lines, lost) = table_cell(
                 self.cell(column),
@@ -855,33 +945,11 @@ impl TableRow {
         false
     }
 
-    fn label(&self, column: usize) -> Vec<Span<'static>> {
-        let mut label = self.header.cells.get(column).cloned().unwrap_or_default();
-        if label.iter().all(|span| span.content.trim().is_empty()) {
-            label = vec![Span::raw(format!("Column {}", column + 1))];
-        } else {
-            for span in &mut label {
-                span.content = span.content.replace('\n', " ").into();
-                span.style = Style::new();
-            }
-        }
-        label.push(Span::raw(": "));
-        label.into_iter().map(Stylize::bold).collect()
-    }
-
     fn boxed(&self, projection: &mut TableProjection<'_>, widths: &[usize]) -> bool {
-        let wraps = self
-            .header
-            .geometry
-            .preferred
-            .iter()
-            .zip(widths)
-            .any(|(&pref, &width)| pref > width);
-        if self.kind == TableKind::Body && wraps && projection.limit > 1 {
-            projection.push_rule(Line::from(table_rule(widths, '╌')), false);
+        if self.kind == TableKind::Body && projection.limit > 1 {
+            projection.push_rule(Line::from(table_rule(widths)));
         }
-        let reserve_rule = usize::from(self.kind == TableKind::Header && projection.limit > 1);
-        let room = projection.limit - projection.rows.len() - reserve_rule;
+        let room = projection.limit - projection.rows.len();
         let cells: Vec<_> = widths
             .iter()
             .enumerate()
@@ -905,13 +973,15 @@ impl TableRow {
             let mut boxes = Vec::with_capacity(count);
             for (column, (lines, width)) in cells.iter_mut().zip(widths).enumerate() {
                 if column > 0 {
-                    spans.push(Span::raw(" ".repeat(TABLE_GUTTER)));
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled("│", Style::new().dim()));
+                    spans.push(Span::raw(" "));
                 }
                 let (start, end) = projection.source.cell(column);
                 let (line, byte) = lines.next().map_or((Line::default(), end), |wrapped| {
                     (wrapped.line, start + wrapped.byte)
                 });
-                let gap = width.saturating_sub(line.width());
+                let gap = width.saturating_sub(text::line_width(&line));
                 let left = match self.header.alignments[column] {
                     Alignment::Right => gap,
                     Alignment::Center => gap / 2,
@@ -932,16 +1002,13 @@ impl TableRow {
             }
             projection.push(Line::from(spans), boxes);
         }
-        if self.kind == TableKind::Header && projection.rows.len() < projection.limit {
-            projection.push_rule(Line::from(table_rule(widths, '─')), true);
-        }
         lost
     }
 }
 
 enum ProjectedRow {
     Cells(Line<'static>, Vec<CellBox>),
-    Rule { line: Line<'static>, at_end: bool },
+    Rule(Line<'static>),
 }
 
 struct TableProjection<'a> {
@@ -956,12 +1023,11 @@ impl TableProjection<'_> {
         self.rows.push(ProjectedRow::Cells(line, boxes));
     }
 
-    fn push_rule(&mut self, line: Line<'static>, at_end: bool) {
-        self.rows.push(ProjectedRow::Rule { line, at_end });
+    fn push_rule(&mut self, line: Line<'static>) {
+        self.rows.push(ProjectedRow::Rule(line));
     }
 
     fn finish(self, (block, byte): Point) -> Vec<Row> {
-        let end = self.source.end() + 1;
         self.rows
             .into_iter()
             .enumerate()
@@ -973,10 +1039,9 @@ impl TableProjection<'_> {
                     &self.source,
                     boxes,
                 ),
-                ProjectedRow::Rule { mut line, at_end } => {
+                ProjectedRow::Rule(mut line) => {
                     line.spans.splice(..0, self.prefix.iter().cloned());
-                    let point = (block, if at_end { end } else { byte });
-                    Row::chrome_at((block, byte, ordinal), point, line)
+                    Row::chrome_at((block, byte, ordinal), (block, byte), line)
                 }
             })
             .collect()

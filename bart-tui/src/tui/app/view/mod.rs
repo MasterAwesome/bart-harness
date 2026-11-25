@@ -535,7 +535,23 @@ impl App {
         let history = self
             .scrollback
             .view(usize::from(conversation.height), &self.transcript);
-        frame.render_widget(Paragraph::new(history), conversation);
+        let buf = frame.buffer_mut();
+        for (index, line) in history
+            .iter()
+            .take(usize::from(conversation.height))
+            .enumerate()
+        {
+            crate::tui::text::render_line(
+                line,
+                Rect::new(
+                    conversation.x,
+                    conversation.y + index as u16,
+                    conversation.width,
+                    1,
+                ),
+                buf,
+            );
+        }
         let Some(menu_area) = menu_area else {
             return context;
         };

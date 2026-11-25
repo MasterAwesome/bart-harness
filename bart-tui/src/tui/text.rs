@@ -1,9 +1,9 @@
 use ratatui::{
+    buffer::CellWidth as _,
     style::Style,
     text::{Line, Span},
 };
 use unicode_segmentation::UnicodeSegmentation as _;
-use unicode_width::UnicodeWidthStr as _;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Clean(String);
@@ -71,15 +71,60 @@ impl From<Clean> for ratatui::text::Text<'static> {
     }
 }
 
+pub(super) fn is_whitespace(grapheme: &str) -> bool {
+    grapheme.chars().all(char::is_whitespace)
+}
+
+pub(super) fn grapheme_width(grapheme: &str) -> usize {
+    if grapheme.contains(char::is_control) {
+        0
+    } else {
+        usize::from(grapheme.cell_width())
+    }
+}
+
 pub(super) fn width(text: &str) -> usize {
-    text.width()
+    text.graphemes(true).map(grapheme_width).sum()
+}
+
+pub(super) fn bounded_width(text: &str, limit: usize) -> usize {
+    let mut used = 0;
+    for grapheme in text.graphemes(true) {
+        used += grapheme_width(grapheme);
+        if used >= limit {
+            break;
+        }
+    }
+    used
+}
+
+pub(super) fn span_width(span: &Span<'_>) -> usize {
+    width(&span.content)
+}
+
+pub(super) fn line_width(line: &Line<'_>) -> usize {
+    line.spans.iter().map(span_width).sum()
+}
+
+pub(super) fn render_line(
+    line: &Line<'_>,
+    area: ratatui::layout::Rect,
+    buf: &mut ratatui::buffer::Buffer,
+) {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    let area = ratatui::layout::Rect { height: 1, ..area };
+    buf.set_style(area, line.style);
+    buf.set_line(area.x, area.y, line, area.width);
 }
 
 pub(super) fn glyph_room(spans: &[Span<'_>], width: usize) -> usize {
     let source: String = spans.iter().map(|span| span.content.as_ref()).collect();
     source
         .graphemes(true)
-        .map(str::width)
+        .map(grapheme_width)
         .max()
         .unwrap_or(1)
         .clamp(1, width.max(1))
@@ -136,28 +181,35 @@ pub(super) fn wrap(
     let mut has_word = false;
     let mut graphemes = source.grapheme_indices(true).peekable();
     while let Some(&(start, grapheme)) = graphemes.peek() {
-        let rest = &source[start..];
         let newline = grapheme == "\n";
-        let whitespace = grapheme.starts_with(char::is_whitespace);
+        let whitespace = is_whitespace(grapheme);
         let verbatim = matches!(mode, Wrap::Verbatim);
         if !whitespace && !verbatim && start >= word_end {
-            word_end = start + rest.find(char::is_whitespace).unwrap_or(rest.len());
-            word_width = source[start..word_end].width();
+            word_end = start;
+            word_width = 0;
+            for (at, next) in graphemes.clone() {
+                if is_whitespace(next) {
+                    break;
+                }
+                word_end = at + next.len();
+                word_width += grapheme_width(next);
+            }
             split_word = word_width > width.min(continuation.saturating_sub(indent));
         }
         let (end, cells) = if whitespace || verbatim || split_word {
-            (start + grapheme.len(), grapheme.width())
+            (start + grapheme.len(), grapheme_width(grapheme))
         } else {
             (word_end.max(start + grapheme.len()), word_width)
         };
-        if matches!(mode, Wrap::Table) && whitespace && !newline && (used == 0 || used >= width) {
+        let row = rows.last_mut().expect("one row");
+        let empty = row.line.spans.len() == row.padding;
+        let has_skipped = !row.skipped.is_empty();
+        if matches!(mode, Wrap::Table) && whitespace && !newline && empty {
             graphemes.next();
             continue;
         }
-        let row = rows.last_mut().expect("one row");
-        let has_skipped = !row.skipped.is_empty();
-        if matches!(mode, Wrap::Prose | Wrap::Plain)
-            && has_word
+        if matches!(mode, Wrap::Prose | Wrap::Plain | Wrap::Table)
+            && (matches!(mode, Wrap::Table) || has_word)
             && whitespace
             && !newline
             && (used + cells > width || has_skipped)
@@ -226,7 +278,7 @@ fn prose_indent(spans: &[Span<'_>]) -> usize {
         .iter()
         .flat_map(|span| span.content.graphemes(true))
         .take_while(|g| !g.chars().any(char::is_alphanumeric) && *g != "\n")
-        .map(str::width)
+        .map(grapheme_width)
         .sum()
 }
 
@@ -236,7 +288,7 @@ fn continuation_padding(spans: &[Span<'static>], mut left: usize) -> Vec<Span<'s
         if left == 0 {
             break;
         }
-        let cells = span.width().min(left);
+        let cells = span_width(span).min(left);
         if cells > 0 {
             fill.push(Span::styled(
                 " ".repeat(cells),
@@ -252,43 +304,44 @@ fn continuation_padding(spans: &[Span<'static>], mut left: usize) -> Vec<Span<'s
 }
 
 pub(super) fn clip_end(text: &str, room: usize) -> String {
-    if width(text) <= room {
-        return text.to_owned();
+    if room == 0 {
+        return String::new();
     }
-    let mut out = String::new();
     let mut used = 0;
-    for grapheme in text.graphemes(true) {
-        let size = width(grapheme);
-        if used + size > room.saturating_sub(1) {
-            break;
+    let mut cut = 0;
+    for (at, grapheme) in text.grapheme_indices(true) {
+        let size = grapheme_width(grapheme);
+        if used + size < room {
+            cut = at + grapheme.len();
         }
-        out.push_str(grapheme);
         used += size;
+        if used > room {
+            let mut out = String::with_capacity(cut + '…'.len_utf8());
+            out.push_str(&text[..cut]);
+            out.push('…');
+            return out;
+        }
     }
-    if room > 0 {
-        out.push('…');
-    }
-    out
+    text.to_owned()
 }
 
 pub(super) fn clip_start(text: &str, room: usize) -> String {
-    if width(text) <= room {
-        return text.to_owned();
-    }
     if room == 0 {
         return String::new();
     }
     let mut used = 0;
     let mut start = text.len();
     for (at, grapheme) in text.grapheme_indices(true).rev() {
-        let size = width(grapheme);
-        if used + size > room - 1 {
-            break;
+        let size = grapheme_width(grapheme);
+        if used + size < room {
+            start = at;
         }
-        start = at;
         used += size;
+        if used > room {
+            return format!("…{}", &text[start..]);
+        }
     }
-    format!("…{}", &text[start..])
+    text.to_owned()
 }
 
 pub(super) struct Item {
